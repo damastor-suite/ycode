@@ -5,6 +5,10 @@
  */
 
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import {
+  applyTenantEq,
+  stampTenantId,
+} from '@/lib/tenant';
 import type { PageFolder } from '../../types';
 import { incrementSiblingOrders } from '../services/pageService';
 
@@ -68,6 +72,7 @@ export async function getAllPageFolders(filters?: QueryFilters): Promise<PageFol
     });
   }
 
+  query = (await applyTenantEq(query)).query;
   const { data, error } = await query.order('order', { ascending: true });
 
   if (error) {
@@ -89,13 +94,14 @@ export async function getPageFolderById(id: string, isPublished = false): Promis
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_folders')
     .select('*')
     .eq('id', id)
     .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -128,10 +134,11 @@ export async function getChildFolders(
     .is('deleted_at', null);
 
   // Handle null vs non-null parent_id
-  const finalQuery = parentId === null
+  let finalQuery = parentId === null
     ? query.is('page_folder_id', null)
     : query.eq('page_folder_id', parentId);
 
+  finalQuery = (await applyTenantEq(finalQuery)).query;
   const { data, error } = await finalQuery.order(orderBy, { ascending: true });
 
   if (error) {
@@ -153,7 +160,7 @@ export async function createPageFolder(folderData: CreatePageFolderData): Promis
 
   const { data, error } = await client
     .from('page_folders')
-    .insert(folderData)
+    .insert(await stampTenantId(folderData as unknown as Record<string, unknown>))
     .select()
     .single();
 
@@ -174,13 +181,14 @@ export async function updatePageFolder(id: string, updates: UpdatePageFolderData
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_folders')
     .update(updates)
     .eq('id', id)
     .eq('is_published', false)
-    .select()
-    .single();
+    .select();
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     throw new Error(`Failed to update page folder: ${error.message}`);
@@ -207,10 +215,12 @@ async function getDescendantFolderIdsFromDB(folderId: string): Promise<string[]>
   }
 
   // Fetch all non-deleted folders once
-  const { data: allFolders, error } = await client
+  let query = client
     .from('page_folders')
     .select('id, page_folder_id')
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: allFolders, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch folders: ${error.message}`);
@@ -257,14 +267,16 @@ export async function batchUpdateFolderOrder(updates: Array<{ id: string; order:
   }
 
   // Update each folder's order (drafts only - users edit drafts)
-  const promises = updates.map(({ id, order }) =>
-    client
+  const promises = updates.map(async ({ id, order }) => {
+    let query = client
       .from('page_folders')
       .update({ order })
       .eq('id', id)
       .eq('is_published', false)
-      .is('deleted_at', null)
-  );
+      .is('deleted_at', null);
+    query = (await applyTenantEq(query)).query;
+    return query;
+  });
 
   const results = await Promise.all(promises);
 
@@ -301,6 +313,7 @@ export async function reorderSiblings(parentId: string | null, depth: number): P
     foldersQuery = foldersQuery.eq('page_folder_id', parentId);
   }
 
+  foldersQuery = (await applyTenantEq(foldersQuery)).query;
   const { data: siblingFolders, error: foldersError } = await foldersQuery.order('order', { ascending: true });
 
   if (foldersError) {
@@ -322,6 +335,7 @@ export async function reorderSiblings(parentId: string | null, depth: number): P
     pagesQuery = pagesQuery.eq('page_folder_id', parentId);
   }
 
+  pagesQuery = (await applyTenantEq(pagesQuery)).query;
   const { data: siblingPages, error: pagesError } = await pagesQuery.order('order', { ascending: true });
 
   if (pagesError) {
@@ -406,12 +420,14 @@ export async function deletePageFolder(id: string): Promise<void> {
   const allFolderIds = [id, ...descendantFolderIds];
 
   // Query 2: Get all draft page IDs within these folders
-  const { data: affectedPages, error: fetchPagesError } = await client
+  let query = client
     .from('pages')
     .select('id')
     .in('page_folder_id', allFolderIds)
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: affectedPages, error: fetchPagesError } = await query;
 
   if (fetchPagesError) {
     throw new Error(`Failed to fetch pages in folder: ${fetchPagesError.message}`);
@@ -421,12 +437,14 @@ export async function deletePageFolder(id: string): Promise<void> {
 
   // Query 3: Soft-delete all draft page_layers for affected pages (if any)
   if (affectedPageIds.length > 0) {
-    const { error: layersError } = await client
+    let query = client
       .from('page_layers')
       .update({ deleted_at: deletedAt })
       .in('page_id', affectedPageIds)
       .eq('is_published', false)
       .is('deleted_at', null);
+    query = (await applyTenantEq(query)).query;
+    const { error: layersError } = await query;
 
     if (layersError) {
       throw new Error(`Failed to delete page layers: ${layersError.message}`);
@@ -434,24 +452,28 @@ export async function deletePageFolder(id: string): Promise<void> {
   }
 
   // Query 4: Soft-delete all draft pages within this folder and its descendants
-  const { error: pagesError } = await client
+  let query2 = client
     .from('pages')
     .update({ deleted_at: deletedAt })
     .in('page_folder_id', allFolderIds)
     .eq('is_published', false)
     .is('deleted_at', null);
+  query2 = (await applyTenantEq(query2)).query;
+  const { error: pagesError } = await query2;
 
   if (pagesError) {
     throw new Error(`Failed to delete pages in folder: ${pagesError.message}`);
   }
 
   // Query 5: Soft-delete ALL draft folders (parent + descendants) in a single query
-  const { error: foldersError } = await client
+  let query3 = client
     .from('page_folders')
     .update({ deleted_at: deletedAt })
     .in('id', allFolderIds)
     .eq('is_published', false)
     .is('deleted_at', null);
+  query3 = (await applyTenantEq(query3)).query;
+  const { error: foldersError } = await query3;
 
   if (foldersError) {
     throw new Error(`Failed to delete folders: ${foldersError.message}`);
@@ -477,12 +499,14 @@ export async function restorePageFolder(id: string): Promise<void> {
   }
 
   // Restore draft folder (publishing service will handle published version)
-  const { error } = await client
+  let query = client
     .from('page_folders')
     .update({ deleted_at: null })
     .eq('id', id)
     .eq('is_published', false)
-    .not('deleted_at', 'is', null); // Only restore if deleted
+    .not('deleted_at', 'is', null);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;  // Only restore if deleted
 
   if (error) {
     throw new Error(`Failed to restore page folder: ${error.message}`);
@@ -500,10 +524,12 @@ export async function forceDeletePageFolder(id: string): Promise<void> {
     throw new Error('Supabase not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('page_folders')
     .delete()
     .eq('id', id);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to force delete page folder: ${error.message}`);
@@ -520,13 +546,14 @@ export async function getDraftPageFolderById(id: string): Promise<PageFolder | n
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_folders')
     .select('*')
     .eq('id', id)
     .eq('is_published', false)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -548,13 +575,14 @@ export async function getPublishedPageFolderById(id: string): Promise<PageFolder
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_folders')
     .select('*')
     .eq('id', id)
     .eq('is_published', true)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -586,6 +614,7 @@ export async function getAllDraftPageFolders(includeSoftDeleted = false): Promis
     query = query.is('deleted_at', null);
   }
 
+  query = (await applyTenantEq(query)).query;
   const { data, error } = await query.order('order', { ascending: true });
 
   if (error) {
@@ -617,6 +646,7 @@ export async function getAllPublishedPageFolders(includeSoftDeleted = false, ten
     query = query.is('deleted_at', null);
   }
 
+  query = (await applyTenantEq(query, tenantId)).query;
   const { data, error } = await query.order('order', { ascending: true });
 
   if (error) {
@@ -641,11 +671,13 @@ export async function getPublishedPageFoldersByIds(ids: string[]): Promise<PageF
     return [];
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_folders')
     .select('*')
     .in('id', ids)
     .eq('is_published', true);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch published folders: ${error.message}`);
@@ -679,6 +711,7 @@ export async function getPageFolderBySlug(slug: string, filters?: QueryFilters):
     });
   }
 
+  query = (await applyTenantEq(query)).query;
   const { data, error } = await query.single();
 
   if (error) {
@@ -754,6 +787,7 @@ export async function duplicatePageFolder(folderId: string): Promise<PageFolder>
     query = query.eq('page_folder_id', originalFolder.page_folder_id);
   }
 
+  query = (await applyTenantEq(query)).query;
   const { data: existingFolders } = await query;
 
   const existingSlugs = (existingFolders || []).map(f => f.slug.toLowerCase());
@@ -778,7 +812,7 @@ export async function duplicatePageFolder(folderId: string): Promise<PageFolder>
   // Create the new folder
   const { data: newFolder, error: folderError } = await client
     .from('page_folders')
-    .insert({
+    .insert(await stampTenantId({
       name: newName,
       slug: newSlug,
       is_published: false, // Always create as unpublished
@@ -786,7 +820,7 @@ export async function duplicatePageFolder(folderId: string): Promise<PageFolder>
       order: newOrder,
       depth: originalFolder.depth,
       settings: originalFolder.settings || {},
-    })
+    }))
     .select()
     .single();
 
@@ -812,24 +846,28 @@ async function duplicateFolderContents(
   newFolderId: string
 ): Promise<void> {
   // Get all child folders
-  const { data: childFolders, error: foldersError } = await client
+  let query = client
     .from('page_folders')
     .select('*')
     .eq('page_folder_id', originalFolderId)
     .is('deleted_at', null)
     .order('order', { ascending: true });
+  query = (await applyTenantEq(query)).query;
+  const { data: childFolders, error: foldersError } = await query;
 
   if (foldersError) {
     throw new Error(`Failed to fetch child folders: ${foldersError.message}`);
   }
 
   // Get all child pages
-  const { data: childPages, error: pagesError } = await client
+  let query2 = client
     .from('pages')
     .select('*')
     .eq('page_folder_id', originalFolderId)
     .is('deleted_at', null)
     .order('order', { ascending: true });
+  query2 = (await applyTenantEq(query2)).query;
+  const { data: childPages, error: pagesError } = await query2;
 
   if (pagesError) {
     throw new Error(`Failed to fetch child pages: ${pagesError.message}`);
@@ -845,7 +883,7 @@ async function duplicateFolderContents(
 
       const { data: duplicatedFolder, error: dupError } = await client
         .from('page_folders')
-        .insert({
+        .insert(await stampTenantId({
           name: folder.name,
           slug: newFolderSlug,
           is_published: false,
@@ -853,7 +891,7 @@ async function duplicateFolderContents(
           order: folder.order,
           depth: folder.depth,
           settings: folder.settings || {},
-        })
+        }))
         .select()
         .single();
 
@@ -876,7 +914,7 @@ async function duplicateFolderContents(
 
       const { data: duplicatedPage, error: dupError } = await client
         .from('pages')
-        .insert({
+        .insert(await stampTenantId({
           name: page.name,
           slug: newPageSlug,
           is_published: false,
@@ -887,7 +925,7 @@ async function duplicateFolderContents(
           is_dynamic: page.is_dynamic,
           error_page: page.error_page,
           settings: page.settings || {},
-        })
+        }))
         .select()
         .single();
 
@@ -896,25 +934,26 @@ async function duplicateFolderContents(
       }
 
       // Duplicate the page's draft layers if they exist
-      const { data: originalLayers, error: layersError } = await client
+      let query = client
         .from('page_layers')
         .select('*')
         .eq('page_id', page.id)
         .eq('is_published', false)
         .is('deleted_at', null)
         .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
+        .limit(1);
+      query = (await applyTenantEq(query)).query;
+      const { data: originalLayers, error: layersError } = await query.single();
 
       // If there are draft layers, duplicate them for the new page
       if (!layersError && originalLayers) {
         await client
           .from('page_layers')
-          .insert({
+          .insert(await stampTenantId({
             page_id: duplicatedPage.id,
             layers: originalLayers.layers,
             is_published: false,
-          });
+          }));
       }
     }
   }

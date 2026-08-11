@@ -5,6 +5,11 @@
  */
 
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import {
+  applyTenantEq,
+  stampTenantId,
+  stampTenantIdMany,
+} from '@/lib/tenant';
 import { SUPABASE_QUERY_LIMIT, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
 import type { AssetFolder, CreateAssetFolderData, UpdateAssetFolderData } from '../../types';
 
@@ -19,12 +24,14 @@ export async function getAllAssetFolders(isPublished = false): Promise<AssetFold
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('asset_folders')
     .select('*')
     .eq('is_published', isPublished)
     .is('deleted_at', null)
     .order('order', { ascending: true });
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch asset folders: ${error.message}`);
@@ -45,13 +52,14 @@ export async function getAssetFolderById(id: string, isPublished = false): Promi
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('asset_folders')
     .select('*')
     .eq('id', id)
     .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -85,10 +93,11 @@ export async function getChildFolders(
     .is('deleted_at', null);
 
   // Handle null vs non-null parent_id
-  const finalQuery = parentId === null
+  let finalQuery = parentId === null
     ? query.is('asset_folder_id', null)
     : query.eq('asset_folder_id', parentId);
 
+  finalQuery = (await applyTenantEq(finalQuery)).query;
   const { data, error } = await finalQuery.order('order', { ascending: true });
 
   if (error) {
@@ -116,7 +125,7 @@ export async function createAssetFolder(folderData: CreateAssetFolderData): Prom
 
   const { data, error } = await client
     .from('asset_folders')
-    .insert(dataToInsert)
+    .insert(await stampTenantId(dataToInsert as unknown as Record<string, unknown>))
     .select()
     .single();
 
@@ -137,7 +146,7 @@ export async function updateAssetFolder(id: string, updates: UpdateAssetFolderDa
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('asset_folders')
     .update({
       ...updates,
@@ -145,8 +154,9 @@ export async function updateAssetFolder(id: string, updates: UpdateAssetFolderDa
     })
     .eq('id', id)
     .eq('is_published', false)
-    .select()
-    .single();
+    .select();
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     throw new Error(`Failed to update asset folder: ${error.message}`);
@@ -166,11 +176,13 @@ async function getDescendantFolderIds(folderId: string): Promise<string[]> {
   }
 
   // Fetch all non-deleted draft folders once
-  const { data: allFolders, error } = await client
+  let query = client
     .from('asset_folders')
     .select('id, asset_folder_id')
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: allFolders, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch folders: ${error.message}`);
@@ -228,24 +240,28 @@ export async function deleteAssetFolder(id: string): Promise<void> {
   const allFolderIds = [id, ...descendantFolderIds];
 
   // Soft-delete all draft assets within these folders
-  const { error: assetsError } = await client
+  let query = client
     .from('assets')
     .update({ deleted_at: new Date().toISOString() })
     .in('asset_folder_id', allFolderIds)
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { error: assetsError } = await query;
 
   if (assetsError) {
     throw new Error(`Failed to delete assets in folder: ${assetsError.message}`);
   }
 
   // Soft-delete all draft folders
-  const { error: foldersError } = await client
+  let query2 = client
     .from('asset_folders')
     .update({ deleted_at: deletedAt })
     .in('id', allFolderIds)
     .eq('is_published', false)
     .is('deleted_at', null);
+  query2 = (await applyTenantEq(query2)).query;
+  const { error: foldersError } = await query2;
 
   if (foldersError) {
     throw new Error(`Failed to delete folders: ${foldersError.message}`);
@@ -289,13 +305,15 @@ export async function getUnpublishedAssetFolders(): Promise<AssetFolder[]> {
   }
 
   // Fetch all draft folders
-  const { data: draftFolders, error } = await client
+  let query = client
     .from('asset_folders')
     .select('*')
     .eq('is_published', false)
     .is('deleted_at', null)
     .order('depth', { ascending: true })
     .order('order', { ascending: true });
+  query = (await applyTenantEq(query)).query;
+  const { data: draftFolders, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch draft asset folders: ${error.message}`);
@@ -307,11 +325,13 @@ export async function getUnpublishedAssetFolders(): Promise<AssetFolder[]> {
 
   // Batch fetch published folders for comparison
   const draftIds = draftFolders.map(f => f.id);
-  const { data: publishedFolders, error: publishedError } = await client
+  let query2 = client
     .from('asset_folders')
     .select('*')
     .in('id', draftIds)
     .eq('is_published', true);
+  query2 = (await applyTenantEq(query2)).query;
+  const { data: publishedFolders, error: publishedError } = await query2;
 
   if (publishedError) {
     throw new Error(`Failed to fetch published asset folders: ${publishedError.message}`);
@@ -344,12 +364,14 @@ export async function getDeletedDraftAssetFolders(): Promise<AssetFolder[]> {
   let offset = 0;
 
   while (true) {
-    const { data, error } = await client
+    let query = client
       .from('asset_folders')
       .select('*')
       .eq('is_published', false)
       .not('deleted_at', 'is', null)
       .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
+    query = (await applyTenantEq(query)).query;
+    const { data, error } = await query;
 
     if (error) {
       throw new Error(`Failed to fetch deleted draft asset folders: ${error.message}`);
@@ -395,12 +417,14 @@ export async function publishAssetFolders(folderIds: string[]): Promise<{ count:
   // Fetch draft folders in batches
   for (let i = 0; i < folderIds.length; i += SUPABASE_WRITE_BATCH_SIZE) {
     const batchIds = folderIds.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-    const { data, error: fetchError } = await client
+    let query = client
       .from('asset_folders')
       .select('*')
       .in('id', batchIds)
       .eq('is_published', false)
       .is('deleted_at', null);
+    query = (await applyTenantEq(query)).query;
+    const { data, error: fetchError } = await query;
 
     if (fetchError) {
       throw new Error(`Failed to fetch draft asset folders: ${fetchError.message}`);
@@ -422,11 +446,13 @@ export async function publishAssetFolders(folderIds: string[]): Promise<{ count:
   const publishedById = new Map<string, AssetFolder>();
   for (let i = 0; i < folderIds.length; i += SUPABASE_WRITE_BATCH_SIZE) {
     const batchIds = folderIds.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-    const { data: existingPublished } = await client
+    let query = client
       .from('asset_folders')
       .select('*')
       .in('id', batchIds)
       .eq('is_published', true);
+    query = (await applyTenantEq(query)).query;
+    const { data: existingPublished } = await query;
 
     existingPublished?.forEach(f => publishedById.set(f.id, f));
   }
@@ -464,7 +490,7 @@ export async function publishAssetFolders(folderIds: string[]): Promise<{ count:
       const batch = recordsToUpsert.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
       const { error: upsertError } = await client
         .from('asset_folders')
-        .upsert(batch, {
+        .upsert(await stampTenantIdMany(batch as unknown as Array<Record<string, unknown>>), {
           onConflict: 'id,is_published',
         });
 
@@ -502,30 +528,38 @@ export async function hardDeleteSoftDeletedAssetFolders(): Promise<{ count: numb
     const batchIds = ids.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
 
     // Clear asset_folder_id on assets referencing these folders
-    await client
+    let clearPublishedAssets = client
       .from('assets')
       .update({ asset_folder_id: null })
       .in('asset_folder_id', batchIds)
       .eq('is_published', true);
+    clearPublishedAssets = (await applyTenantEq(clearPublishedAssets)).query;
+    await clearPublishedAssets;
 
-    await client
+    let clearDraftAssets = client
       .from('assets')
       .update({ asset_folder_id: null })
       .in('asset_folder_id', batchIds)
       .eq('is_published', false);
+    clearDraftAssets = (await applyTenantEq(clearDraftAssets)).query;
+    await clearDraftAssets;
 
     // Clear parent references on child asset_folders
-    await client
+    let clearPublishedFolders = client
       .from('asset_folders')
       .update({ asset_folder_id: null })
       .in('asset_folder_id', batchIds)
       .eq('is_published', true);
+    clearPublishedFolders = (await applyTenantEq(clearPublishedFolders)).query;
+    await clearPublishedFolders;
 
-    await client
+    let clearDraftFolders = client
       .from('asset_folders')
       .update({ asset_folder_id: null })
       .in('asset_folder_id', batchIds)
       .eq('is_published', false);
+    clearDraftFolders = (await applyTenantEq(clearDraftFolders)).query;
+    await clearDraftFolders;
   }
 
   // Delete published and draft versions in batches
@@ -533,23 +567,27 @@ export async function hardDeleteSoftDeletedAssetFolders(): Promise<{ count: numb
     const batchIds = ids.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
 
     // Delete published versions
-    const { error: deletePublishedError } = await client
+    let query = client
       .from('asset_folders')
       .delete()
       .in('id', batchIds)
       .eq('is_published', true);
+    query = (await applyTenantEq(query)).query;
+    const { error: deletePublishedError } = await query;
 
     if (deletePublishedError) {
       console.error('Failed to delete published asset folders:', deletePublishedError);
     }
 
     // Delete soft-deleted draft versions
-    const { error: deleteDraftError } = await client
+    let query2 = client
       .from('asset_folders')
       .delete()
       .in('id', batchIds)
       .eq('is_published', false)
       .not('deleted_at', 'is', null);
+    query2 = (await applyTenantEq(query2)).query;
+    const { error: deleteDraftError } = await query2;
 
     if (deleteDraftError) {
       throw new Error(`Failed to delete draft asset folders: ${deleteDraftError.message}`);
