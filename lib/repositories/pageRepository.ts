@@ -7,7 +7,7 @@
 import type { Knex } from 'knex';
 
 import { getDb, isMissingTableError } from '@/lib/platform/db';
-import { addTenantFilter } from '@/lib/knex-helpers';
+import { addTenantFilter, batchUpdateColumn } from '@/lib/knex-helpers';
 import { getTenantIdFromHeaders } from '@/lib/platform/tenant';
 import { generatePageLayersHash, generatePageMetadataHash } from '@/lib/hash-utils';
 import { isHomepage } from '@/lib/page-utils';
@@ -490,19 +490,15 @@ export async function batchUpdatePageOrder(updates: Array<{ id: string; order: n
   if (updates.length === 0) return;
 
   const knex = await getDb();
-  const now = new Date().toISOString();
-  const rows = await Promise.all(updates.map(async ({ id, order }) => withTenantOnInsert({
-    id,
-    order,
-    is_published: false,
-    updated_at: now,
-  })));
 
   try {
-    await knex('pages')
-      .insert(rows)
-      .onConflict(['id', 'is_published'])
-      .merge(['order', 'updated_at']);
+    await batchUpdateColumn(knex, 'pages', 'order',
+      updates.map(u => ({ id: u.id, value: u.order })),
+      {
+        extraWhereClause: 'AND is_published = false AND deleted_at IS NULL',
+        castType: 'integer',
+      }
+    );
   } catch (error) {
     throw new Error(`Failed to update page order: ${getErrorMessage(error)}`);
   }
