@@ -90,7 +90,7 @@ export async function createColorVariable(
   maxQuery = await applyTenantFilter(knex, maxQuery, 'color_variables');
 
   try {
-    const [maxRow] = await maxQuery;
+    const maxRow = await maxQuery.first();
     const nextOrder = Number(maxRow?.max ?? -1) + 1;
     const row = await addTenantIdToRow(knex, 'color_variables', {
       ...variableData,

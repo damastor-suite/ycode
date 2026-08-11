@@ -80,7 +80,7 @@ export async function createGlobalVariable(
         .max<{ max: number | string | null }>('order as max')
         .where('is_published', false);
       maxQuery = await applyTenantFilter(knex, maxQuery, 'global_variables');
-      const [maxRow] = await maxQuery;
+      const maxRow = await maxQuery.first();
       order = Number(maxRow?.max ?? -1) + 1;
     }
 
