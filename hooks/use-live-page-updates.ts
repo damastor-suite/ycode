@@ -4,9 +4,10 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useAuthStore } from '../stores/useAuthStore';
 import { usePagesStore } from '../stores/usePagesStore';
 import { useCollaborationPresenceStore } from '../stores/useCollaborationPresenceStore';
-import { createClient } from '@/lib/supabase-browser';
 import { debounce } from '../lib/collaboration-utils';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client';
 import type { Page } from '../types';
 
 interface PageUpdate {
@@ -31,7 +32,7 @@ export function useLivePageUpdates(): UseLivePageUpdatesReturn {
   const updateUser = useCollaborationPresenceStore((state) => state.updateUser);
   const currentUserId = useCollaborationPresenceStore((state) => state.currentUserId);
 
-  const channelRef = useRef<any>(null);
+  const channelRef = useRef<YcodeRealtimeChannel | null>(null);
   const isReceivingUpdates = useRef(false);
   const lastUpdateTime = useRef<number | null>(null);
   const updateQueue = useRef<PageUpdate[]>([]);
@@ -62,7 +63,7 @@ export function useLivePageUpdates(): UseLivePageUpdatesReturn {
     }, 100) // 100ms debounce - faster sync
   );
 
-  // Initialize Supabase channel for page updates
+  // Initialize realtime channel for page updates
   useEffect(() => {
     if (!user) {
       return;
@@ -72,9 +73,8 @@ export function useLivePageUpdates(): UseLivePageUpdatesReturn {
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel('pages:updates');
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel('pages:updates');
+        if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'page_update' }, (payload) => {
           handleIncomingPageUpdate(payload.payload);
@@ -88,7 +88,7 @@ export function useLivePageUpdates(): UseLivePageUpdatesReturn {
           handleIncomingPageDelete(payload.payload);
         });
 
-        await channel.subscribe((status) => {
+        channel.subscribe((status) => {
           if (status === 'SUBSCRIBED') {
             isReceivingUpdates.current = true;
           }

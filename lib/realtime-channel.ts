@@ -1,42 +1,29 @@
-import type { RealtimeChannel, SupabaseClient } from '@supabase/supabase-js';
+/**
+ * Race-safe lifecycle wrapper for async-initialized realtime channels.
+ */
+
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client';
 
 export interface ChannelLifecycle {
-  /**
-   * Track a created channel + client for race-safe teardown.
-   * Returns false if teardown already ran — the channel is removed immediately
-   * in that case, so the caller should abort initialization.
-   */
-  track: (channel: RealtimeChannel, client: SupabaseClient) => boolean;
-  /** True once `teardown()` has been called. */
+  track: (channel: YcodeRealtimeChannel) => boolean;
   readonly cancelled: boolean;
-  /**
-   * Remove the tracked channel via `client.removeChannel()` and mark the
-   * lifecycle as cancelled. Safe to call repeatedly.
-   */
   teardown: () => void;
 }
 
 /**
- * Race-safe lifecycle wrapper for an async-initialized Supabase realtime channel.
- *
- * Plain `channel.unsubscribe()` does not remove the channel from supabase-js'
- * internal registry; `client.removeChannel()` does. This helper also handles
- * the case where the effect's cleanup runs before async init resolves, which
- * would otherwise leak the channel.
+ * Race-safe lifecycle for SSE realtime channels.
  */
 export function createChannelLifecycle(): ChannelLifecycle {
   let isCancelled = false;
-  let trackedChannel: RealtimeChannel | null = null;
-  let trackedClient: SupabaseClient | null = null;
+  let trackedChannel: YcodeRealtimeChannel | null = null;
 
   return {
-    track(channel, client) {
+    track(channel) {
       if (isCancelled) {
-        client.removeChannel(channel);
+        channel.unsubscribe();
         return false;
       }
       trackedChannel = channel;
-      trackedClient = client;
       return true;
     },
     get cancelled() {
@@ -44,10 +31,9 @@ export function createChannelLifecycle(): ChannelLifecycle {
     },
     teardown() {
       isCancelled = true;
-      if (trackedChannel && trackedClient) {
-        trackedClient.removeChannel(trackedChannel);
+      if (trackedChannel) {
+        trackedChannel.unsubscribe();
         trackedChannel = null;
-        trackedClient = null;
       }
     },
   };

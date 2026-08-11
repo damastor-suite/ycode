@@ -19,7 +19,6 @@ import {
   DialogClose,
 } from '@/components/ui/dialog';
 import { useAuthStore } from '@/stores/useAuthStore';
-import { createClient } from '@/lib/supabase-browser';
 
 export default function ProfilePage() {
   const user = useAuthStore((state) => state.user);
@@ -316,9 +315,7 @@ export default function ProfilePage() {
         throw new Error(result.error || 'Failed to delete profile');
       }
 
-      // Sign out and redirect
-      const supabase = await createClient();
-      await supabase.auth.signOut();
+      await signOut();
       window.location.href = '/';
     } catch (error) {
       console.error('Failed to delete profile:', error);

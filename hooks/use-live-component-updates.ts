@@ -3,7 +3,7 @@
 /**
  * Live Component Updates Hook
  * 
- * Manages real-time synchronization of component changes using Supabase Realtime
+ * Manages real-time synchronization of component changes.
  */
 
 import { useCallback, useEffect, useMemo, useRef } from 'react';
@@ -11,8 +11,9 @@ import { useAuthStore } from '../stores/useAuthStore';
 import { useComponentsStore } from '../stores/useComponentsStore';
 import { useCollaborationPresenceStore } from '../stores/useCollaborationPresenceStore';
 import { usePagesStore } from '../stores/usePagesStore';
-import { createClient } from '@/lib/supabase-browser';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client';
 import type { Component, Layer } from '../types';
 
 // Types for component updates
@@ -36,10 +37,10 @@ export function useLiveComponentUpdates(): UseLiveComponentUpdatesReturn {
   const updateUser = useCollaborationPresenceStore((state) => state.updateUser);
   const currentUserId = useCollaborationPresenceStore((state) => state.currentUserId);
   
-  const channelRef = useRef<ReturnType<Awaited<ReturnType<typeof createClient>>['channel']> | null>(null);
+  const channelRef = useRef<YcodeRealtimeChannel | null>(null);
   const isConnectedRef = useRef(false);
   
-  // Initialize Supabase channel for component updates
+  // Initialize realtime channel for component updates
   useEffect(() => {
     if (!user) {
       return;
@@ -49,9 +50,8 @@ export function useLiveComponentUpdates(): UseLiveComponentUpdatesReturn {
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel('components:updates');
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel('components:updates');
+        if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'component_created' }, (payload) => {
           handleIncomingComponentCreate(payload.payload);
@@ -69,7 +69,7 @@ export function useLiveComponentUpdates(): UseLiveComponentUpdatesReturn {
           handleIncomingComponentLayersUpdate(payload.payload);
         });
 
-        await channel.subscribe((status) => {
+        channel.subscribe((status) => {
           if (status === 'SUBSCRIBED') {
             isConnectedRef.current = true;
           } else {

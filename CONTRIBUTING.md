@@ -17,7 +17,9 @@ Please open a [Discussion](https://github.com/ycode/ycode/discussions) first so 
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) v18 or later
-- A [Supabase](https://supabase.com) project (free tier works)
+- Postgres for application data
+- Redis for realtime collaboration
+- Optional MinIO-compatible object storage for assets
 - A [Vercel](https://vercel.com) account (for deployment) or local development
 
 ### Local Development
@@ -35,7 +37,7 @@ Please open a [Discussion](https://github.com/ycode/ycode/discussions) first so 
    npm install
    ```
 
-3. Copy the environment template and fill in your Supabase credentials:
+3. Copy the environment template and fill in your Postgres, Redis, and optional MinIO credentials:
 
    ```bash
    cp .env.example .env.local

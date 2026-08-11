@@ -9,8 +9,8 @@
  */
 
 import { useEffect } from 'react';
-import { createClient } from '@/lib/supabase-browser';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useFontsStore } from '@/stores/useFontsStore';
 
@@ -26,16 +26,15 @@ export function useLiveFontUpdates(): void {
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel('fonts:updates');
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel('fonts:updates');
+        if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'fonts_changed' }, () => {
           // Refetching is idempotent, so no own-broadcast filtering is needed.
           useFontsStore.getState().refreshFonts();
         });
 
-        await channel.subscribe();
+        channel.subscribe();
       } catch (error) {
         console.error('[LIVE-FONTS] Failed to initialize:', error);
       }

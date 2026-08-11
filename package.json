@@ -15,8 +15,7 @@
     "visual-editor",
     "no-code",
     "self-hosted",
-    "nextjs",
-    "supabase"
+    "nextjs"
   ],
   "engines": {
     "node": ">=18"
@@ -69,8 +68,6 @@
     "@radix-ui/react-toggle-group": "^1.1.11",
     "@radix-ui/react-tooltip": "^1.2.8",
     "@react-spring/web": "^10.0.3",
-    "@supabase/ssr": "^0.7.0",
-    "@supabase/supabase-js": "^2.76.1",
     "@tanstack/react-virtual": "^3.13.22",
     "@tiptap/core": "^3.10.5",
     "@tiptap/extension-heading": "^3.10.7",

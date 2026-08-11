@@ -19,7 +19,9 @@ Ycode has extensive [documentation][docs]. We actively maintain and improve it, 
 To self-host Ycode you will need:
 
 - A [GitHub](https://github.com) account
-- A [Supabase](https://supabase.com) account
+- A Postgres database
+- Redis for realtime collaboration
+- Optional MinIO-compatible object storage for assets
 - A [Vercel](https://vercel.com) account
 
 Follow the [installation instructions][install] to get started.

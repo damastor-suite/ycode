@@ -3,16 +3,17 @@
 /**
  * Live Layer Style Updates Hook
  *
- * Manages real-time synchronization of layer style changes using Supabase Realtime
+ * Manages real-time synchronization of layer style changes.
  */
 
 import { useCallback, useEffect, useRef } from 'react';
 import { useAuthStore } from '../stores/useAuthStore';
 import { useLayerStylesStore } from '../stores/useLayerStylesStore';
 import { useCollaborationPresenceStore } from '../stores/useCollaborationPresenceStore';
-import { createClient } from '@/lib/supabase-browser';
 import { detachStyleAcrossStores, updateStyleAcrossStores } from '../lib/layer-style-store-utils';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client';
 import type { LayerStyle } from '../types';
 
 // Types for style updates
@@ -35,10 +36,10 @@ export function useLiveLayerStyleUpdates(): UseLiveLayerStyleUpdatesReturn {
   const updateUser = useCollaborationPresenceStore((state) => state.updateUser);
   const currentUserId = useCollaborationPresenceStore((state) => state.currentUserId);
 
-  const channelRef = useRef<ReturnType<Awaited<ReturnType<typeof createClient>>['channel']> | null>(null);
+  const channelRef = useRef<YcodeRealtimeChannel | null>(null);
   const isConnectedRef = useRef(false);
 
-  // Initialize Supabase channel for style updates
+  // Initialize realtime channel for style updates
   useEffect(() => {
     if (!user) {
       return;
@@ -48,9 +49,8 @@ export function useLiveLayerStyleUpdates(): UseLiveLayerStyleUpdatesReturn {
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel('layer-styles:updates');
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel('layer-styles:updates');
+        if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'style_created' }, (payload) => {
           handleIncomingStyleCreate(payload.payload);
@@ -64,7 +64,7 @@ export function useLiveLayerStyleUpdates(): UseLiveLayerStyleUpdatesReturn {
           handleIncomingStyleDelete(payload.payload);
         });
 
-        await channel.subscribe((status) => {
+        channel.subscribe((status) => {
           if (status === 'SUBSCRIBED') {
             isConnectedRef.current = true;
           } else {

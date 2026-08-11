@@ -3,15 +3,16 @@
 /**
  * Live Collection Updates Hook
  *
- * Manages real-time synchronization of collection and item changes using Supabase Realtime
+ * Manages real-time synchronization of collection and item changes.
  */
 
 import { useCallback, useEffect, useRef } from 'react';
 import { useAuthStore } from '../stores/useAuthStore';
 import { useCollectionsStore } from '../stores/useCollectionsStore';
 import { useCollaborationPresenceStore } from '../stores/useCollaborationPresenceStore';
-import { createClient } from '@/lib/supabase-browser';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client';
 import type { Collection, CollectionItemWithValues } from '../types';
 
 // Types for collection updates
@@ -48,10 +49,10 @@ export function useLiveCollectionUpdates(): UseLiveCollectionUpdatesReturn {
   const updateUser = useCollaborationPresenceStore((state) => state.updateUser);
   const currentUserId = useCollaborationPresenceStore((state) => state.currentUserId);
 
-  const channelRef = useRef<any>(null);
+  const channelRef = useRef<YcodeRealtimeChannel | null>(null);
   const isConnectedRef = useRef(false);
 
-  // Initialize Supabase channel for collection updates
+  // Initialize realtime channel for collection updates
   useEffect(() => {
     if (!user) {
       return;
@@ -61,9 +62,8 @@ export function useLiveCollectionUpdates(): UseLiveCollectionUpdatesReturn {
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel('collections:updates');
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel('collections:updates');
+        if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'collection_created' }, (payload) => {
           handleIncomingCollectionCreate(payload.payload);
@@ -89,7 +89,7 @@ export function useLiveCollectionUpdates(): UseLiveCollectionUpdatesReturn {
           handleIncomingItemDelete(payload.payload);
         });
 
-        await channel.subscribe((status) => {
+        channel.subscribe((status) => {
           if (status === 'SUBSCRIBED') {
             isConnectedRef.current = true;
           } else {

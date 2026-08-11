@@ -12,12 +12,13 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useCollaborationPresenceStore, getResourceLockKey } from '@/stores/useCollaborationPresenceStore';
 import { useAuthStore } from '@/stores/useAuthStore';
-import { createClient } from '@/lib/supabase-browser';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client';
 
 export interface UseResourceLockOptions {
   resourceType: string; // e.g., 'layer', 'collection_item'
-  channelName: string; // Supabase channel name for broadcasting
+  channelName: string; // Realtime channel name for broadcasting
 }
 
 export interface UseResourceLockReturn {
@@ -40,7 +41,7 @@ export function useResourceLock({
   const storeReleaseLock = useCollaborationPresenceStore((state) => state.releaseResourceLock);
   const updateUser = useCollaborationPresenceStore((state) => state.updateUser);
   
-  const channelRef = useRef<any>(null);
+  const channelRef = useRef<YcodeRealtimeChannel | null>(null);
   const myLocksRef = useRef<Set<string>>(new Set());
   
   // Refs to avoid stale closures in channel handlers
@@ -52,7 +53,7 @@ export function useResourceLock({
   // Track if user is available (for effect dependency)
   const hasUser = !!user;
   
-  // Initialize Supabase channel for lock broadcasting
+  // Initialize realtime channel for lock broadcasting
   useEffect(() => {
     // Use ref for user data but still depend on hasUser for triggering
     const currentUser = userRef.current;
@@ -64,9 +65,8 @@ export function useResourceLock({
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel(channelName);
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel(channelName);
+        if (!lifecycle.track(channel)) return;
 
         // Listen for lock changes from other users
         channel.on('broadcast', { event: `${resourceType}_lock_acquired` }, (payload) => {

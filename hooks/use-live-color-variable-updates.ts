@@ -11,8 +11,8 @@
  */
 
 import { useEffect } from 'react';
-import { createClient } from '@/lib/supabase-browser';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useColorVariablesStore } from '@/stores/useColorVariablesStore';
 
@@ -28,16 +28,15 @@ export function useLiveColorVariableUpdates(): void {
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel('color-variables:updates');
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel('color-variables:updates');
+        if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'color_variables_changed' }, () => {
           // Refetching is idempotent, so no own-broadcast filtering is needed.
           useColorVariablesStore.getState().loadColorVariables();
         });
 
-        await channel.subscribe();
+        channel.subscribe();
       } catch (error) {
         console.error('[LIVE-COLOR-VARIABLES] Failed to initialize:', error);
       }

@@ -1,10 +1,10 @@
-import { createClient } from '@/lib/supabase-browser'
-import { RealtimeChannel, REALTIME_SUBSCRIBE_STATES } from '@supabase/supabase-js'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useCollaborationPresenceStore } from '../stores/useCollaborationPresenceStore'
 import { useAuthStore } from '../stores/useAuthStore'
 import { useEditorStore } from '../stores/useEditorStore'
 import { createChannelLifecycle } from '@/lib/realtime-channel'
+import { createRealtimeChannel } from '@/lib/realtime-client'
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client'
 
 /**
  * Throttle a callback to a certain delay, It will only call the callback if the delay has passed, with the arguments
@@ -41,17 +41,6 @@ const useThrottleCallback = <Params extends unknown[], Return>(
   )
 }
 
-let supabase: any = null;
-
-// Initialize supabase client
-const getSupabaseClient = async () => {
-  if (!supabase) {
-    const { createClient } = await import('@/lib/supabase-browser');
-    supabase = await createClient();
-  }
-  return supabase;
-};
-
 // Curated collaboration colors that match the project's design system
 const COLLABORATION_COLORS = [
   '#8b5cf6', // violet-500 (matches component purple)
@@ -72,6 +61,9 @@ const generateUserId = (username: string) => {
 }
 
 const EVENT_NAME = 'realtime-cursor-move'
+const PRESENCE_SYNC_EVENT = 'presence_sync'
+const PRESENCE_JOIN_EVENT = 'presence_join'
+const PRESENCE_LEAVE_EVENT = 'presence_leave'
 
 // How often we refresh a remote user's metadata in the local store while
 // receiving their cursor broadcasts. Anything more frequent than this just
@@ -96,6 +88,17 @@ type CursorEventPayload = {
     lockedLayerId?: string | null
 }
 
+type PresenceEventPayload = {
+    key: number
+    authId?: string
+    email?: string
+    name: string
+    color: string
+    avatarUrl?: string | null
+    lockedLayerId?: string | null
+    timestamp: number
+}
+
 export const useRealtimeCursors = ({
   roomName,
   username,
@@ -111,18 +114,54 @@ export const useRealtimeCursors = ({
   const cursorPayload = useRef<CursorEventPayload | null>(null)
   const remoteUserLastRefresh = useRef<Record<string, number>>({})
 
-  const channelRef = useRef<RealtimeChannel | null>(null)
+  const channelRef = useRef<YcodeRealtimeChannel | null>(null)
     
   // Get collaboration state
   const setConnectionStatus = useCollaborationPresenceStore((s) => s.setConnectionStatus);
   const setCurrentUser = useCollaborationPresenceStore((s) => s.setCurrentUser);
   const user = useAuthStore((s) => s.user);
   const selectedLayerId = useEditorStore((s) => s.selectedLayerId);
+  const selectedLayerIdRef = useRef(selectedLayerId)
+  selectedLayerIdRef.current = selectedLayerId
   
   // Ref to avoid stale closures and prevent channel reinitialization on user object reference changes
   const userRef = useRef(user)
   userRef.current = user
   const hasUser = !!user
+
+  const createPresencePayload = useCallback((): PresenceEventPayload => {
+    const currentUser = userRef.current
+
+    return {
+      key: userId,
+      authId: currentUser?.id,
+      email: currentUser?.email || username,
+      name: username,
+      color,
+      avatarUrl: currentUser?.user_metadata?.avatar_url || null,
+      lockedLayerId: selectedLayerIdRef.current || null,
+      timestamp: Date.now(),
+    }
+  }, [color, userId, username])
+
+  const syncRemotePresence = useCallback((presence: PresenceEventPayload) => {
+    const { updateUser: storeUpdateUser } = useCollaborationPresenceStore.getState()
+    const currentAuthId = userRef.current?.id
+    const isRemoteUser = presence.authId && presence.authId !== currentAuthId
+
+    if (!isRemoteUser) {
+      return
+    }
+
+    storeUpdateUser(presence.authId, {
+      user_id: presence.authId,
+      email: presence.email || presence.name || 'Unknown',
+      color: presence.color || '#3b82f6',
+      avatar_url: presence.avatarUrl || null,
+      selected_layer_id: presence.lockedLayerId || null,
+      last_active: Date.now()
+    })
+  }, [])
 
   const callback = useCallback(
     (event: MouseEvent) => {
@@ -200,66 +239,51 @@ export const useRealtimeCursors = ({
     const lifecycle = createChannelLifecycle();
 
     const initializeChannel = async () => {
-      const supabaseClient = await getSupabaseClient();
-      const channel = supabaseClient.channel(roomName)
-      if (!lifecycle.track(channel, supabaseClient)) return;
+      const channel = createRealtimeChannel(roomName)
+      if (!lifecycle.track(channel)) return;
 
       channel
-        .on('presence', { event: 'sync' }, () => {
-          const presenceState = channel.presenceState();
-
-          const { updateUser: storeUpdateUser } = useCollaborationPresenceStore.getState();
-          const currentAuthId = userRef.current?.id;
-            
-          // Update collaboration store with user info from presence (but NOT locks - those are handled by use-layer-locks.ts)
-          Object.values(presenceState).forEach((presences: unknown) => {
-            if (Array.isArray(presences)) {
-              presences.forEach((presence: any) => {
-                const remoteAuthId = presence.authId;
-                const isRemoteUser = remoteAuthId && remoteAuthId !== currentAuthId;
-                
-                if (isRemoteUser) {
-                  // Store user info for lock indicator display (color, email, avatar, etc.)
-                  storeUpdateUser(remoteAuthId, {
-                    user_id: remoteAuthId,
-                    email: presence.email || presence.name || 'Unknown',
-                    color: presence.color || '#3b82f6',
-                    avatar_url: presence.avatarUrl || null,
-                    last_active: Date.now()
-                  });
-                }
-              });
-            }
-          });
+        .on('broadcast', { event: PRESENCE_SYNC_EVENT }, (data: { payload: PresenceEventPayload }) => {
+          syncRemotePresence(data.payload)
         })
-        .on('presence', { event: 'leave' }, ({ leftPresences }: { leftPresences: any[] }) => {
+        .on('broadcast', { event: PRESENCE_LEAVE_EVENT }, (data: { payload: PresenceEventPayload }) => {
           const { removeUser } = useCollaborationPresenceStore.getState();
           const currentAuthId = userRef.current?.id;
-          
-          leftPresences.forEach(function (element: any) {
-            // Remove cursor when user leaves
-            setCursors((prev) => {
-              if (prev[element.key]) {
-                delete prev[element.key]
-              }
-              return { ...prev }
-            })
-            
-            // Remove user from collaboration store (locks are handled by use-layer-locks.ts)
-            // Don't remove the current user - they might just be reconnecting
-            if (element.authId && element.authId !== currentAuthId) {
-              removeUser(element.authId);
-            }
-          })
-        })
-        .on('presence', { event: 'join' }, () => {
-          if (!cursorPayload.current) return
 
-          // All cursors broadcast their position when a new cursor joins
+          setCursors((prev) => {
+            if (!prev[data.payload.key]) {
+              return prev
+            }
+
+            const updated = { ...prev }
+            delete updated[data.payload.key]
+            return updated
+          })
+
+          // Remove user from collaboration store (locks are handled by use-layer-locks.ts)
+          // Don't remove the current user - they might just be reconnecting.
+          if (data.payload.authId && data.payload.authId !== currentAuthId) {
+            removeUser(data.payload.authId);
+          }
+        })
+        .on('broadcast', { event: PRESENCE_JOIN_EVENT }, (data: { payload: PresenceEventPayload }) => {
+          syncRemotePresence(data.payload)
+
+          if (data.payload.authId === userRef.current?.id) return
+
+          // All cursors broadcast their position when a new cursor joins.
+          if (cursorPayload.current) {
+            channelRef.current?.send({
+              type: 'broadcast',
+              event: EVENT_NAME,
+              payload: cursorPayload.current,
+            })
+          }
+
           channelRef.current?.send({
             type: 'broadcast',
-            event: EVENT_NAME,
-            payload: cursorPayload.current,
+            event: PRESENCE_SYNC_EVENT,
+            payload: createPresencePayload(),
           })
         })
         .on('broadcast', { event: EVENT_NAME }, (data: { payload: CursorEventPayload }) => {
@@ -299,23 +323,19 @@ export const useRealtimeCursors = ({
             }
           })
         })
-        .subscribe(async (status: any) => {
-          if (status === REALTIME_SUBSCRIBE_STATES.SUBSCRIBED) {
+        .subscribe((status: string) => {
+          if (status === 'SUBSCRIBED') {
             if (lifecycle.cancelled) return;
             const currentUser = userRef.current;
             const avatarUrl = currentUser?.user_metadata?.avatar_url || null;
-            await channel.track({ 
-              key: userId,
-              authId: currentUser?.id, // Include auth ID for lock comparison
-              email: currentUser?.email || username,
-              name: username,
-              color: color,
-              avatarUrl: avatarUrl,
-              lockedLayerId: selectedLayerId || null
-            })
-            if (lifecycle.cancelled) return;
             channelRef.current = channel
             setConnectionStatus(true)
+
+            channel.send({
+              type: 'broadcast',
+              event: PRESENCE_JOIN_EVENT,
+              payload: createPresencePayload(),
+            })
                     
             // Set current user in collaboration store
             if (currentUser && currentUser.email) {
@@ -345,22 +365,24 @@ export const useRealtimeCursors = ({
     initializeChannel();
 
     return () => {
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: PRESENCE_LEAVE_EVENT,
+        payload: createPresencePayload(),
+      })
       lifecycle.teardown();
       channelRef.current = null;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomName, userId, hasUser, setConnectionStatus, setCurrentUser])
+  }, [roomName, userId, hasUser, setConnectionStatus, setCurrentUser, syncRemotePresence, createPresencePayload])
 
   // Update presence when selected layer changes
   useEffect(() => {
     if (channelRef.current && userId) {
-      channelRef.current.track({
-        key: userId,
-        authId: user?.id,
-        email: user?.email || username,
-        name: username,
-        color: color,
-        lockedLayerId: selectedLayerId || null
+      channelRef.current.send({
+        type: 'broadcast',
+        event: PRESENCE_SYNC_EVENT,
+        payload: createPresencePayload(),
       });
     }
 
@@ -373,7 +395,7 @@ export const useRealtimeCursors = ({
         last_active: Date.now(),
       });
     }
-  }, [selectedLayerId, userId, user?.id, user?.email, username, color]);
+  }, [selectedLayerId, userId, user?.id, createPresencePayload]);
 
   useEffect(() => {
     // Handle mouse leaving the window - broadcast off-screen position

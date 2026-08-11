@@ -1,7 +1,7 @@
 /**
  * Live Layer Updates Hook
  *
- * Manages real-time synchronization of layer changes using Supabase Realtime
+ * Manages real-time synchronization of layer changes.
  */
 
 import { useCallback, useEffect, useMemo, useRef } from 'react';
@@ -9,11 +9,12 @@ import { useCollaborationPresenceStore, getResourceLockKey } from '../stores/use
 import { useAuthStore } from '../stores/useAuthStore';
 import { usePagesStore, markPageMcpSynced } from '../stores/usePagesStore';
 import { useEditorStore } from '../stores/useEditorStore';
-import { createClient } from '@/lib/supabase-browser';
 import { debounce } from '../lib/collaboration-utils';
 import { createChannelLifecycle } from '@/lib/realtime-channel';
+import { createRealtimeChannel } from '@/lib/realtime-client';
 import { findAddedLayerIds } from '@/lib/layer-utils';
 import { syncLayerAssets } from '@/lib/canvas-asset-sync';
+import type { YcodeRealtimeChannel } from '@/lib/realtime-client';
 import type { Layer, LayerUpdate } from '../types';
 
 // Helper function to find layer in draft
@@ -44,7 +45,7 @@ export function useLiveLayerUpdates(
   const updateUser = useCollaborationPresenceStore((state) => state.updateUser);
   const currentUserId = useCollaborationPresenceStore((state) => state.currentUserId);
 
-  const channelRef = useRef<any>(null);
+  const channelRef = useRef<YcodeRealtimeChannel | null>(null);
   const isReceivingUpdates = useRef(false);
   const lastUpdateTime = useRef<number | null>(null);
   const updateQueue = useRef<LayerUpdate[]>([]);
@@ -81,7 +82,7 @@ export function useLiveLayerUpdates(
     }, 100) // 100ms debounce - faster sync
   );
 
-  // Initialize Supabase channel
+  // Initialize realtime channel
   useEffect(() => {
     if (!pageId || !user) {
       return;
@@ -91,9 +92,8 @@ export function useLiveLayerUpdates(
 
     const initializeChannel = async () => {
       try {
-        const supabase = await createClient();
-        const channel = supabase.channel(`page:${pageId}:updates`);
-        if (!lifecycle.track(channel, supabase)) return;
+        const channel = createRealtimeChannel(`page:${pageId}:updates`);
+        if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'layer_update' }, (payload) => {
           handleIncomingUpdate(payload.payload);
@@ -124,7 +124,7 @@ export function useLiveLayerUpdates(
           handleLockChange(payload.payload);
         });
 
-        await channel.subscribe((status) => {
+        channel.subscribe((status) => {
           if (status === 'SUBSCRIBED') {
             isReceivingUpdates.current = true;
           }
