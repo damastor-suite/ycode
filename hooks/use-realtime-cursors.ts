@@ -147,14 +147,14 @@ export const useRealtimeCursors = ({
   const syncRemotePresence = useCallback((presence: PresenceEventPayload) => {
     const { updateUser: storeUpdateUser } = useCollaborationPresenceStore.getState()
     const currentAuthId = userRef.current?.id
-    const isRemoteUser = presence.authId && presence.authId !== currentAuthId
+    const remoteAuthId = presence.authId
 
-    if (!isRemoteUser) {
+    if (!remoteAuthId || remoteAuthId === currentAuthId) {
       return
     }
 
-    storeUpdateUser(presence.authId, {
-      user_id: presence.authId,
+    storeUpdateUser(remoteAuthId, {
+      user_id: remoteAuthId,
       email: presence.email || presence.name || 'Unknown',
       color: presence.color || '#3b82f6',
       avatar_url: presence.avatarUrl || null,
@@ -243,33 +243,36 @@ export const useRealtimeCursors = ({
       if (!lifecycle.track(channel)) return;
 
       channel
-        .on('broadcast', { event: PRESENCE_SYNC_EVENT }, (data: { payload: PresenceEventPayload }) => {
-          syncRemotePresence(data.payload)
+        .on('broadcast', { event: PRESENCE_SYNC_EVENT }, (data) => {
+          const payload = data.payload as PresenceEventPayload
+          syncRemotePresence(payload)
         })
-        .on('broadcast', { event: PRESENCE_LEAVE_EVENT }, (data: { payload: PresenceEventPayload }) => {
+        .on('broadcast', { event: PRESENCE_LEAVE_EVENT }, (data) => {
+          const payload = data.payload as PresenceEventPayload
           const { removeUser } = useCollaborationPresenceStore.getState();
           const currentAuthId = userRef.current?.id;
 
           setCursors((prev) => {
-            if (!prev[data.payload.key]) {
+            if (!prev[payload.key]) {
               return prev
             }
 
             const updated = { ...prev }
-            delete updated[data.payload.key]
+            delete updated[payload.key]
             return updated
           })
 
           // Remove user from collaboration store (locks are handled by use-layer-locks.ts)
           // Don't remove the current user - they might just be reconnecting.
-          if (data.payload.authId && data.payload.authId !== currentAuthId) {
-            removeUser(data.payload.authId);
+          if (payload.authId && payload.authId !== currentAuthId) {
+            removeUser(payload.authId);
           }
         })
-        .on('broadcast', { event: PRESENCE_JOIN_EVENT }, (data: { payload: PresenceEventPayload }) => {
-          syncRemotePresence(data.payload)
+        .on('broadcast', { event: PRESENCE_JOIN_EVENT }, (data) => {
+          const payload = data.payload as PresenceEventPayload
+          syncRemotePresence(payload)
 
-          if (data.payload.authId === userRef.current?.id) return
+          if (payload.authId === userRef.current?.id) return
 
           // All cursors broadcast their position when a new cursor joins.
           if (cursorPayload.current) {
@@ -286,8 +289,9 @@ export const useRealtimeCursors = ({
             payload: createPresencePayload(),
           })
         })
-        .on('broadcast', { event: EVENT_NAME }, (data: { payload: CursorEventPayload }) => {
-          const { user: remoteUser, lockedLayerId, color: remoteColor } = data.payload
+        .on('broadcast', { event: EVENT_NAME }, (data) => {
+          const payload = data.payload as CursorEventPayload
+          const { user: remoteUser, lockedLayerId, color: remoteColor } = payload
           // Don't render your own cursor
           if (remoteUser.id === userId) return
 
@@ -319,7 +323,7 @@ export const useRealtimeCursors = ({
 
             return {
               ...prev,
-              [remoteUser.id]: data.payload,
+              [remoteUser.id]: payload,
             }
           })
         })

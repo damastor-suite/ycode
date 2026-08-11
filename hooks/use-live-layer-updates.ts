@@ -96,7 +96,7 @@ export function useLiveLayerUpdates(
         if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'layer_update' }, (payload) => {
-          handleIncomingUpdate(payload.payload);
+          handleIncomingUpdate(payload.payload as LayerUpdate);
         });
 
         channel.on('broadcast', { event: 'layer_added' }, (payload) => {
@@ -113,7 +113,7 @@ export function useLiveLayerUpdates(
 
         // Full layer sync (from MCP / server-side changes)
         channel.on('broadcast', { event: 'layers_full_sync' }, (payload) => {
-          handleIncomingFullSync(payload.payload);
+          handleIncomingFullSync(payload.payload as { page_id: string; layers: Layer[]; user_id: string });
         });
 
         channel.on('broadcast', { event: 'user_activity' }, (payload) => {

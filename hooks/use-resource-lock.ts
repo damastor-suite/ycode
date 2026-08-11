@@ -30,6 +30,13 @@ export interface UseResourceLockReturn {
   getLockOwner: (resourceId: string) => string | null;
 }
 
+interface LockEventPayload {
+  resourceId: string;
+  userId: string;
+  userEmail?: string;
+  userColor?: string;
+}
+
 export function useResourceLock({
   resourceType,
   channelName,
@@ -70,7 +77,7 @@ export function useResourceLock({
 
         // Listen for lock changes from other users
         channel.on('broadcast', { event: `${resourceType}_lock_acquired` }, (payload) => {
-          const { resourceId, userId, userEmail, userColor } = payload.payload;
+          const { resourceId, userId, userEmail, userColor } = payload.payload as LockEventPayload;
           // Use ref to get latest currentUserId (avoid stale closure)
           if (userId !== currentUserIdRef.current) {
             storeAcquireLock(resourceType, resourceId, userId);
@@ -87,7 +94,7 @@ export function useResourceLock({
         });
         
         channel.on('broadcast', { event: `${resourceType}_lock_released` }, (payload) => {
-          const { resourceId, userId } = payload.payload;
+          const { resourceId, userId } = payload.payload as LockEventPayload;
           // Use ref to get latest currentUserId (avoid stale closure)
           if (userId !== currentUserIdRef.current) {
             storeReleaseLock(resourceType, resourceId);

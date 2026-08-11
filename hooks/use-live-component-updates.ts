@@ -54,19 +54,23 @@ export function useLiveComponentUpdates(): UseLiveComponentUpdatesReturn {
         if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'component_created' }, (payload) => {
-          handleIncomingComponentCreate(payload.payload);
+          handleIncomingComponentCreate(payload.payload as { component: Component; user_id: string });
         });
 
         channel.on('broadcast', { event: 'component_updated' }, (payload) => {
-          handleIncomingComponentUpdate(payload.payload);
+          handleIncomingComponentUpdate(payload.payload as ComponentUpdate);
         });
 
         channel.on('broadcast', { event: 'component_deleted' }, (payload) => {
-          handleIncomingComponentDelete(payload.payload);
+          handleIncomingComponentDelete(payload.payload as { component_id: string; user_id: string });
         });
 
         channel.on('broadcast', { event: 'component_layers_updated' }, (payload) => {
-          handleIncomingComponentLayersUpdate(payload.payload);
+          handleIncomingComponentLayersUpdate(payload.payload as {
+            component_id: string;
+            layers: Layer[];
+            user_id: string;
+          });
         });
 
         channel.subscribe((status) => {

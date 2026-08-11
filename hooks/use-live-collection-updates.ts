@@ -66,27 +66,35 @@ export function useLiveCollectionUpdates(): UseLiveCollectionUpdatesReturn {
         if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'collection_created' }, (payload) => {
-          handleIncomingCollectionCreate(payload.payload);
+          handleIncomingCollectionCreate(payload.payload as { collection: Collection; user_id: string });
         });
 
         channel.on('broadcast', { event: 'collection_updated' }, (payload) => {
-          handleIncomingCollectionUpdate(payload.payload);
+          handleIncomingCollectionUpdate(payload.payload as CollectionUpdate);
         });
 
         channel.on('broadcast', { event: 'collection_deleted' }, (payload) => {
-          handleIncomingCollectionDelete(payload.payload);
+          handleIncomingCollectionDelete(payload.payload as { collection_id: string; user_id: string });
         });
 
         channel.on('broadcast', { event: 'item_created' }, (payload) => {
-          handleIncomingItemCreate(payload.payload);
+          handleIncomingItemCreate(payload.payload as {
+            collection_id: string;
+            item: CollectionItemWithValues;
+            user_id: string;
+          });
         });
 
         channel.on('broadcast', { event: 'item_updated' }, (payload) => {
-          handleIncomingItemUpdate(payload.payload);
+          handleIncomingItemUpdate(payload.payload as ItemUpdate);
         });
 
         channel.on('broadcast', { event: 'item_deleted' }, (payload) => {
-          handleIncomingItemDelete(payload.payload);
+          handleIncomingItemDelete(payload.payload as {
+            collection_id: string;
+            item_id: string;
+            user_id: string;
+          });
         });
 
         channel.subscribe((status) => {

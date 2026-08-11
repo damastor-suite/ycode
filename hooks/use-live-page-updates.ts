@@ -77,15 +77,15 @@ export function useLivePageUpdates(): UseLivePageUpdatesReturn {
         if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'page_update' }, (payload) => {
-          handleIncomingPageUpdate(payload.payload);
+          handleIncomingPageUpdate(payload.payload as PageUpdate);
         });
 
         channel.on('broadcast', { event: 'page_created' }, (payload) => {
-          handleIncomingPageCreate(payload.payload);
+          handleIncomingPageCreate(payload.payload as Page);
         });
 
         channel.on('broadcast', { event: 'page_deleted' }, (payload) => {
-          handleIncomingPageDelete(payload.payload);
+          handleIncomingPageDelete(payload.payload as { pageId: string });
         });
 
         channel.subscribe((status) => {

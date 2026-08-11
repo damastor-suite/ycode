@@ -53,15 +53,15 @@ export function useLiveLayerStyleUpdates(): UseLiveLayerStyleUpdatesReturn {
         if (!lifecycle.track(channel)) return;
 
         channel.on('broadcast', { event: 'style_created' }, (payload) => {
-          handleIncomingStyleCreate(payload.payload);
+          handleIncomingStyleCreate(payload.payload as { style: LayerStyle; user_id: string });
         });
 
         channel.on('broadcast', { event: 'style_updated' }, (payload) => {
-          handleIncomingStyleUpdate(payload.payload);
+          handleIncomingStyleUpdate(payload.payload as StyleUpdate);
         });
 
         channel.on('broadcast', { event: 'style_deleted' }, (payload) => {
-          handleIncomingStyleDelete(payload.payload);
+          handleIncomingStyleDelete(payload.payload as { style_id: string; user_id: string });
         });
 
         channel.subscribe((status) => {

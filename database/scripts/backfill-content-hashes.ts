@@ -131,7 +131,7 @@ async function backfillPageLayersHashes(db: Knex) {
     try {
       const hash = generatePageLayersHash({
         layers: record.layers || [],
-        generated_css: record.generated_css || null,
+        generated_css: asNullableString(record.generated_css),
       });
 
       await db('page_layers')
