@@ -1,7 +1,10 @@
 import { cache } from 'react';
+import type { Knex } from 'knex';
+
 import { escapeHtml } from '@/lib/escape-html';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { getKnexClient } from '@/lib/knex-client';
+import { getDb } from '@/lib/platform/db';
+import { applyTenantFilter as applyTenantFilterWithTenant } from '@/lib/repositories/knex-repository-utils';
 import { buildSlugPath, buildDynamicPageUrl, buildLocalizedSlugPath, buildLocalizedDynamicPageUrl, detectLocaleFromPath, matchPageWithTranslatedSlugs, matchDynamicPageWithTranslatedSlugs } from '@/lib/page-utils';
 import { getItemWithValues, getItemsWithValues, getItemsWithValuesByIds, getItemIdsByFieldValue, getItemsByCollectionId, getSlugsByItemIds } from '@/lib/repositories/collectionItemRepository';
 import { getValuesByItemIds } from '@/lib/repositories/collectionItemValueRepository';
@@ -49,6 +52,43 @@ import { isVirtualAssetField, findDisplayField, hasDynamicDateRule, isDynamicDat
 import { getDefaultFormatId, isFormatValidForFieldType } from '@/lib/variable-format-utils';
 import type { DynamicVisibilityCondition, FieldVariable, AssetVariable, DynamicTextVariable, DynamicRichTextVariable, LinkSettings } from '@/types';
 import type { DesignColorVariable } from '@/types';
+
+type DbClient = Awaited<ReturnType<typeof getDb>>;
+
+async function scopedRows<T>(
+  db: DbClient,
+  tableName: string,
+  query: Knex.QueryBuilder,
+  tenantId?: string
+): Promise<T[]> {
+  const scoped = await applyTenantFilterWithTenant(db, query, tableName, tenantId);
+  return await scoped as T[];
+}
+
+async function scopedFirst<T>(
+  db: DbClient,
+  tableName: string,
+  query: Knex.QueryBuilder,
+  tenantId?: string
+): Promise<T | null> {
+  const scoped = await applyTenantFilterWithTenant(db, query, tableName, tenantId);
+  return (await scoped.first() as T | undefined) ?? null;
+}
+
+async function fetchPageLayersForPage(
+  pageId: string,
+  isPublished: boolean,
+  tenantId?: string
+): Promise<PageLayers | null> {
+  const db = await getDb();
+  return scopedFirst<PageLayers>(db, 'page_layers', db('page_layers')
+    .select('*')
+    .where('page_id', pageId)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at')
+    .orderBy('created_at', 'desc')
+    .limit(1), tenantId);
+}
 
 // Cached map provider tokens for synchronous use inside layerToHtml.
 // Set by ensureMapTokens() before HTML generation begins.
@@ -248,20 +288,14 @@ export async function loadTranslationsForLocale(
   tenantId?: string
 ): Promise<{ locale: Locale | null; translations: Record<string, Translation> }> {
   try {
-    const supabase = await getSupabaseAdmin(tenantId);
-
-    if (!supabase) {
-      return { locale: null, translations: {} };
-    }
+    const db = await getDb();
 
     // Find the locale by code
-    const { data: locale } = await supabase
-      .from('locales')
+    const locale = await scopedFirst<Locale>(db, 'locales', db('locales')
       .select('*')
-      .eq('code', localeCode)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .single();
+      .where('code', localeCode)
+      .where('is_published', isPublished)
+      .whereNull('deleted_at'), tenantId);
 
     if (!locale) {
       return { locale: null, translations: {} };
@@ -409,11 +443,7 @@ async function getCollectionItemBySlug(
   tenantId?: string
 ): Promise<CollectionItemWithValues | null> {
   try {
-    const supabase = await getSupabaseAdmin(tenantId);
-
-    if (!supabase) {
-      return null;
-    }
+    const db = await getDb();
 
     // If locale and translations are provided, try to find item by translated slug first
     if (locale && translations && collectionFields) {
@@ -434,17 +464,16 @@ async function getCollectionItemBySlug(
 
             // Verify this item belongs to the correct collection. On the public
             // path also require is_publishable so unpublished items can't resolve.
-            let itemQuery = supabase
-              .from('collection_items')
+            let itemQuery = db('collection_items')
               .select('*')
-              .eq('id', itemId)
-              .eq('collection_id', collectionId)
-              .eq('is_published', isPublished)
-              .is('deleted_at', null);
-            if (isPublished) itemQuery = itemQuery.eq('is_publishable', true);
-            const { data: item, error: itemError } = await itemQuery.single();
+              .where('id', itemId)
+              .where('collection_id', collectionId)
+              .where('is_published', isPublished)
+              .whereNull('deleted_at');
+            if (isPublished) itemQuery = itemQuery.where('is_publishable', true);
+            const item = await scopedFirst<{ id: string }>(db, 'collection_items', itemQuery, tenantId);
 
-            if (!itemError && item) {
+            if (item) {
               // Found the item via translation - return it with all values
               return await getItemWithValues(item.id, isPublished);
             }
@@ -454,33 +483,31 @@ async function getCollectionItemBySlug(
     }
 
     // Fall back to original slug lookup (no translation or translation not found)
-    const { data: valueData, error: valueError } = await supabase
-      .from('collection_item_values')
+    const valueData = await scopedFirst<{ item_id: string }>(db, 'collection_item_values', db('collection_item_values')
       .select('item_id')
-      .eq('field_id', slugFieldId)
-      .eq('value', slugValue)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
+      .where('field_id', slugFieldId)
+      .where('value', slugValue)
+      .where('is_published', isPublished)
+      .whereNull('deleted_at')
       .limit(1)
-      .single();
+    , tenantId);
 
-    if (valueError || !valueData) {
+    if (!valueData) {
       return null;
     }
 
     // Verify the item belongs to the correct collection. On the public path
     // also require is_publishable so unpublished items can't resolve.
-    let itemQuery = supabase
-      .from('collection_items')
+    let itemQuery = db('collection_items')
       .select('*')
-      .eq('id', valueData.item_id)
-      .eq('collection_id', collectionId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null);
-    if (isPublished) itemQuery = itemQuery.eq('is_publishable', true);
-    const { data: item, error: itemError } = await itemQuery.single();
+      .where('id', valueData.item_id)
+      .where('collection_id', collectionId)
+      .where('is_published', isPublished)
+      .whereNull('deleted_at');
+    if (isPublished) itemQuery = itemQuery.where('is_publishable', true);
+    const item = await scopedFirst<{ id: string }>(db, 'collection_items', itemQuery, tenantId);
 
-    if (itemError || !item) {
+    if (!item) {
       return null;
     }
 
@@ -510,25 +537,29 @@ async function fetchPageByPathInternal(
 ): Promise<PageData | null> {
   try {
     const resolveLayers = options?.resolveLayers !== false;
-    const supabase = await getSupabaseAdmin(tenantId);
-
-    if (!supabase) {
-      console.error('Supabase not configured');
-      return null;
-    }
+    const db = await getDb();
 
     // Fetch shared page lookup data in parallel.
     // Components/timezone are only needed when resolving layers.
-    const [{ data: availableLocales }, { data: pages }, { data: folders }, components, timezoneRaw] = await Promise.all([
-      supabase.from('locales').select('*').eq('is_published', isPublished).is('deleted_at', null),
-      supabase.from('pages').select('*').eq('is_published', isPublished).is('deleted_at', null),
-      supabase.from('page_folders').select('*').eq('is_published', isPublished).is('deleted_at', null),
-      resolveLayers ? fetchComponents(supabase, isPublished) : Promise.resolve([] as Component[]),
+    const [availableLocales, pages, folders, components, timezoneRaw] = await Promise.all([
+      scopedRows<Locale>(db, 'locales', db('locales')
+        .select('*')
+        .where('is_published', isPublished)
+        .whereNull('deleted_at'), tenantId),
+      scopedRows<Page>(db, 'pages', db('pages')
+        .select('*')
+        .where('is_published', isPublished)
+        .whereNull('deleted_at'), tenantId),
+      scopedRows<PageFolder>(db, 'page_folders', db('page_folders')
+        .select('*')
+        .where('is_published', isPublished)
+        .whereNull('deleted_at'), tenantId),
+      resolveLayers ? fetchComponents(isPublished, tenantId) : Promise.resolve([] as Component[]),
       resolveLayers ? getSettingByKey('timezone') : Promise.resolve('UTC'),
     ]);
     const timezone = (timezoneRaw as string | null) || 'UTC';
 
-    const validLocaleCodes = availableLocales?.map(l => l.code) || [];
+    const validLocaleCodes = availableLocales.map(l => l.code);
     const localeDetection = detectLocaleFromPath(slugPath, validLocaleCodes);
     const pathWithoutLocale = localeDetection?.remainingPath ?? slugPath;
 
@@ -543,10 +574,6 @@ async function fetchPageByPathInternal(
       );
       detectedLocale = locale;
       translations = trans;
-    }
-
-    if (!pages || !folders) {
-      return null;
     }
 
     const targetPath = pathWithoutLocale;
@@ -576,7 +603,7 @@ async function fetchPageByPathInternal(
           },
           components: homepageData.components,
           locale: detectedLocale,
-          availableLocales: availableLocales as Locale[] || [],
+          availableLocales,
           translations,
         };
       }
@@ -676,24 +703,16 @@ async function fetchPageByPathInternal(
                 collectionItem: enhancedCollectionItem,
                 collectionFields,
                 locale: detectedLocale,
-                availableLocales: availableLocales as Locale[] || [],
+                availableLocales,
                 translations,
               };
             }
 
             // Get layers for the dynamic page
-            const { data: pageLayers, error: layersError } = await supabase
-              .from('page_layers')
-              .select('*')
-              .eq('page_id', matchingPage.id)
-              .eq('is_published', isPublished)
-              .is('deleted_at', null)
-              .order('created_at', { ascending: false })
-              .limit(1)
-              .single();
+            const pageLayers = await fetchPageLayersForPage(matchingPage.id, isPublished, tenantId);
 
-            if (layersError) {
-              console.error(`Failed to fetch ${isPublished ? 'published' : 'draft'} layers:`, layersError);
+            if (!pageLayers) {
+              console.error(`Failed to fetch ${isPublished ? 'published' : 'draft'} layers`);
               return null;
             }
 
@@ -807,7 +826,7 @@ async function fetchPageByPathInternal(
               pageCollectionSortedItemIds,
               pageCollectionSortedItemSlugs,
               locale: detectedLocale,
-              availableLocales: availableLocales as Locale[] || [],
+              availableLocales,
               translations,
               generatedCss: pageLayers?.generated_css || null,
             };
@@ -826,24 +845,16 @@ async function fetchPageByPathInternal(
         pageLayers: { layers: [] } as any,
         components: [],
         locale: detectedLocale,
-        availableLocales: availableLocales as Locale[] || [],
+        availableLocales,
         translations,
       };
     }
 
     // Get layers for the matched page
-    const { data: pageLayers, error: layersError } = await supabase
-      .from('page_layers')
-      .select('*')
-      .eq('page_id', matchingPage.id)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
+    const pageLayers = await fetchPageLayersForPage(matchingPage.id, isPublished, tenantId);
 
-    if (layersError) {
-      console.error(`Failed to fetch ${isPublished ? 'published' : 'draft'} layers:`, layersError);
+    if (!pageLayers) {
+      console.error(`Failed to fetch ${isPublished ? 'published' : 'draft'} layers`);
       return null;
     }
 
@@ -877,7 +888,7 @@ async function fetchPageByPathInternal(
       },
       components,
       locale: detectedLocale,
-      availableLocales: availableLocales as Locale[] || [],
+      availableLocales,
       translations,
       generatedCss: pageLayers?.generated_css || null,
     };
@@ -915,50 +926,34 @@ export async function fetchErrorPage(
   tenantId?: string
 ): Promise<PageData | null> {
   try {
-    const supabase = await getSupabaseAdmin(tenantId);
-
-    if (!supabase) {
-      console.error('Supabase not configured');
-      return null;
-    }
+    const db = await getDb();
 
     // Get all active locales from the database
-    const { data: availableLocales } = await supabase
-      .from('locales')
+    const availableLocales = await scopedRows<Locale>(db, 'locales', db('locales')
       .select('*')
-      .eq('is_published', isPublished)
-      .is('deleted_at', null);
+      .where('is_published', isPublished)
+      .whereNull('deleted_at'), tenantId);
 
     // Get the error page
-    const { data: errorPage } = await supabase
-      .from('pages')
+    const errorPage = await scopedFirst<Page>(db, 'pages', db('pages')
       .select('*')
-      .eq('error_page', errorCode)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .single();
+      .where('error_page', errorCode)
+      .where('is_published', isPublished)
+      .whereNull('deleted_at'), tenantId);
 
     if (!errorPage) {
       return null;
     }
 
     // Get layers for the error page
-    const { data: pageLayers, error: layersError } = await supabase
-      .from('page_layers')
-      .select('*')
-      .eq('page_id', errorPage.id)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
+    const pageLayers = await fetchPageLayersForPage(errorPage.id, isPublished, tenantId);
 
-    if (layersError) {
-      console.error(`Failed to fetch ${isPublished ? 'published' : 'draft'} error page layers:`, layersError);
+    if (!pageLayers) {
+      console.error(`Failed to fetch ${isPublished ? 'published' : 'draft'} error page layers`);
       return null;
     }
 
-    const components = await fetchComponents(supabase, isPublished);
+    const components = await fetchComponents(isPublished, tenantId);
 
     // First, resolve components so collection layers inside components are available
     const layersWithComponents = resolveComponents(pageLayers?.layers || [], components);
@@ -984,7 +979,7 @@ export async function fetchErrorPage(
       },
       components, // Layers are pre-resolved; components passed for rich-text embedded rendering
       locale: null, // Error pages don't have locale context
-      availableLocales: availableLocales as Locale[] || [],
+      availableLocales,
       translations: {}, // Error pages don't have translations
     };
   } catch (error) {
@@ -1008,21 +1003,26 @@ export const fetchHomepage = cache(async function fetchHomepage(
   translations?: Record<string, Translation>
 ): Promise<Pick<PageData, 'page' | 'pageLayers' | 'components' | 'locale' | 'availableLocales' | 'translations' | 'generatedCss'> | null> {
   try {
-    const supabase = await getSupabaseAdmin(tenantId);
-
-    if (!supabase) {
-      return null;
-    }
+    const db = await getDb();
 
     // Fetch locales, homepage, and components in parallel
     const [
-      { data: availableLocales },
-      { data: homepage },
+      availableLocales,
+      homepage,
       componentsResult,
     ] = await Promise.all([
-      supabase.from('locales').select('*').eq('is_published', isPublished).is('deleted_at', null),
-      supabase.from('pages').select('*').eq('is_index', true).is('page_folder_id', null).eq('is_published', isPublished).is('deleted_at', null).limit(1).single(),
-      preloadedComponents ? Promise.resolve(preloadedComponents) : fetchComponents(supabase, isPublished),
+      scopedRows<Locale>(db, 'locales', db('locales')
+        .select('*')
+        .where('is_published', isPublished)
+        .whereNull('deleted_at'), tenantId),
+      scopedFirst<Page>(db, 'pages', db('pages')
+        .select('*')
+        .where('is_index', true)
+        .whereNull('page_folder_id')
+        .where('is_published', isPublished)
+        .whereNull('deleted_at')
+        .limit(1), tenantId),
+      preloadedComponents ? Promise.resolve(preloadedComponents) : fetchComponents(isPublished, tenantId),
     ]);
 
     if (!homepage) {
@@ -1032,17 +1032,9 @@ export const fetchHomepage = cache(async function fetchHomepage(
     const components = componentsResult;
 
     // Get layers for homepage (depends on homepage.id)
-    const { data: pageLayers, error: layersError } = await supabase
-      .from('page_layers')
-      .select('*')
-      .eq('page_id', homepage.id)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
+    const pageLayers = await fetchPageLayersForPage(homepage.id, isPublished, tenantId);
 
-    if (layersError) {
+    if (!pageLayers) {
       return null;
     }
 
@@ -1074,7 +1066,7 @@ export const fetchHomepage = cache(async function fetchHomepage(
       },
       components,
       locale: null,
-      availableLocales: availableLocales as Locale[] || [],
+      availableLocales,
       translations: translations || {},
       generatedCss: pageLayers?.generated_css || null,
     };
@@ -1085,17 +1077,15 @@ export const fetchHomepage = cache(async function fetchHomepage(
 
 /**
  * Fetch all components from the database
- * @param supabase - Supabase client
  * @param isPublished - Whether to fetch published or draft components (defaults to false for draft)
  * @returns Array of components or empty array if fetch fails
  */
-async function fetchComponents(supabase: any, isPublished: boolean = false): Promise<Component[]> {
-  const { data: components } = await supabase
-    .from('components')
+async function fetchComponents(isPublished: boolean = false, tenantId?: string): Promise<Component[]> {
+  const db = await getDb();
+  return scopedRows<Component>(db, 'components', db('components')
     .select('*')
-    .eq('is_published', isPublished)
-    .is('deleted_at', null);
-  return components || [];
+    .where('is_published', isPublished)
+    .whereNull('deleted_at'), tenantId);
 }
 
 /**
@@ -2144,8 +2134,7 @@ async function buildCollectionCache(
   };
   if (collectionIds.size === 0) return empty;
 
-  const client = await getSupabaseAdmin();
-  if (!client) return empty;
+  const db = await getDb();
 
   // Warm direct DB connection in parallel so first-hit value queries don't pay
   // connection setup cost on the critical path.
@@ -2156,29 +2145,27 @@ async function buildCollectionCache(
   const ids = Array.from(collectionIds);
 
   // Phase 1: Fetch fields for all collections (needed to discover reference collections)
-  const { data: nonComputedFieldsData } = await client
-    .from('collection_fields')
+  const nonComputedFieldsData = await scopedRows<CollectionField>(db, 'collection_fields', db('collection_fields')
     .select('*')
-    .in('collection_id', ids)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .eq('is_computed', false)
-    .order('order', { ascending: true })
-    .limit(5000);
+    .whereIn('collection_id', ids)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at')
+    .where('is_computed', false)
+    .orderBy('order', 'asc')
+    .limit(5000));
 
   // Count fields are computed but their config is needed during render so layers
   // bound to a count value can resolve correctly. Pull them in alongside the
   // regular fields. Other computed types (e.g. status) are still excluded.
-  const { data: countFieldsData } = await client
-    .from('collection_fields')
+  const countFieldsData = await scopedRows<CollectionField>(db, 'collection_fields', db('collection_fields')
     .select('*')
-    .in('collection_id', ids)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .eq('type', 'count')
-    .limit(5000);
+    .whereIn('collection_id', ids)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at')
+    .where('type', 'count')
+    .limit(5000));
 
-  const fieldsData = [...(nonComputedFieldsData || []), ...(countFieldsData || [])];
+  const fieldsData = [...nonComputedFieldsData, ...countFieldsData];
 
   // Discover referenced collections so we can pre-fetch their data too.
   // When boundFieldIds is supplied, only follow reference fields that are bound.
@@ -2230,23 +2217,21 @@ async function buildCollectionCache(
 
   const fetchItemsForCollection = async (collectionId: string) => {
     const all: any[] = [];
-    for (let from = 0; from < PER_COLLECTION_LIMIT; from += ITEMS_PAGE_SIZE) {
-      const to = Math.min(from + ITEMS_PAGE_SIZE - 1, PER_COLLECTION_LIMIT - 1);
-      let q = client
-        .from('collection_items')
+    for (let offset = 0; offset < PER_COLLECTION_LIMIT; offset += ITEMS_PAGE_SIZE) {
+      let q = db('collection_items')
         .select('*')
-        .eq('collection_id', collectionId)
-        .eq('is_published', isPublished)
-        .is('deleted_at', null)
-        .order('manual_order', { ascending: true })
-        .order('created_at', { ascending: false })
-        .range(from, to);
-      if (isPublished) q = q.eq('is_publishable', true);
-      const { data, error } = await q;
-      if (error) throw new Error(`Failed to fetch items: ${error.message}`);
-      if (!data || data.length === 0) break;
+        .where('collection_id', collectionId)
+        .where('is_published', isPublished)
+        .whereNull('deleted_at')
+        .orderBy('manual_order', 'asc')
+        .orderBy('created_at', 'desc')
+        .limit(ITEMS_PAGE_SIZE)
+        .offset(offset);
+      if (isPublished) q = q.where('is_publishable', true);
+      const data = await scopedRows<any>(db, 'collection_items', q);
+      if (data.length === 0) break;
       all.push(...data);
-      if (data.length < (to - from + 1)) break;
+      if (data.length < ITEMS_PAGE_SIZE) break;
     }
     return all;
   };
@@ -2256,19 +2241,19 @@ async function buildCollectionCache(
     .catch(error => ({ data: [] as any[], error }));
 
   const refFieldsPromise = refCollectionIds.length > 0
-    ? client.from('collection_fields').select('*')
-      .in('collection_id', refCollectionIds)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .eq('is_computed', false)
-      .order('order', { ascending: true })
-      .limit(5000)
-    : Promise.resolve({ data: [] as any[] });
+    ? scopedRows<CollectionField>(db, 'collection_fields', db('collection_fields').select('*')
+      .whereIn('collection_id', refCollectionIds)
+      .where('is_published', isPublished)
+      .whereNull('deleted_at')
+      .where('is_computed', false)
+      .orderBy('order', 'asc')
+      .limit(5000))
+    : Promise.resolve([] as CollectionField[]);
 
-  const [{ data: itemsData }, { data: refFieldsRaw }] = await Promise.all([itemsPromise, refFieldsPromise]);
+  const [{ data: itemsData }, refFieldsRaw] = await Promise.all([itemsPromise, refFieldsPromise]);
 
   // Build field structures
-  const allFieldsData = [...(fieldsData || []), ...(refFieldsRaw || [])];
+  const allFieldsData = [...fieldsData, ...refFieldsRaw];
   const fieldsByCollection = new Map<string, CollectionField[]>();
   const fieldTypeMap: Record<string, string> = {};
   for (const f of allFieldsData) {

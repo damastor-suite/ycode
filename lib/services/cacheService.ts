@@ -1,6 +1,9 @@
 import { revalidateTag, revalidatePath } from 'next/cache';
 import { invalidateByTag } from '@vercel/functions';
-import { getSupabaseAdmin, getSupabaseConfig } from '@/lib/supabase-server';
+import type { Knex } from 'knex';
+
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import { buildSlugPath, normalizeSlugSegment } from '@/lib/page-utils';
 import type { Page, PageFolder } from '@/types';
 import type {
@@ -29,10 +32,27 @@ const MAX_ROUTES_TO_WARM_TOTAL = (() => {
   const raw = Number(process.env.CACHE_WARM_MAX_TOTAL);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2000;
 })();
-
-type SupabaseAdmin = NonNullable<Awaited<ReturnType<typeof getSupabaseAdmin>>>;
-
 const SUPABASE_IN_LIMIT = 500;
+
+type DbClient = Awaited<ReturnType<typeof getDb>>;
+
+async function scopedQuery<T>(
+  db: DbClient,
+  tableName: string,
+  query: Knex.QueryBuilder
+): Promise<T[]> {
+  const scoped = await addTenantFilter(db, query, tableName);
+  return await scoped as T[];
+}
+
+async function scopedFirst<T>(
+  db: DbClient,
+  tableName: string,
+  query: Knex.QueryBuilder
+): Promise<T | null> {
+  const scoped = await addTenantFilter(db, query, tableName);
+  return (await scoped.first() as T | undefined) ?? null;
+}
 
 /**
  * Vercel's bulk cache-tag purge API accepts at most 16 tags per call
@@ -162,44 +182,51 @@ export async function clearAllCache(): Promise<void> {
 export async function getRoutePathsForPages(pageIds: string[]): Promise<string[]> {
   if (pageIds.length === 0) return [];
 
-  const client = await getSupabaseAdmin();
-  if (!client) return [];
+  const db = await getDb();
 
   const [
-    { data: pages },
-    { data: folders },
-    { data: locales },
-    { data: translations },
+    pages,
+    folders,
+    locales,
+    translations,
   ] = await Promise.all([
-    client.from('pages').select('*').in('id', pageIds).eq('is_published', true).is('deleted_at', null),
-    client.from('page_folders').select('*').eq('is_published', true).is('deleted_at', null),
-    client.from('locales').select('*').is('deleted_at', null),
-    client.from('translations').select('*').eq('is_published', true).is('deleted_at', null),
+    scopedQuery<Page>(db, 'pages', db('pages')
+      .select('*')
+      .whereIn('id', pageIds)
+      .where('is_published', true)
+      .whereNull('deleted_at')),
+    scopedQuery<PageFolder>(db, 'page_folders', db('page_folders')
+      .select('*')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ id: string; code: string; is_default: boolean }>[number]>(db, 'locales', db('locales')
+      .select('*')
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ locale_id: string; source_type: string; source_id: string; content_key: string; content_value: string }>[number]>(db, 'translations', db('translations')
+      .select('*')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
   ]);
-
-  if (!pages || !folders) return [];
 
   const routePaths: string[] = [];
   const dynamicPages: Page[] = [];
 
   // Build translations lookup
   const translationsMap: Record<string, Record<string, string>> = {};
-  if (translations) {
-    for (const t of translations) {
-      if (!translationsMap[t.locale_id]) translationsMap[t.locale_id] = {};
-      const key = `${t.source_type}:${t.source_id}:${t.content_key}`;
-      translationsMap[t.locale_id][key] = t.content_value;
-    }
+  for (const t of translations) {
+    if (!translationsMap[t.locale_id]) translationsMap[t.locale_id] = {};
+    const key = `${t.source_type}:${t.source_id}:${t.content_key}`;
+    translationsMap[t.locale_id][key] = t.content_value;
   }
 
-  for (const page of pages as Page[]) {
+  for (const page of pages) {
     if (page.is_dynamic) {
       dynamicPages.push(page);
       continue;
     }
 
     // Default locale path
-    const defaultPath = buildSlugPath(page, folders as PageFolder[], 'page');
+    const defaultPath = buildSlugPath(page, folders, 'page');
     const trimmed = defaultPath.slice(1); // Remove leading "/"
 
     if (page.is_index && page.page_folder_id === null) {
@@ -209,39 +236,37 @@ export async function getRoutePathsForPages(pageIds: string[]): Promise<string[]
     }
 
     // Locale variant paths
-    if (locales) {
-      for (const locale of locales) {
-        if (locale.is_default) continue;
-        const localeTranslations = translationsMap[locale.id] || {};
+    for (const locale of locales) {
+      if (locale.is_default) continue;
+      const localeTranslations = translationsMap[locale.id] || {};
 
         const slugParts: string[] = [locale.code];
 
-        let currentFolderId = page.page_folder_id;
-        const folderSegments: string[] = [];
-        while (currentFolderId) {
-          const folder = (folders as PageFolder[]).find(f => f.id === currentFolderId);
-          if (!folder) break;
-          const tKey = `folder:${folder.id}:slug`;
-          folderSegments.unshift(localeTranslations[tKey] || folder.slug);
-          currentFolderId = folder.page_folder_id;
-        }
-        slugParts.push(...folderSegments);
-
-        if (!page.is_index && page.slug) {
-          const pageKey = `page:${page.id}:slug`;
-          slugParts.push(localeTranslations[pageKey] || page.slug);
-        }
-
-        const localePath = slugParts.map(normalizeSlugSegment).filter(Boolean).join('/');
-        if (localePath) routePaths.push(localePath);
+      let currentFolderId = page.page_folder_id;
+      const folderSegments: string[] = [];
+      while (currentFolderId) {
+        const folder = folders.find(f => f.id === currentFolderId);
+        if (!folder) break;
+        const tKey = `folder:${folder.id}:slug`;
+        folderSegments.unshift(localeTranslations[tKey] || folder.slug);
+        currentFolderId = folder.page_folder_id;
       }
+      slugParts.push(...folderSegments);
+
+      if (!page.is_index && page.slug) {
+        const pageKey = `page:${page.id}:slug`;
+        slugParts.push(localeTranslations[pageKey] || page.slug);
+      }
+
+      const localePath = slugParts.map(normalizeSlugSegment).filter(Boolean).join('/');
+      if (localePath) routePaths.push(localePath);
     }
   }
 
   // Resolve actual URLs for dynamic pages by enumerating collection item slugs
   if (dynamicPages.length > 0) {
     const dynamicRoutes = await resolveDynamicPageRoutes(
-      client, dynamicPages, folders as PageFolder[], locales || [], translationsMap,
+      db, dynamicPages, folders, locales, translationsMap,
     );
     routePaths.push(...dynamicRoutes);
   }
@@ -255,7 +280,7 @@ export async function getRoutePathsForPages(pageIds: string[]): Promise<string[]
  * values of published items to build the real URL paths.
  */
 async function resolveDynamicPageRoutes(
-  client: SupabaseAdmin,
+  db: DbClient,
   dynamicPages: Page[],
   folders: PageFolder[],
   locales: Array<{ id: string; code: string; is_default: boolean }>,
@@ -267,37 +292,33 @@ async function resolveDynamicPageRoutes(
     const collectionId = (page.settings as any)?.cms?.collection_id;
     if (!collectionId) continue;
 
-    const { data: slugField } = await client
-      .from('collection_fields')
+    const slugField = await scopedFirst<{ id: string }>(db, 'collection_fields', db('collection_fields')
       .select('id')
-      .eq('collection_id', collectionId)
-      .eq('key', 'slug')
-      .is('deleted_at', null)
-      .limit(1)
-      .single();
+      .where('collection_id', collectionId)
+      .where('key', 'slug')
+      .whereNull('deleted_at')
+      .limit(1));
 
     if (!slugField) continue;
 
-    const { data: items } = await client
-      .from('collection_items')
+    const items = await scopedQuery<Array<{ id: string }>[number]>(db, 'collection_items', db('collection_items')
       .select('id')
-      .eq('collection_id', collectionId)
-      .eq('is_published', true)
-      .is('deleted_at', null);
+      .where('collection_id', collectionId)
+      .where('is_published', true)
+      .whereNull('deleted_at'));
 
-    if (!items || items.length === 0) continue;
+    if (items.length === 0) continue;
 
     const itemIds = items.map(i => i.id);
     const slugValues: Array<{ item_id: string; value: unknown }> = [];
     for (const idChunk of chunk(itemIds, SUPABASE_IN_LIMIT)) {
-      const { data } = await client
-        .from('collection_item_values')
+      const data = await scopedQuery<Array<{ item_id: string; value: unknown }>[number]>(db, 'collection_item_values', db('collection_item_values')
         .select('item_id, value')
-        .eq('field_id', slugField.id)
-        .eq('is_published', true)
-        .is('deleted_at', null)
-        .in('item_id', idChunk);
-      if (data) slugValues.push(...data);
+        .where('field_id', slugField.id)
+        .where('is_published', true)
+        .whereNull('deleted_at')
+        .whereIn('item_id', idChunk));
+      slugValues.push(...data);
     }
 
     if (slugValues.length === 0) continue;
@@ -351,31 +372,38 @@ export async function getRoutePathsForDeletedCollectionItems(
 ): Promise<string[]> {
   if (deletedSlugs.size === 0) return [];
 
-  const client = await getSupabaseAdmin();
-  if (!client) return [];
+  const db = await getDb();
 
   const routes: string[] = [];
 
   const [
-    { data: dynamicPages },
-    { data: folders },
-    { data: locales },
-    { data: translations },
+    dynamicPages,
+    folders,
+    locales,
+    translations,
   ] = await Promise.all([
-    client.from('pages').select('*').eq('is_published', true).eq('is_dynamic', true).is('deleted_at', null),
-    client.from('page_folders').select('*').eq('is_published', true).is('deleted_at', null),
-    client.from('locales').select('*').is('deleted_at', null),
-    client.from('translations')
+    scopedQuery<Page>(db, 'pages', db('pages')
+      .select('*')
+      .where('is_published', true)
+      .where('is_dynamic', true)
+      .whereNull('deleted_at')),
+    scopedQuery<PageFolder>(db, 'page_folders', db('page_folders')
+      .select('*')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ id: string; code: string; is_default: boolean }>[number]>(db, 'locales', db('locales')
+      .select('*')
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ locale_id: string; source_type: string; source_id: string; content_key: string; content_value: string }>[number]>(db, 'translations', db('translations')
       .select('locale_id, source_type, source_id, content_key, content_value')
-      .eq('is_published', true).is('deleted_at', null)
-      .in('content_key', ['slug', 'field:key:slug']),
+      .where('is_published', true)
+      .whereNull('deleted_at')
+      .whereIn('content_key', ['slug', 'field:key:slug'])),
   ]);
-
-  if (!dynamicPages || !folders) return [];
 
   // Build translations lookup: locale_id → "type:source:key" → value
   const translationsMap: Record<string, Record<string, string>> = {};
-  for (const t of translations || []) {
+  for (const t of translations) {
     if (!translationsMap[t.locale_id]) translationsMap[t.locale_id] = {};
     translationsMap[t.locale_id][`${t.source_type}:${t.source_id}:${t.content_key}`] = t.content_value;
   }
@@ -386,29 +414,26 @@ export async function getRoutePathsForDeletedCollectionItems(
   const slugToItemIdByCollection = new Map<string, Map<string, string>>();
   for (const [collectionId, slugs] of deletedSlugs) {
     if (!slugs || slugs.length === 0) continue;
-    const { data: slugField } = await client
-      .from('collection_fields')
+    const slugField = await scopedFirst<{ id: string }>(db, 'collection_fields', db('collection_fields')
       .select('id')
-      .eq('collection_id', collectionId)
-      .eq('key', 'slug')
-      .is('deleted_at', null)
-      .limit(1)
-      .single();
+      .where('collection_id', collectionId)
+      .where('key', 'slug')
+      .whereNull('deleted_at')
+      .limit(1));
     if (!slugField) continue;
-    const { data: values } = await client
-      .from('collection_item_values')
+    const values = await scopedQuery<Array<{ item_id: string; value: unknown }>[number]>(db, 'collection_item_values', db('collection_item_values')
       .select('item_id, value')
-      .eq('field_id', slugField.id)
-      .is('deleted_at', null)
-      .in('value', slugs);
+      .where('field_id', slugField.id)
+      .whereNull('deleted_at')
+      .whereIn('value', slugs));
     const map = new Map<string, string>();
-    for (const v of values || []) {
+    for (const v of values) {
       if (typeof v.value === 'string') map.set(v.value, v.item_id);
     }
     slugToItemIdByCollection.set(collectionId, map);
   }
 
-  for (const page of dynamicPages as Page[]) {
+  for (const page of dynamicPages) {
     const collectionId = (page.settings as any)?.cms?.collection_id;
     if (!collectionId) continue;
 
@@ -416,7 +441,7 @@ export async function getRoutePathsForDeletedCollectionItems(
     if (!slugs || slugs.length === 0) continue;
 
     const slugToItemId = slugToItemIdByCollection.get(collectionId) || new Map<string, string>();
-    const basePath = buildSlugPath(page, folders as PageFolder[], 'page', '').slice(1).replace(/\/$/, '');
+    const basePath = buildSlugPath(page, folders, 'page', '').slice(1).replace(/\/$/, '');
 
     for (const itemSlug of slugs) {
       const fullPath = basePath ? `${basePath}/${itemSlug}` : itemSlug;
@@ -425,25 +450,23 @@ export async function getRoutePathsForDeletedCollectionItems(
       const itemId = slugToItemId.get(itemSlug);
 
       // Locale-prefixed paths with translated folder + item slugs
-      if (locales) {
-        for (const locale of locales) {
-          if (locale.is_default) continue;
-          const lt = translationsMap[locale.id] || {};
-          const slugParts: string[] = [locale.code];
-          let currentFolderId = page.page_folder_id;
-          const folderSegments: string[] = [];
-          while (currentFolderId) {
-            const folder = (folders as PageFolder[]).find(f => f.id === currentFolderId);
-            if (!folder) break;
-            folderSegments.unshift(lt[`folder:${folder.id}:slug`] || folder.slug);
-            currentFolderId = folder.page_folder_id;
-          }
-          slugParts.push(...folderSegments);
-          const translatedSlug = itemId ? lt[`cms:${itemId}:field:key:slug`] : undefined;
-          slugParts.push(translatedSlug || itemSlug);
-          const localePath = slugParts.map(normalizeSlugSegment).filter(Boolean).join('/');
-          if (localePath) routes.push(localePath);
+      for (const locale of locales) {
+        if (locale.is_default) continue;
+        const lt = translationsMap[locale.id] || {};
+        const slugParts: string[] = [locale.code];
+        let currentFolderId = page.page_folder_id;
+        const folderSegments: string[] = [];
+        while (currentFolderId) {
+          const folder = folders.find(f => f.id === currentFolderId);
+          if (!folder) break;
+          folderSegments.unshift(lt[`folder:${folder.id}:slug`] || folder.slug);
+          currentFolderId = folder.page_folder_id;
         }
+        slugParts.push(...folderSegments);
+        const translatedSlug = itemId ? lt[`cms:${itemId}:field:key:slug`] : undefined;
+        slugParts.push(translatedSlug || itemSlug);
+        const localePath = slugParts.map(normalizeSlugSegment).filter(Boolean).join('/');
+        if (localePath) routes.push(localePath);
       }
     }
   }
@@ -503,20 +526,18 @@ export interface SelectiveInvalidationResult {
 async function hasErrorPage(pageIds: string[]): Promise<boolean> {
   if (pageIds.length === 0) return false;
 
-  const client = await getSupabaseAdmin();
-  if (!client) return false;
+  const db = await getDb();
 
   for (const ids of chunk(pageIds, SUPABASE_IN_LIMIT)) {
-    const { data } = await client
-      .from('pages')
+    const data = await scopedQuery<Array<{ id: string }>[number]>(db, 'pages', db('pages')
       .select('id')
-      .in('id', ids)
-      .eq('is_published', true)
-      .not('error_page', 'is', null)
-      .is('deleted_at', null)
-      .limit(1);
+      .whereIn('id', ids)
+      .where('is_published', true)
+      .whereNotNull('error_page')
+      .whereNull('deleted_at')
+      .limit(1));
 
-    if (data && data.length > 0) return true;
+    if (data.length > 0) return true;
   }
 
   return false;
@@ -578,16 +599,14 @@ export async function selectiveInvalidation(
  * visitor doesn't pay the cold-cache cost.
  */
 export async function getAllPublishedRoutes(): Promise<string[]> {
-  const client = await getSupabaseAdmin();
-  if (!client) return [];
+  const db = await getDb();
 
-  const { data: pages } = await client
-    .from('pages')
+  const pages = await scopedQuery<Array<{ id: string }>[number]>(db, 'pages', db('pages')
     .select('id')
-    .eq('is_published', true)
-    .is('deleted_at', null);
+    .where('is_published', true)
+    .whereNull('deleted_at'));
 
-  if (!pages || pages.length === 0) return [];
+  if (pages.length === 0) return [];
 
   return getRoutePathsForPages(pages.map((p) => p.id));
 }
@@ -630,22 +649,18 @@ async function warmBatch(routes: string[], baseUrl: string): Promise<void> {
 
 // ── Internal chain authentication ────────────────────────────────────────
 // The warm endpoint issues GETs to same-origin paths, so it must not be an
-// open amplification endpoint. Rather than make self-hosters configure a
-// dedicated secret, we sign each chain hop with an HMAC keyed on the Supabase
-// service-role key — a credential every deployment already has, that is
-// server-only and never sent to the browser. The raw key is never
-// transmitted; only the per-payload signature travels over the wire.
+// open amplification endpoint. Sign each chain hop with an existing server-only
+// app secret so the raw key never leaves the server.
 
 const WARM_SIGNATURE_HEADER = 'x-warm-signature';
 
-/** The HMAC key for chain auth: the service-role key the app already requires. */
+/** The HMAC key for chain auth. */
 async function getChainSigningKey(): Promise<string | null> {
-  try {
-    const creds = await getSupabaseConfig();
-    return creds?.serviceRoleKey ?? null;
-  } catch {
-    return null;
-  }
+  return process.env.CACHE_WARM_SECRET
+    || process.env.BETTER_AUTH_SECRET
+    || process.env.AUTH_SECRET
+    || process.env.NEXTAUTH_SECRET
+    || null;
 }
 
 /** HMAC-SHA256 of `message` keyed by `key`, hex-encoded. Web Crypto = runtime-agnostic. */
@@ -835,41 +850,58 @@ interface CurrentLocalisationState {
 
 /** Read everything we need to construct locale URLs (post-upsert state). */
 async function loadCurrentLocalisationState(): Promise<CurrentLocalisationState | null> {
-  const client = await getSupabaseAdmin();
-  if (!client) return null;
+  const db = await getDb();
 
   const [
-    { data: pages },
-    { data: folders },
-    { data: locales },
-    { data: translations },
-    { data: collectionItems },
-    { data: collectionFields },
-    { data: collectionItemValues },
+    pages,
+    folders,
+    locales,
+    translations,
+    collectionItems,
+    collectionFields,
+    collectionItemValues,
   ] = await Promise.all([
-    client.from('pages').select('*').eq('is_published', true).is('deleted_at', null),
-    client.from('page_folders').select('*').eq('is_published', true).is('deleted_at', null),
-    client.from('locales').select('*').eq('is_published', true).is('deleted_at', null),
-    client.from('translations').select('locale_id, source_type, source_id, content_key, content_value')
-      .eq('is_published', true).is('deleted_at', null)
-      .in('content_key', ['slug', 'field:key:slug']),
-    client.from('collection_items').select('id, collection_id').eq('is_published', true).is('deleted_at', null),
-    client.from('collection_fields').select('id, collection_id, key').eq('key', 'slug').is('deleted_at', null),
-    client.from('collection_item_values').select('item_id, field_id, value').eq('is_published', true).is('deleted_at', null),
+    scopedQuery<Page>(db, 'pages', db('pages')
+      .select('*')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
+    scopedQuery<PageFolder>(db, 'page_folders', db('page_folders')
+      .select('*')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ id: string; code: string; is_default: boolean }>[number]>(db, 'locales', db('locales')
+      .select('*')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ locale_id: string; source_type: string; source_id: string; content_key: string; content_value: string }>[number]>(db, 'translations', db('translations')
+      .select('locale_id', 'source_type', 'source_id', 'content_key', 'content_value')
+      .where('is_published', true)
+      .whereNull('deleted_at')
+      .whereIn('content_key', ['slug', 'field:key:slug'])),
+    scopedQuery<Array<{ id: string; collection_id: string }>[number]>(db, 'collection_items', db('collection_items')
+      .select('id', 'collection_id')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ id: string; collection_id: string; key: string }>[number]>(db, 'collection_fields', db('collection_fields')
+      .select('id', 'collection_id', 'key')
+      .where('key', 'slug')
+      .whereNull('deleted_at')),
+    scopedQuery<Array<{ item_id: string; field_id: string; value: unknown }>[number]>(db, 'collection_item_values', db('collection_item_values')
+      .select('item_id', 'field_id', 'value')
+      .where('is_published', true)
+      .whereNull('deleted_at')),
   ]);
 
-  if (!pages || !folders) return null;
-
   const pagesById = new Map<string, Page>();
-  for (const p of pages as Page[]) pagesById.set(p.id, p);
+  for (const p of pages) pagesById.set(p.id, p);
 
   const localesById = new Map<string, { id: string; code: string; is_default: boolean }>();
-  for (const l of locales || []) localesById.set(l.id, { id: l.id, code: l.code, is_default: l.is_default });
+  for (const l of locales) localesById.set(l.id, { id: l.id, code: l.code, is_default: l.is_default });
 
   const currentFolderSlugs = new Map<string, Map<string, string>>();
   const currentPageSlugs = new Map<string, Map<string, string>>();
   const currentCmsSlugs = new Map<string, Map<string, string>>();
-  for (const t of translations || []) {
+  for (const t of translations) {
     const target = t.source_type === 'folder' && t.content_key === 'slug'
       ? currentFolderSlugs
       : t.source_type === 'page' && t.content_key === 'slug'
@@ -882,9 +914,9 @@ async function loadCurrentLocalisationState(): Promise<CurrentLocalisationState 
     target.get(t.locale_id)!.set(t.source_id, t.content_value);
   }
 
-  const slugFieldIds = new Set((collectionFields || []).map((f) => f.id));
+  const slugFieldIds = new Set(collectionFields.map((f) => f.id));
   const itemSlugByItemId = new Map<string, string>();
-  for (const v of collectionItemValues || []) {
+  for (const v of collectionItemValues) {
     if (slugFieldIds.has(v.field_id) && typeof v.value === 'string' && v.value) {
       itemSlugByItemId.set(v.item_id, v.value);
     }
@@ -892,14 +924,14 @@ async function loadCurrentLocalisationState(): Promise<CurrentLocalisationState 
 
   const itemCollectionByItemId = new Map<string, string>();
   const collectionItemsByCollectionId = new Map<string, string[]>();
-  for (const it of collectionItems || []) {
+  for (const it of collectionItems) {
     itemCollectionByItemId.set(it.id, it.collection_id);
     if (!collectionItemsByCollectionId.has(it.collection_id)) collectionItemsByCollectionId.set(it.collection_id, []);
     collectionItemsByCollectionId.get(it.collection_id)!.push(it.id);
   }
 
   const dynamicPageByCollectionId = new Map<string, Page>();
-  for (const p of pages as Page[]) {
+  for (const p of pages) {
     if (!p.is_dynamic) continue;
     const cid = (p.settings as any)?.cms?.collection_id;
     if (cid) dynamicPageByCollectionId.set(cid, p);
@@ -907,8 +939,8 @@ async function loadCurrentLocalisationState(): Promise<CurrentLocalisationState 
 
   return {
     pagesById,
-    pages: pages as Page[],
-    folders: folders as PageFolder[],
+    pages,
+    folders,
     localesById,
     currentFolderSlugs,
     currentPageSlugs,

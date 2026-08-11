@@ -32,7 +32,8 @@ import {
   insertValuesBulk,
   getValuesByItemIds,
 } from '@/lib/repositories/collectionItemValueRepository';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 
 import {
   listCollectionsWithFields,
@@ -1081,15 +1082,13 @@ async function batchUpsertValues(
 /** Soft-delete a batch of YCode items. */
 async function batchSoftDelete(itemIds: string[]): Promise<void> {
   if (itemIds.length === 0) return;
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase not configured');
 
   const now = new Date().toISOString();
-  const { error } = await client
-    .from('collection_items')
+  const db = await getDb();
+  let query = db('collection_items')
     .update({ deleted_at: now, updated_at: now })
-    .in('id', itemIds)
-    .eq('is_published', false);
-
-  if (error) throw new Error(`Batch delete failed: ${error.message}`);
+    .whereIn('id', itemIds)
+    .where('is_published', false);
+  query = await addTenantFilter(db, query, 'collection_items');
+  await query;
 }

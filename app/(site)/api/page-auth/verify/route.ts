@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { timingSafeEqual } from 'crypto';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { noCache } from '@/lib/api-response';
 import { parseAuthCookie, buildAuthCookieValue, PAGE_AUTH_COOKIE_NAME } from '@/lib/page-auth';
+import { getPageById } from '@/lib/repositories/pageRepository';
+import { getPageFolderById } from '@/lib/repositories/pageFolderRepository';
 
 /**
  * Constant-time string comparison to prevent timing attacks
@@ -69,6 +70,33 @@ interface VerifyRequest {
   isPublished?: boolean;
 }
 
+interface AuthSettings {
+  auth?: {
+    enabled?: boolean;
+    password?: string;
+  };
+}
+
+function parseAuthSettings(settings: unknown): AuthSettings | null {
+  if (!settings) {
+    return null;
+  }
+
+  if (typeof settings === 'string') {
+    try {
+      return JSON.parse(settings) as AuthSettings;
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof settings === 'object') {
+    return settings as AuthSettings;
+  }
+
+  return null;
+}
+
 /**
  * POST /api/page-auth/verify
  *
@@ -111,39 +139,19 @@ export async function POST(request: NextRequest) {
       return noCache({ error: 'Invalid redirect URL' }, 400);
     }
 
-    // Get Supabase client
-    const supabase = await getSupabaseAdmin();
-    if (!supabase) {
-      return noCache({ error: 'Database not configured' }, 500);
-    }
-
     let expectedPassword: string | null = null;
     let unlockType: 'page' | 'folder' = 'page';
     let unlockId: string = '';
 
     if (pageId) {
       // Fetch the page to get its password
-      const { data: pages, error } = await supabase
-        .from('pages')
-        .select('id, settings')
-        .eq('id', pageId)
-        .eq('is_published', isPublished)
-        .is('deleted_at', null)
-        .limit(1);
-
-      if (error) {
-        return noCache({ error: 'Page not found' }, 404);
-      }
-
-      const page = pages?.[0];
+      const page = await getPageById(pageId, isPublished).catch(() => null);
       if (!page) {
         return noCache({ error: 'Page not found' }, 404);
       }
 
       // Handle settings - may be JSON string or object depending on database
-      const settings = typeof page.settings === 'string' 
-        ? JSON.parse(page.settings) 
-        : page.settings;
+      const settings = parseAuthSettings(page.settings);
       
       if (settings?.auth?.enabled && settings.auth.password) {
         expectedPassword = settings.auth.password;
@@ -154,27 +162,13 @@ export async function POST(request: NextRequest) {
 
     if (folderId && !expectedPassword) {
       // Fetch the folder to get its password
-      const { data: folders, error } = await supabase
-        .from('page_folders')
-        .select('id, settings')
-        .eq('id', folderId)
-        .eq('is_published', isPublished)
-        .is('deleted_at', null)
-        .limit(1);
-
-      if (error) {
-        return noCache({ error: 'Folder not found' }, 404);
-      }
-
-      const folder = folders?.[0];
+      const folder = await getPageFolderById(folderId, isPublished).catch(() => null);
       if (!folder) {
         return noCache({ error: 'Folder not found' }, 404);
       }
 
       // Handle settings - may be JSON string or object depending on database
-      const settings = typeof folder.settings === 'string' 
-        ? JSON.parse(folder.settings) 
-        : folder.settings;
+      const settings = parseAuthSettings(folder.settings);
       
       if (settings?.auth?.enabled && settings.auth.password) {
         expectedPassword = settings.auth.password;

@@ -1,12 +1,14 @@
 /**
- * File upload utilities for Supabase Storage
+ * File upload utilities for platform storage
  * Creates Asset records in database for uploaded files
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { createAsset } from '@/lib/repositories/assetRepository';
+import { deleteAsset as deleteAssetRecord, getAssetById } from '@/lib/repositories/assetRepository';
+import { getDb } from '@/lib/platform/db';
+import { getStorage } from '@/lib/platform/storage';
 import { isAssetOfType } from './asset-utils';
-import { ASSET_CATEGORIES, STORAGE_BUCKET, generateStoragePath, getDisplayName } from '@/lib/asset-constants';
+import { ASSET_CATEGORIES, generateStoragePath, getDisplayName } from '@/lib/asset-constants';
 import sharp from 'sharp';
 import type { Asset } from '@/types';
 
@@ -222,11 +224,7 @@ export async function uploadFile(
     }
 
     // For non-SVG files, proceed with storage upload
-    const supabase = await getSupabaseAdmin();
-
-    if (!supabase) {
-      throw new Error('Supabase client not available');
-    }
+    const storage = await getStorage();
 
     // Try to convert image to WebP
     const webpConversion = await convertImageToWebP(file);
@@ -263,27 +261,16 @@ export async function uploadFile(
       : file.name;
     const storagePath = generateStoragePath(effectiveFilename);
 
-    const { data, error } = await supabase.storage
-      .from(STORAGE_BUCKET)
-      .upload(storagePath, fileToUpload, {
-        cacheControl: '3600',
-        upsert: false,
-        contentType: mimeType,
-      });
-
-    if (error) {
-      console.error('Error uploading file:', error);
-      return null;
-    }
-
-    const { data: urlData } = supabase.storage
-      .from(STORAGE_BUCKET)
-      .getPublicUrl(data.path);
+    const { path } = await storage.upload(storagePath, fileToUpload, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType: mimeType,
+    });
 
     const asset = await createAsset({
       filename,
-      storage_path: data.path,
-      public_url: urlData.publicUrl,
+      storage_path: path,
+      public_url: storage.getPublicUrl(path),
       file_size: fileSize,
       mime_type: mimeType,
       width: dimensions?.width,
@@ -309,41 +296,22 @@ export async function uploadFile(
  */
 export async function deleteAsset(assetId: string): Promise<boolean> {
   try {
-    const supabase = await getSupabaseAdmin();
-
-    if (!supabase) {
-      throw new Error('Supabase client not available');
-    }
-
-    const { data: asset, error: fetchError } = await supabase
-      .from('assets')
-      .select('storage_path')
-      .eq('id', assetId)
-      .single();
-
-    if (fetchError || !asset) {
-      console.error('Error fetching asset:', fetchError);
+    const asset = await getAssetById(assetId);
+    if (!asset) {
+      console.error('Error fetching asset: asset not found');
       return false;
     }
 
-    const { error: storageError } = await supabase.storage
-      .from(STORAGE_BUCKET)
-      .remove([asset.storage_path]);
-
-    if (storageError) {
-      console.error('Error deleting file from storage:', storageError);
-      return false;
+    if (asset.storage_path) {
+      const storage = await getStorage();
+      await storage.remove([asset.storage_path]);
     }
 
-    const { error: dbError } = await supabase
-      .from('assets')
-      .delete()
-      .eq('id', assetId);
-
-    if (dbError) {
-      console.error('Error deleting asset from database:', dbError);
-      return false;
-    }
+    await deleteAssetRecord(assetId);
+    const knex = await getDb();
+    await knex('assets')
+      .where('id', assetId)
+      .del();
 
     return true;
   } catch (error) {

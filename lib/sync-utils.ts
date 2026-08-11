@@ -5,7 +5,13 @@
  * Both operations follow the same pattern with inverted is_published values.
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  getConflictColumns,
+  resolveTenantIdForTable,
+} from '@/lib/repositories/knex-repository-utils';
 import { SUPABASE_QUERY_LIMIT, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
 
 /** Direction of the sync operation */
@@ -17,6 +23,49 @@ export function getSyncFlags(direction: SyncDirection) {
     source: direction === 'publish' ? false : true,
     target: direction === 'publish' ? true : false,
   } as const;
+}
+
+type DbRow = Record<string, unknown> & { id: string };
+
+async function upsertRows(
+  tableName: string,
+  rows: DbRow[]
+): Promise<void> {
+  if (rows.length === 0) return;
+
+  const knex = await getDb();
+  const tenantId = await resolveTenantIdForTable(knex, tableName);
+  const conflictColumns = await getConflictColumns(knex, tableName, ['id', 'is_published'], tenantId);
+  const rowsWithTenant = await Promise.all(
+    rows.map((row) => addTenantIdToRow(knex, tableName, row, tenantId ?? undefined))
+  );
+
+  for (let i = 0; i < rowsWithTenant.length; i += SUPABASE_WRITE_BATCH_SIZE) {
+    const batch = rowsWithTenant.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
+    await knex(tableName)
+      .insert(batch)
+      .onConflict(conflictColumns)
+      .merge();
+  }
+}
+
+async function deleteRowsByIds(
+  tableName: string,
+  ids: string[],
+  isPublished: boolean
+): Promise<void> {
+  if (ids.length === 0) return;
+
+  const knex = await getDb();
+  for (let i = 0; i < ids.length; i += SUPABASE_WRITE_BATCH_SIZE) {
+    const batch = ids.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
+    let query = knex(tableName)
+      .where('is_published', isPublished)
+      .whereIn('id', batch)
+      .del();
+    query = await addTenantFilter(knex, query, tableName);
+    await query;
+  }
 }
 
 /**
@@ -31,32 +80,23 @@ export async function syncTableRows(
   direction: SyncDirection,
   options?: { ids?: string[]; excludeColumns?: string[] }
 ): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const { source, target } = getSyncFlags(direction);
 
-  let query = client
-    .from(tableName)
+  let query = knex(tableName)
     .select('*')
-    .eq('is_published', source)
-    .is('deleted_at', null)
+    .where('is_published', source)
+    .whereNull('deleted_at')
     .limit(SUPABASE_QUERY_LIMIT);
 
   if (options?.ids && options.ids.length > 0) {
-    query = query.in('id', options.ids);
+    query = query.whereIn('id', options.ids);
   }
 
-  const { data: sourceRows, error: fetchError } = await query;
+  query = await addTenantFilter(knex, query, tableName);
+  const sourceRows = await query as DbRow[];
 
-  if (fetchError) {
-    throw new Error(`Failed to fetch ${tableName} rows: ${fetchError.message}`);
-  }
-
-  if (!sourceRows || sourceRows.length === 0) {
+  if (sourceRows.length === 0) {
     return 0;
   }
 
@@ -68,16 +108,7 @@ export async function syncTableRows(
     return mapped;
   });
 
-  for (let i = 0; i < targetRows.length; i += SUPABASE_WRITE_BATCH_SIZE) {
-    const batch = targetRows.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-    const { error: upsertError } = await client
-      .from(tableName)
-      .upsert(batch, { onConflict: 'id,is_published' });
-
-    if (upsertError) {
-      throw new Error(`Failed to sync ${tableName}: ${upsertError.message}`);
-    }
-  }
+  await upsertRows(tableName, targetRows);
 
   return targetRows.length;
 }
@@ -108,38 +139,27 @@ export async function cleanupOrphanedRows(
     collectColumns?: string[];
   }
 ): Promise<CleanupResult> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const { source, target } = getSyncFlags(direction);
 
   // Get all source IDs
-  const { data: sourceRows, error: sourceError } = await client
-    .from(tableName)
+  let sourceQuery = knex(tableName)
     .select('id')
-    .eq('is_published', source)
-    .is('deleted_at', null)
+    .where('is_published', source)
+    .whereNull('deleted_at')
     .limit(SUPABASE_QUERY_LIMIT);
+  sourceQuery = await addTenantFilter(knex, sourceQuery, tableName);
+  const sourceRows = await sourceQuery as Array<{ id: string }>;
 
-  if (sourceError) {
-    throw new Error(`Failed to fetch source ${tableName} IDs: ${sourceError.message}`);
-  }
-
-  const sourceIds = new Set((sourceRows || []).map(r => r.id));
+  const sourceIds = new Set(sourceRows.map(r => r.id));
 
   // Get all target rows
-  const { data: targetRows, error: targetError } = await client
-    .from(tableName)
+  let targetQuery = knex(tableName)
     .select('*')
-    .eq('is_published', target)
+    .where('is_published', target)
     .limit(SUPABASE_QUERY_LIMIT);
-
-  if (targetError) {
-    throw new Error(`Failed to fetch target ${tableName} IDs: ${targetError.message}`);
-  }
+  targetQuery = await addTenantFilter(knex, targetQuery, tableName);
+  const targetRows = await targetQuery as DbRow[];
 
   const orphanedIds: string[] = [];
   const preservedIds: string[] = [];
@@ -150,7 +170,7 @@ export async function cleanupOrphanedRows(
     for (const col of collectColumns) collected[col] = [];
   }
 
-  for (const row of targetRows || []) {
+  for (const row of targetRows) {
     const r = row as Record<string, unknown>;
     const id = r.id as string;
 
@@ -177,24 +197,9 @@ export async function cleanupOrphanedRows(
     return { deleted: 0, preservedIds, collected };
   }
 
-  // Delete orphaned rows in batches
-  let deletedCount = 0;
-  for (let i = 0; i < orphanedIds.length; i += SUPABASE_WRITE_BATCH_SIZE) {
-    const batch = orphanedIds.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-    const { error: deleteError } = await client
-      .from(tableName)
-      .delete()
-      .eq('is_published', target)
-      .in('id', batch);
+  await deleteRowsByIds(tableName, orphanedIds, target);
 
-    if (deleteError) {
-      throw new Error(`Failed to cleanup orphaned ${tableName}: ${deleteError.message}`);
-    }
-
-    deletedCount += batch.length;
-  }
-
-  return { deleted: deletedCount, preservedIds, collected };
+  return { deleted: orphanedIds.length, preservedIds, collected };
 }
 
 /**
@@ -214,12 +219,7 @@ export async function syncTableRowsByParent(
 ): Promise<number> {
   if (parentIds.length === 0) return 0;
 
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const { source, target } = getSyncFlags(direction);
   const now = new Date().toISOString();
   let totalSynced = 0;
@@ -227,18 +227,15 @@ export async function syncTableRowsByParent(
   for (let i = 0; i < parentIds.length; i += SUPABASE_WRITE_BATCH_SIZE) {
     const batchIds = parentIds.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
 
-    const { data: sourceRows, error: fetchError } = await client
-      .from(tableName)
+    let query = knex(tableName)
       .select('*')
-      .eq('is_published', source)
-      .is('deleted_at', null)
-      .in(parentColumn, batchIds);
+      .where('is_published', source)
+      .whereNull('deleted_at')
+      .whereIn(parentColumn, batchIds);
+    query = await addTenantFilter(knex, query, tableName);
+    const sourceRows = await query as DbRow[];
 
-    if (fetchError) {
-      throw new Error(`Failed to fetch ${tableName} by ${parentColumn}: ${fetchError.message}`);
-    }
-
-    if (!sourceRows || sourceRows.length === 0) continue;
+    if (sourceRows.length === 0) continue;
 
     const targetRows = sourceRows.map(row => ({
       ...row,
@@ -246,16 +243,7 @@ export async function syncTableRowsByParent(
       updated_at: now,
     }));
 
-    for (let j = 0; j < targetRows.length; j += SUPABASE_WRITE_BATCH_SIZE) {
-      const batch = targetRows.slice(j, j + SUPABASE_WRITE_BATCH_SIZE);
-      const { error: upsertError } = await client
-        .from(tableName)
-        .upsert(batch, { onConflict: 'id,is_published' });
-
-      if (upsertError) {
-        throw new Error(`Failed to sync ${tableName} by ${parentColumn}: ${upsertError.message}`);
-      }
-    }
+    await upsertRows(tableName, targetRows);
 
     totalSynced += targetRows.length;
   }
@@ -273,53 +261,37 @@ export async function cleanupOrphanedChildRows(
   parentColumn: string,
   parentTable: string
 ): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const { source, target } = getSyncFlags(direction);
 
   // Get all source parent IDs (active parents)
-  const { data: sourceParents } = await client
-    .from(parentTable)
+  let parentQuery = knex(parentTable)
     .select('id')
-    .eq('is_published', source)
-    .is('deleted_at', null)
+    .where('is_published', source)
+    .whereNull('deleted_at')
     .limit(SUPABASE_QUERY_LIMIT);
+  parentQuery = await addTenantFilter(knex, parentQuery, parentTable);
+  const sourceParents = await parentQuery as Array<{ id: string }>;
 
-  const sourceParentIds = new Set((sourceParents || []).map(r => r.id));
+  const sourceParentIds = new Set(sourceParents.map(r => r.id));
 
   // Get target child rows and find ones with orphaned parents
-  const { data: targetChildren } = await client
-    .from(tableName)
+  let childQuery = knex(tableName)
     .select('*')
-    .eq('is_published', target)
+    .where('is_published', target)
     .limit(SUPABASE_QUERY_LIMIT);
+  childQuery = await addTenantFilter(knex, childQuery, tableName);
+  const targetChildren = await childQuery as DbRow[];
 
-  const orphanedIds = (targetChildren || [])
+  const orphanedIds = targetChildren
     .filter(row => !sourceParentIds.has((row as Record<string, unknown>)[parentColumn] as string))
     .map(row => (row as Record<string, unknown>).id as string);
 
   if (orphanedIds.length === 0) return 0;
 
-  let deletedCount = 0;
-  for (let i = 0; i < orphanedIds.length; i += SUPABASE_WRITE_BATCH_SIZE) {
-    const batch = orphanedIds.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-    const { error } = await client
-      .from(tableName)
-      .delete()
-      .eq('is_published', target)
-      .in('id', batch);
+  await deleteRowsByIds(tableName, orphanedIds, target);
 
-    if (error) {
-      throw new Error(`Failed to cleanup orphaned ${tableName}: ${error.message}`);
-    }
-    deletedCount += batch.length;
-  }
-
-  return deletedCount;
+  return orphanedIds.length;
 }
 
 /**
@@ -327,31 +299,23 @@ export async function cleanupOrphanedChildRows(
  * Works for any table with (id, is_published, deleted_at) columns.
  */
 export async function getDeletedDraftCount(tableName: string): Promise<number> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase not configured');
-
-  const { data: deletedDrafts, error: draftError } = await client
-    .from(tableName)
+  const knex = await getDb();
+  let draftQuery = knex(tableName)
     .select('id')
-    .eq('is_published', false)
-    .not('deleted_at', 'is', null)
+    .where('is_published', false)
+    .whereNotNull('deleted_at')
     .limit(SUPABASE_QUERY_LIMIT);
+  draftQuery = await addTenantFilter(knex, draftQuery, tableName);
+  const deletedDrafts = await draftQuery as Array<{ id: string }>;
 
-  if (draftError) {
-    throw new Error(`Failed to fetch deleted drafts from ${tableName}: ${draftError.message}`);
-  }
+  if (deletedDrafts.length === 0) return 0;
 
-  if (!deletedDrafts || deletedDrafts.length === 0) return 0;
+  let countQuery = knex(tableName)
+    .count<{ count: string | number }[]>({ count: '*' })
+    .whereIn('id', deletedDrafts.map(d => d.id))
+    .where('is_published', true);
+  countQuery = await addTenantFilter(knex, countQuery, tableName);
+  const [row] = await countQuery;
 
-  const { count, error: pubError } = await client
-    .from(tableName)
-    .select('id', { count: 'exact', head: true })
-    .in('id', deletedDrafts.map(d => d.id))
-    .eq('is_published', true);
-
-  if (pubError) {
-    throw new Error(`Failed to count published rows pending deletion in ${tableName}: ${pubError.message}`);
-  }
-
-  return count ?? 0;
+  return Number(row?.count ?? 0);
 }

@@ -1,7 +1,7 @@
 /**
  * Asset Proxy Route
  *
- * Serves assets with SEO-friendly URLs by proxying from Supabase Storage.
+ * Serves assets with SEO-friendly URLs by proxying from platform storage.
  * URL format: /a/{base62-hash}/{seo-friendly-name}.{ext}
  *
  * The hash is a base62-encoded UUID used for lookup.
@@ -17,8 +17,7 @@ import sharp from 'sharp';
 import { base62ToUuid } from '@/lib/convertion-utils';
 import { getAssetProxyUrl, isAssetOfType, ASSET_CATEGORIES } from '@/lib/asset-utils';
 import { getAssetForProxy } from '@/lib/repositories/assetRepository';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET } from '@/lib/asset-constants';
+import { getStorage } from '@/lib/platform/storage';
 
 // Cache headers set at infrastructure level via next.config.ts headers()
 // to prevent Next.js proxy from overriding them
@@ -50,12 +49,110 @@ function isResizableBitmap(mimeType: string | null | undefined): boolean {
   return true;
 }
 
+function getContentTypeFromPath(path: string): string {
+  const extension = path.split('.').pop()?.toLowerCase();
+  switch (extension) {
+    case 'avif':
+      return 'image/avif';
+    case 'gif':
+      return 'image/gif';
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'png':
+      return 'image/png';
+    case 'svg':
+      return 'image/svg+xml';
+    case 'webp':
+      return 'image/webp';
+    case 'woff':
+      return 'font/woff';
+    case 'woff2':
+      return 'font/woff2';
+    case 'mp4':
+      return 'video/mp4';
+    case 'webm':
+      return 'video/webm';
+    case 'mp3':
+      return 'audio/mpeg';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+function parseRangeHeader(rangeHeader: string | null, totalLength: number): { start: number; end: number } | null {
+  if (!rangeHeader) return null;
+  const match = rangeHeader.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) return null;
+
+  const [, rawStart, rawEnd] = match;
+  if (!rawStart && !rawEnd) return null;
+
+  if (!rawStart) {
+    const suffixLength = Number(rawEnd);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
+    const start = Math.max(totalLength - suffixLength, 0);
+    return { start, end: totalLength - 1 };
+  }
+
+  const start = Number(rawStart);
+  const end = rawEnd ? Number(rawEnd) : totalLength - 1;
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    start < 0 ||
+    end < start ||
+    start >= totalLength
+  ) {
+    return null;
+  }
+
+  return { start, end: Math.min(end, totalLength - 1) };
+}
+
+function buildObjectResponse(
+  body: Buffer,
+  contentType: string,
+  rangeHeader: string | null = null
+): Response {
+  const range = parseRangeHeader(rangeHeader, body.length);
+  const headers = new Headers({
+    'Content-Type': contentType,
+    'Accept-Ranges': 'bytes',
+  });
+
+  if (!range) {
+    headers.set('Content-Length', body.length.toString());
+    return new Response(new Uint8Array(body), { status: 200, headers });
+  }
+
+  const chunk = body.subarray(range.start, range.end + 1);
+  headers.set('Content-Length', chunk.length.toString());
+  headers.set('Content-Range', `bytes ${range.start}-${range.end}/${body.length}`);
+  return new Response(new Uint8Array(chunk), { status: 206, headers });
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ hash: string; name: string[] }> }
 ) {
   try {
     const { hash, name } = await params;
+    const storage = await getStorage();
+
+    if (hash === 'local') {
+      const storagePath = name.join('/');
+      const object = storage.getObject ? await storage.getObject(storagePath) : null;
+      if (!object) {
+        return new Response('Not found', { status: 404 });
+      }
+
+      return buildObjectResponse(
+        object.body,
+        object.contentType || getContentTypeFromPath(storagePath),
+        request.headers.get('range')
+      );
+    }
 
     let assetId: string;
     try {
@@ -81,29 +178,10 @@ export async function GET(
       }
     }
 
-    const supabase = await getSupabaseAdmin();
-    if (!supabase) {
-      return new Response('Service unavailable', { status: 503 });
-    }
-
-    const { data: urlData } = supabase.storage
-      .from(STORAGE_BUCKET)
-      .getPublicUrl(asset.storage_path);
-
     const url = new URL(request.url);
     const isImage = isAssetOfType(asset.mime_type, ASSET_CATEGORIES.IMAGES);
-
-    // Forward Range requests for media (video/audio). Safari refuses to play
-    // a video unless the server responds with 206 Partial Content, so we proxy
-    // the client's Range header to Supabase Storage (which supports ranges).
-    const rangeHeader = request.headers.get('range');
-    const upstreamHeaders: Record<string, string> = {};
-    if (rangeHeader && !isImage) {
-      upstreamHeaders.Range = rangeHeader;
-    }
-
-    const response = await fetch(urlData.publicUrl, { headers: upstreamHeaders });
-    if (!response.ok && response.status !== 206) {
+    const object = storage.getObject ? await storage.getObject(asset.storage_path) : null;
+    if (!object) {
       return new Response('Not found', { status: 404 });
     }
 
@@ -112,7 +190,7 @@ export async function GET(
     // isResizableBitmap — Sharp flattens animated frames into a single static
     // image, so they fall through and stream as raw bytes below.
     if (transform && isImage && isResizableBitmap(asset.mime_type)) {
-      const buffer = Buffer.from(await response.arrayBuffer());
+      const buffer = object.body;
 
       // Preserve AVIF on output (already highly compressed); re-encoding to WebP
       // would inflate size and lose quality.
@@ -160,24 +238,11 @@ export async function GET(
       }
     }
 
-    // Mirror the upstream status (206 for partial content) and range headers so
-    // Safari can stream/seek the video. Advertise Accept-Ranges so clients know
-    // range requests are supported even on the initial full response.
-    const headers = new Headers({
-      'Content-Type': asset.mime_type || 'application/octet-stream',
-      'Accept-Ranges': 'bytes',
-    });
-
-    const contentRange = response.headers.get('content-range');
-    if (contentRange) headers.set('Content-Range', contentRange);
-
-    const contentLength = response.headers.get('content-length');
-    if (contentLength) headers.set('Content-Length', contentLength);
-
-    return new Response(response.body, {
-      status: response.status,
-      headers,
-    });
+    return buildObjectResponse(
+      object.body,
+      object.contentType || asset.mime_type || 'application/octet-stream',
+      request.headers.get('range')
+    );
   } catch {
     return new Response('Internal server error', { status: 500 });
   }

@@ -1,13 +1,13 @@
 /**
  * Font Upload Utilities
  *
- * Handles uploading custom font files to Supabase Storage and creating font records.
+ * Handles uploading custom font files to platform storage and creating font records.
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { createFont } from '@/lib/repositories/fontRepository';
-import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { STORAGE_FOLDERS } from '@/lib/asset-constants';
 import { mapExtensionToFontFormat } from '@/lib/font-utils';
+import { getStorage } from '@/lib/platform/storage';
 import type { Font } from '@/types';
 
 /**
@@ -22,12 +22,6 @@ export async function uploadFontFile(
   fontName?: string,
 ): Promise<Font | null> {
   try {
-    const supabase = await getSupabaseAdmin();
-
-    if (!supabase) {
-      throw new Error('Supabase client not available');
-    }
-
     const extension = file.name.split('.').pop()?.toLowerCase() || '';
     const format = mapExtensionToFontFormat(extension);
 
@@ -40,26 +34,16 @@ export async function uploadFontFile(
     const random = Math.random().toString(36).substring(2, 15);
     const storagePath = `${STORAGE_FOLDERS.FONTS}/${timestamp}-${random}.${extension}`;
 
-    // Upload to Supabase Storage
+    // Upload to platform storage
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
+    const storage = await getStorage();
 
-    const { data, error } = await supabase.storage
-      .from(STORAGE_BUCKET)
-      .upload(storagePath, buffer, {
-        cacheControl: '31536000', // Cache for 1 year (fonts don't change)
-        upsert: false,
-        contentType: file.type || `font/${extension}`,
-      });
-
-    if (error) {
-      console.error('Error uploading font file:', error);
-      return null;
-    }
-
-    const { data: urlData } = supabase.storage
-      .from(STORAGE_BUCKET)
-      .getPublicUrl(data.path);
+    const { path } = await storage.upload(storagePath, buffer, {
+      cacheControl: '31536000', // Cache for 1 year (fonts don't change)
+      upsert: false,
+      contentType: file.type || `font/${extension}`,
+    });
 
     // Derive font name from filename if not provided
     const baseName = file.name.replace(/\.[^/.]+$/, '');
@@ -80,8 +64,8 @@ export async function uploadFontFile(
       weights: ['400'],
       category: '',
       kind: format,
-      url: urlData.publicUrl,
-      storage_path: data.path,
+      url: storage.getPublicUrl(path),
+      storage_path: path,
       file_hash: fileHash,
     });
 

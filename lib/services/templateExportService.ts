@@ -1,7 +1,7 @@
 import { getKnexClient, closeKnexClient, testKnexConnection } from '../knex-client';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET } from '@/lib/asset-constants';
 import { YCODE_EXTERNAL_API_URL } from '@/lib/config';
+import { getDb } from '@/lib/platform/db';
+import { getStorage } from '@/lib/platform/storage';
 
 // API key for uploading templates to the shared template service
 const TEMPLATE_UPLOAD_API_KEY =
@@ -435,7 +435,7 @@ export async function exportTemplateSQL(
 }
 
 /**
- * Collect assets from Supabase Storage for template export.
+ * Collect assets from platform storage for template export.
  * Includes user-uploaded images and custom font files.
  */
 export async function collectTemplateAssets(): Promise<
@@ -445,24 +445,16 @@ export async function collectTemplateAssets(): Promise<
     mimeType: string;
   }>
   > {
-  const client = await getSupabaseAdmin();
-  if (!client) {
-    console.error('[collectTemplateAssets] Supabase not configured');
-    return [];
-  }
+  const db = await getDb();
+  const storage = await getStorage();
+  if (!storage.getObject) return [];
 
   // Get assets that have a storage_path (user uploads, not inline SVGs)
   // and are not from other templates
-  const { data: assets, error } = await client
-    .from('assets')
+  const assets = await db('assets')
     .select('*')
-    .not('storage_path', 'is', null)
-    .not('source', 'like', 'template:%');
-
-  if (error || !assets) {
-    console.error('[collectTemplateAssets] Failed to fetch assets:', error);
-    return [];
-  }
+    .whereNotNull('storage_path')
+    .whereNot('source', 'like', 'template:%');
 
   const results: Array<{
     filename: string;
@@ -472,22 +464,18 @@ export async function collectTemplateAssets(): Promise<
 
   for (const asset of assets) {
     try {
-      const { data, error: downloadError } = await client.storage
-        .from(STORAGE_BUCKET)
-        .download(asset.storage_path);
-
-      if (downloadError || !data) {
+      const object = await storage.getObject(asset.storage_path);
+      if (!object) {
         console.warn(
           `[collectTemplateAssets] Failed to download ${asset.filename}:`,
-          downloadError
+          'object not found'
         );
         continue;
       }
 
-      const buffer = await data.arrayBuffer();
       results.push({
         filename: asset.filename,
-        base64: Buffer.from(buffer).toString('base64'),
+        base64: object.body.toString('base64'),
         mimeType: asset.mime_type || 'application/octet-stream',
       });
     } catch (err) {
@@ -499,32 +487,25 @@ export async function collectTemplateAssets(): Promise<
   }
 
   // Collect custom font files (fonts with storage_path)
-  const { data: fonts, error: fontsError } = await client
-    .from('fonts')
+  const fonts = await db('fonts')
     .select('*')
-    .not('storage_path', 'is', null)
-    .eq('is_published', false)
-    .is('deleted_at', null);
+    .whereNotNull('storage_path')
+    .where('is_published', false)
+    .whereNull('deleted_at');
 
-  if (fontsError) {
-    console.warn('[collectTemplateAssets] Failed to fetch fonts:', fontsError);
-  } else if (fonts && fonts.length > 0) {
+  if (fonts.length > 0) {
     for (const font of fonts) {
       try {
-        const { data, error: downloadError } = await client.storage
-          .from(STORAGE_BUCKET)
-          .download(font.storage_path);
-
-        if (downloadError || !data) {
-          console.warn(`[collectTemplateAssets] Failed to download font ${font.name}:`, downloadError);
+        const object = await storage.getObject(font.storage_path);
+        if (!object) {
+          console.warn(`[collectTemplateAssets] Failed to download font ${font.name}: object not found`);
           continue;
         }
 
-        const buffer = await data.arrayBuffer();
         const fontFilename = `font-${font.name || font.id}.${font.kind || 'woff2'}`;
         results.push({
           filename: fontFilename,
-          base64: Buffer.from(buffer).toString('base64'),
+          base64: object.body.toString('base64'),
           mimeType: font.kind === 'woff2' ? 'font/woff2' : 'font/ttf',
         });
       } catch (err) {

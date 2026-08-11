@@ -8,8 +8,10 @@ import { createItemsBulk, enrichItemsWithStatus } from '@/lib/repositories/colle
 import { insertValuesBulk } from '@/lib/repositories/collectionItemValueRepository';
 import { findStatusFieldId } from '@/lib/collection-field-utils';
 import { createAsset } from '@/lib/repositories/assetRepository';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
+import { getStorage } from '@/lib/platform/storage';
+import { STORAGE_FOLDERS } from '@/lib/asset-constants';
 import { getSampleCollectionById } from '@/lib/sample-collections';
 import type { SampleCollectionDefinition, SampleFieldDefinition, SampleItemDefinition } from '@/lib/sample-collections';
 import type { Asset, Collection, CollectionField, CollectionItemWithValues } from '@/types';
@@ -156,21 +158,19 @@ export async function createSampleCollection(
  * Avoids duplicate storage files and DB records for the same sample image.
  */
 async function getOrUploadSampleImage(filename: string): Promise<Asset> {
-  const supabase = await getSupabaseAdmin();
-  if (!supabase) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   // Check for existing draft asset with the same filename and source
-  const { data: existing } = await supabase
-    .from('assets')
+  let existingQuery = db('assets')
     .select('*')
-    .eq('filename', filename)
-    .eq('source', 'sample-collection')
-    .eq('is_published', false)
-    .is('deleted_at', null)
+    .where('filename', filename)
+    .where('source', 'sample-collection')
+    .where('is_published', false)
+    .whereNull('deleted_at')
     .limit(1)
-    .single();
+    .first();
+  existingQuery = await addTenantFilter(db, existingQuery, 'assets');
+  const existing = await existingQuery;
 
   if (existing) return existing as Asset;
 
@@ -186,28 +186,19 @@ async function getOrUploadSampleImage(filename: string): Promise<Asset> {
   const random = Math.random().toString(36).substring(2, 15);
   const ext = path.extname(filename).slice(1) || 'jpg';
   const storagePath = `${STORAGE_FOLDERS.WEBSITE}/${timestamp}-${random}.${ext}`;
+  const storage = await getStorage();
 
-  const { data, error } = await supabase.storage
-    .from(STORAGE_BUCKET)
-    .upload(storagePath, buffer, {
-      cacheControl: '3600',
-      upsert: false,
-      contentType: `image/${ext === 'jpg' ? 'jpeg' : ext}`,
-    });
-
-  if (error) {
-    throw new Error(`Failed to upload sample image "${filename}": ${error.message}`);
-  }
-
-  const { data: urlData } = supabase.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(data.path);
+  const { path: uploadedPath } = await storage.upload(storagePath, buffer, {
+    cacheControl: '3600',
+    upsert: false,
+    contentType: `image/${ext === 'jpg' ? 'jpeg' : ext}`,
+  });
 
   return createAsset({
     filename,
     source: 'sample-collection',
-    storage_path: data.path,
-    public_url: urlData.publicUrl,
+    storage_path: uploadedPath,
+    public_url: storage.getPublicUrl(uploadedPath),
     file_size: buffer.length,
     mime_type: `image/${ext === 'jpg' ? 'jpeg' : ext}`,
     width,

@@ -5,7 +5,8 @@
  * across pages, components, and other collections (reference fields).
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import { getConnections as getAirtableConnections } from '@/lib/apps/airtable/sync-service';
 import type { Layer, CollectionVariable, FieldVariable, DesignColorVariable } from '@/types';
 
@@ -40,6 +41,19 @@ export interface CollectionFieldUsageResult {
   pages: UsageEntry[];
   components: UsageEntry[];
   total: number;
+}
+
+async function selectDraftRows<T>(
+  tableName: string,
+  columns: string[]
+): Promise<T[]> {
+  const db = await getDb();
+  let query = db(tableName)
+    .select(...columns)
+    .where('is_published', false)
+    .whereNull('deleted_at');
+  query = await addTenantFilter(db, query, tableName);
+  return await query as T[];
 }
 
 // ---------------------------------------------------------------------------
@@ -208,9 +222,7 @@ function layersReferenceField(layers: Layer[], fieldId: string): boolean {
  * Get collection usage across pages, components, and reference fields
  */
 export async function getCollectionUsage(collectionId: string): Promise<CollectionUsageResult> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase not configured');
-
+  const db = await getDb();
   const pages: UsageEntry[] = [];
   const components: UsageEntry[] = [];
   const referenceFields: ReferenceFieldUsageEntry[] = [];
@@ -218,30 +230,24 @@ export async function getCollectionUsage(collectionId: string): Promise<Collecti
   const pageIdsWithUsage = new Set<string>();
 
   // 1. Check page layers for collection bindings
-  const { data: pageLayersRecords, error: plErr } = await client
-    .from('page_layers')
-    .select('page_id, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const pageLayersRecords = await selectDraftRows<{ page_id: string; layers: Layer[] | null }>(
+    'page_layers',
+    ['page_id', 'layers']
+  );
 
-  if (plErr) throw new Error(`Failed to fetch page layers: ${plErr.message}`);
-
-  for (const record of pageLayersRecords || []) {
+  for (const record of pageLayersRecords) {
     if (record.layers && layersReferenceCollection(record.layers, collectionId)) {
       pageIdsWithUsage.add(record.page_id);
     }
   }
 
   // 2. Check page-level CMS settings (collection pages)
-  const { data: pagesData, error: pagesErr } = await client
-    .from('pages')
-    .select('id, name, settings')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const pagesData = await selectDraftRows<Array<{ id: string; name: string | null; settings: { cms?: { collection_id?: string } } | null }>[number]>(
+    'pages',
+    ['id', 'name', 'settings']
+  );
 
-  if (pagesErr) throw new Error(`Failed to fetch pages: ${pagesErr.message}`);
-
-  for (const page of pagesData || []) {
+  for (const page of pagesData) {
     if (page.settings?.cms?.collection_id === collectionId) {
       pageIdsWithUsage.add(page.id);
     }
@@ -249,49 +255,44 @@ export async function getCollectionUsage(collectionId: string): Promise<Collecti
 
   // Build page entries with names
   for (const pageId of pageIdsWithUsage) {
-    const page = (pagesData || []).find((p) => p.id === pageId);
+    const page = pagesData.find((p) => p.id === pageId);
     pages.push({ id: pageId, name: page?.name ?? 'Unknown Page' });
   }
 
   // 3. Check components
-  const { data: componentsData, error: compErr } = await client
-    .from('components')
-    .select('id, name, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const componentsData = await selectDraftRows<Array<{ id: string; name: string | null; layers: Layer[] | null }>[number]>(
+    'components',
+    ['id', 'name', 'layers']
+  );
 
-  if (compErr) throw new Error(`Failed to fetch components: ${compErr.message}`);
-
-  for (const component of componentsData || []) {
+  for (const component of componentsData) {
     if (component.layers && layersReferenceCollection(component.layers, collectionId)) {
       components.push({ id: component.id, name: component.name ?? 'Unknown Component' });
     }
   }
 
   // 4. Check reference fields pointing to this collection
-  const { data: refFields, error: rfErr } = await client
-    .from('collection_fields')
-    .select('id, name, collection_id')
-    .eq('reference_collection_id', collectionId)
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  let refFieldsQuery = db('collection_fields')
+    .select('id', 'name', 'collection_id')
+    .where('reference_collection_id', collectionId)
+    .where('is_published', false)
+    .whereNull('deleted_at');
+  refFieldsQuery = await addTenantFilter(db, refFieldsQuery, 'collection_fields');
+  const refFields = await refFieldsQuery as Array<{ id: string; name: string | null; collection_id: string }>;
 
-  if (rfErr) throw new Error(`Failed to fetch reference fields: ${rfErr.message}`);
-
-  if (refFields && refFields.length > 0) {
+  if (refFields.length > 0) {
     const parentCollectionIds = [...new Set(refFields.map((f) => f.collection_id))];
 
-    const { data: parentCollections, error: pcErr } = await client
-      .from('collections')
-      .select('id, name')
-      .in('id', parentCollectionIds)
-      .eq('is_published', false)
-      .is('deleted_at', null);
-
-    if (pcErr) throw new Error(`Failed to fetch collections: ${pcErr.message}`);
+    let parentCollectionsQuery = db('collections')
+      .select('id', 'name')
+      .whereIn('id', parentCollectionIds)
+      .where('is_published', false)
+      .whereNull('deleted_at');
+    parentCollectionsQuery = await addTenantFilter(db, parentCollectionsQuery, 'collections');
+    const parentCollections = await parentCollectionsQuery as Array<{ id: string; name: string | null }>;
 
     const collectionNames: Record<string, string> = {};
-    (parentCollections || []).forEach((c) => {
+    parentCollections.forEach((c) => {
       collectionNames[c.id] = c.name ?? 'Unknown Collection';
     });
 
@@ -336,39 +337,30 @@ export async function getCollectionUsage(collectionId: string): Promise<Collecti
  * Get collection field usage across pages and components (layer bindings)
  */
 export async function getCollectionFieldUsage(fieldId: string): Promise<CollectionFieldUsageResult> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase not configured');
-
   const pages: UsageEntry[] = [];
   const components: UsageEntry[] = [];
 
   const pageIdsWithUsage = new Set<string>();
 
   // 1. Check page layers for field bindings
-  const { data: pageLayersRecords, error: plErr } = await client
-    .from('page_layers')
-    .select('page_id, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const pageLayersRecords = await selectDraftRows<{ page_id: string; layers: Layer[] | null }>(
+    'page_layers',
+    ['page_id', 'layers']
+  );
 
-  if (plErr) throw new Error(`Failed to fetch page layers: ${plErr.message}`);
-
-  for (const record of pageLayersRecords || []) {
+  for (const record of pageLayersRecords) {
     if (record.layers && layersReferenceField(record.layers, fieldId)) {
       pageIdsWithUsage.add(record.page_id);
     }
   }
 
   // 2. Check page-level CMS settings (slug field)
-  const { data: pagesData, error: pagesErr } = await client
-    .from('pages')
-    .select('id, name, settings')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const pagesData = await selectDraftRows<Array<{ id: string; name: string | null; settings: { cms?: { slug_field_id?: string }; seo?: { image?: unknown } } | null }>[number]>(
+    'pages',
+    ['id', 'name', 'settings']
+  );
 
-  if (pagesErr) throw new Error(`Failed to fetch pages: ${pagesErr.message}`);
-
-  for (const page of pagesData || []) {
+  for (const page of pagesData) {
     if (page.settings?.cms?.slug_field_id === fieldId) {
       pageIdsWithUsage.add(page.id);
     }
@@ -383,20 +375,17 @@ export async function getCollectionFieldUsage(fieldId: string): Promise<Collecti
 
   // Build page entries
   for (const pageId of pageIdsWithUsage) {
-    const page = (pagesData || []).find((p) => p.id === pageId);
+    const page = pagesData.find((p) => p.id === pageId);
     pages.push({ id: pageId, name: page?.name ?? 'Unknown Page' });
   }
 
   // 3. Check components
-  const { data: componentsData, error: compErr } = await client
-    .from('components')
-    .select('id, name, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const componentsData = await selectDraftRows<Array<{ id: string; name: string | null; layers: Layer[] | null }>[number]>(
+    'components',
+    ['id', 'name', 'layers']
+  );
 
-  if (compErr) throw new Error(`Failed to fetch components: ${compErr.message}`);
-
-  for (const component of componentsData || []) {
+  for (const component of componentsData) {
     if (component.layers && layersReferenceField(component.layers, fieldId)) {
       components.push({ id: component.id, name: component.name ?? 'Unknown Component' });
     }

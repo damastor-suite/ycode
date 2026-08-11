@@ -8,9 +8,15 @@
  */
 
 import { getKnexClient } from '../knex-client';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import { getPublishedPagesByIds } from '@/lib/repositories/pageRepository';
 import { batchPublishPageLayers } from '@/lib/repositories/pageLayersRepository';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import {
+  addTenantIdToRow,
+  getConflictColumns,
+  resolveTenantIdForTable,
+} from '@/lib/repositories/knex-repository-utils';
 import { buildSlugPath } from '@/lib/page-utils';
 import type { Page, PageFolder } from '@/types';
 
@@ -190,22 +196,16 @@ export async function publishPages(pageIds: string[]): Promise<PublishPagesResul
     getPublishedPageFoldersByIds,
   } = await import('../repositories/pageFolderRepository');
 
-  const client = await getSupabaseAdmin();
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   // Step 1: Batch fetch all draft pages in a single query
-  const { data: draftPagesData, error: pagesError } = await client
-    .from('pages')
+  let draftPagesQuery = db('pages')
     .select('*')
-    .in('id', pageIds)
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (pagesError) {
-    throw new Error(`Failed to fetch draft pages: ${pagesError.message}`);
-  }
+    .whereIn('id', pageIds)
+    .where('is_published', false)
+    .whereNull('deleted_at');
+  draftPagesQuery = await addTenantFilter(db, draftPagesQuery, 'pages');
+  const draftPagesData = await draftPagesQuery as Page[];
 
   // Filter valid draft pages
   const allValidDraftPages = (draftPagesData || []).filter(
@@ -222,13 +222,14 @@ export async function publishPages(pageIds: string[]): Promise<PublishPagesResul
   const unpublishedPageRoutes: string[] = [];
   if (nonPublishableDraftPages.length > 0) {
     const draftIds = nonPublishableDraftPages.map((p) => p.id);
-    const { data: livePages } = await client
-      .from('pages')
+    let livePagesQuery = db('pages')
       .select('id')
-      .in('id', draftIds)
-      .eq('is_published', true);
+      .whereIn('id', draftIds)
+      .where('is_published', true);
+    livePagesQuery = await addTenantFilter(db, livePagesQuery, 'pages');
+    const livePages = await livePagesQuery as Array<{ id: string }>;
 
-    const livePageIds = (livePages || []).map((p) => p.id);
+    const livePageIds = livePages.map((p) => p.id);
     if (livePageIds.length > 0) {
       try {
         const { getRoutePathsForPages } = await import('@/lib/services/cacheService');
@@ -238,11 +239,12 @@ export async function publishPages(pageIds: string[]): Promise<PublishPagesResul
       }
 
       // Delete live rows (page_layers removed via ON DELETE CASCADE)
-      await client
-        .from('pages')
-        .delete()
-        .in('id', livePageIds)
-        .eq('is_published', true);
+      let deleteLiveQuery = db('pages')
+        .whereIn('id', livePageIds)
+        .where('is_published', true)
+        .del();
+      deleteLiveQuery = await addTenantFilter(db, deleteLiveQuery, 'pages');
+      await deleteLiveQuery;
     }
   }
 
@@ -351,11 +353,15 @@ export async function publishPages(pageIds: string[]): Promise<PublishPagesResul
 
   // Batch upsert folders
   if (foldersToUpsert.length > 0) {
-    await client
-      .from('page_folders')
-      .upsert(foldersToUpsert, {
-        onConflict: 'id,is_published',
-      });
+    const tenantId = await resolveTenantIdForTable(db, 'page_folders');
+    const conflictColumns = await getConflictColumns(db, 'page_folders', ['id', 'is_published'], tenantId);
+    const folderRows = await Promise.all(
+      foldersToUpsert.map((folder) => addTenantIdToRow(db, 'page_folders', folder, tenantId ?? undefined))
+    );
+    await db('page_folders')
+      .insert(folderRows)
+      .onConflict(conflictColumns)
+      .merge();
   }
 
   // Step 8: Publish pages using upsert (only pages that changed or are new)
@@ -450,16 +456,22 @@ export async function publishPages(pageIds: string[]): Promise<PublishPagesResul
     }
 
     const slugsToCheck = [...new Set(nonDynamicPagesToUpsert.map((p) => p.slug))];
-    const { data: conflictingPublished } = await client
-      .from('pages')
-      .select('id, slug, page_folder_id, error_page')
-      .eq('is_published', true)
-      .eq('is_dynamic', false)
-      .is('deleted_at', null)
-      .in('slug', slugsToCheck);
+    let conflictingQuery = db('pages')
+      .select('id', 'slug', 'page_folder_id', 'error_page')
+      .where('is_published', true)
+      .where('is_dynamic', false)
+      .whereNull('deleted_at')
+      .whereIn('slug', slugsToCheck);
+    conflictingQuery = await addTenantFilter(db, conflictingQuery, 'pages');
+    const conflictingPublished = await conflictingQuery as Array<{
+      id: string;
+      slug: string;
+      page_folder_id: string | null;
+      error_page: number | null;
+    }>;
 
     // Delete if a different page will occupy this slug/folder/error_page slot
-    const idsToDelete = (conflictingPublished || [])
+    const idsToDelete = conflictingPublished
       .filter((row) => {
         const key = slugKey(row);
         const ownerAfterUpsert = upsertKeyToId.get(key);
@@ -474,26 +486,20 @@ export async function publishPages(pageIds: string[]): Promise<PublishPagesResul
       }
 
       // Delete page_layers first (FK constraint)
-      const { error: layersDeleteError } = await client
-        .from('page_layers')
-        .delete()
-        .eq('is_published', true)
-        .in('page_id', idsToDelete);
-
-      if (layersDeleteError) {
-        throw new Error(`Failed to remove conflicting published page layers: ${layersDeleteError.message}`);
-      }
+      let layersDeleteQuery = db('page_layers')
+        .where('is_published', true)
+        .whereIn('page_id', idsToDelete)
+        .del();
+      layersDeleteQuery = await addTenantFilter(db, layersDeleteQuery, 'page_layers');
+      await layersDeleteQuery;
 
       // Then delete the pages
-      const { error: deleteError } = await client
-        .from('pages')
-        .delete()
-        .eq('is_published', true)
-        .in('id', idsToDelete);
-
-      if (deleteError) {
-        throw new Error(`Failed to remove conflicting published pages: ${deleteError.message}`);
-      }
+      let deleteQuery = db('pages')
+        .where('is_published', true)
+        .whereIn('id', idsToDelete)
+        .del();
+      deleteQuery = await addTenantFilter(db, deleteQuery, 'pages');
+      await deleteQuery;
     }
   }
 
@@ -502,15 +508,15 @@ export async function publishPages(pageIds: string[]): Promise<PublishPagesResul
 
   // Batch upsert pages
   if (pagesToUpsert.length > 0) {
-    const { error: upsertError } = await client
-      .from('pages')
-      .upsert(pagesToUpsert, {
-        onConflict: 'id,is_published',
-      });
-
-    if (upsertError) {
-      throw new Error(`Failed to upsert pages: ${upsertError.message}`);
-    }
+    const tenantId = await resolveTenantIdForTable(db, 'pages');
+    const conflictColumns = await getConflictColumns(db, 'pages', ['id', 'is_published'], tenantId);
+    const pageRows = await Promise.all(
+      pagesToUpsert.map((page) => addTenantIdToRow(db, 'pages', page, tenantId ?? undefined))
+    );
+    await db('pages')
+      .insert(pageRows)
+      .onConflict(conflictColumns)
+      .merge();
   }
 
   const pagesDurationMs = Math.round(performance.now() - pagesStart);

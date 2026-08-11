@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { getStorage } from '@/lib/platform/storage';
 import { validateCategoryMimeType } from '@/lib/asset-utils';
-import { STORAGE_BUCKET, MAX_UPLOAD_FILE_SIZE, generateStoragePath } from '@/lib/asset-constants';
+import { MAX_UPLOAD_FILE_SIZE, generateStoragePath } from '@/lib/asset-constants';
 
 export const runtime = 'nodejs';
 
@@ -39,22 +39,17 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const supabase = await getSupabaseAdmin();
-
-    if (!supabase) {
-      return NextResponse.json({ error: 'Supabase not configured' }, { status: 500 });
-    }
-
     const storagePath = generateStoragePath(filename);
 
-    const { data, error } = await supabase.storage
-      .from(STORAGE_BUCKET)
-      .createSignedUploadUrl(storagePath);
-
-    if (error) {
-      console.error('Error creating signed upload URL:', error);
-      return NextResponse.json({ error: 'Failed to create upload URL' }, { status: 500 });
+    const storage = await getStorage();
+    if (!storage.createSignedUploadUrl) {
+      return NextResponse.json(
+        { error: 'Signed uploads are not supported by the configured storage provider' },
+        { status: 500 }
+      );
     }
+
+    const data = await storage.createSignedUploadUrl(storagePath);
 
     return NextResponse.json({
       data: {

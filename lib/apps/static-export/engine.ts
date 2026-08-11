@@ -15,12 +15,13 @@ import {
   fetchGoogleFontsCss,
   getGoogleFontLinks,
 } from '@/lib/font-utils'
+import { addTenantFilter } from '@/lib/knex-helpers'
+import { getDb } from '@/lib/platform/db'
 import { generateColorVariablesCss } from '@/lib/repositories/colorVariableRepository'
 import { getAssetById } from '@/lib/repositories/assetRepository'
 import { getPublishedFonts } from '@/lib/repositories/fontRepository'
 import { getSettingByKey } from '@/lib/repositories/settingsRepository'
 import { getTranslationsByLocale } from '@/lib/repositories/translationRepository'
-import { getSupabaseAdmin } from '@/lib/supabase-server'
 
 import type { Locale, Page, PageFolder } from '@/types'
 
@@ -117,20 +118,17 @@ export async function exportSite(presetJobId?: string): Promise<ExportJob> {
       throw new Error('No output target selected — pick at least one of: local, S3, GitHub')
     }
 
-    const client = await getSupabaseAdmin()
-    if (!client) throw new Error('Supabase client not configured')
+    const db = await getDb()
 
     // ---- Load pages (one query, all published, all routes) --------------
-    const { data: pageRows, error: pagesError } = await client
-      .from('pages')
+    let pagesQuery = db('pages')
       .select('*')
-      .eq('is_published', true)
-      .is('deleted_at', null)
-      .order('depth', { ascending: true })
-      .order('order', { ascending: true })
-
-    if (pagesError) throw new Error(`Failed to fetch pages: ${pagesError.message}`)
-    const pages = (pageRows ?? []) as Page[]
+      .where('is_published', true)
+      .whereNull('deleted_at')
+      .orderBy('depth', 'asc')
+      .orderBy('order', 'asc')
+    pagesQuery = await addTenantFilter(db, pagesQuery, 'pages')
+    const pages = await pagesQuery as Page[]
     if (pages.length === 0) {
       job.status = 'completed'
       job.completedAt = new Date().toISOString()
@@ -140,35 +138,36 @@ export async function exportSite(presetJobId?: string): Promise<ExportJob> {
 
     // ---- Folders + shared CSS + fonts + locales in parallel ---------------
     const [
-      folderResult,
+      folders,
       publishedCss,
       colorVariablesCss,
       fonts,
       globalCustomCodeHead,
       globalCustomCodeBody,
-      localeResult,
+      locales,
     ] = await Promise.all([
-      client
-        .from('page_folders')
-        .select('*')
-        .is('deleted_at', null)
-        .order('depth', { ascending: true }),
+      (async (): Promise<PageFolder[]> => {
+        let foldersQuery = db('page_folders')
+          .select('*')
+          .whereNull('deleted_at')
+          .orderBy('depth', 'asc')
+        foldersQuery = await addTenantFilter(db, foldersQuery, 'page_folders')
+        return await foldersQuery as PageFolder[]
+      })(),
       getSettingByKey('published_css').catch(() => null),
       generateColorVariablesCss().catch(() => null),
       getPublishedFonts().catch(() => []),
       getSettingByKey('custom_code_head').catch(() => null),
       getSettingByKey('custom_code_body').catch(() => null),
-      client
-        .from('locales')
-        .select('*')
-        .eq('is_published', true)
-        .is('deleted_at', null),
+      (async (): Promise<Locale[]> => {
+        let localesQuery = db('locales')
+          .select('*')
+          .where('is_published', true)
+          .whereNull('deleted_at')
+        localesQuery = await addTenantFilter(db, localesQuery, 'locales')
+        return await localesQuery as Locale[]
+      })(),
     ])
-    if (folderResult.error) {
-      throw new Error(`Failed to fetch folders: ${folderResult.error.message}`)
-    }
-    const folders = (folderResult.data ?? []) as PageFolder[]
-    const locales = (localeResult.data ?? []) as Locale[]
 
     // The export always covers the default locale, plus one pass per
     // non-default published locale (writing to `<code>/...`).

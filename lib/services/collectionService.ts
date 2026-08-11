@@ -12,8 +12,15 @@
  */
 
 import { withTransaction } from '../database/transaction';
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
 import { getKnexClient } from '@/lib/knex-client';
+import { getDb } from '@/lib/platform/db';
+import { getTenantIdFromHeaders } from '@/lib/platform/tenant';
+import {
+  addTenantIdToRow,
+  getConflictColumns,
+  resolveTenantIdForTable,
+} from '@/lib/repositories/knex-repository-utils';
 import { SUPABASE_IN_FILTER_CHUNK_SIZE, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
 import { getCollectionById, hardDeleteCollection } from '@/lib/repositories/collectionRepository';
 import { getFieldsByCollectionId } from '@/lib/repositories/collectionFieldRepository';
@@ -22,6 +29,59 @@ import { getValueRowsForItems, type PublishValueRow } from '@/lib/repositories/c
 import { publishAssets } from '@/lib/repositories/assetRepository';
 import { collectItemValueAssetIds } from '@/lib/collection-asset-utils';
 import type { Collection, CollectionField, CollectionItem } from '@/types';
+
+type UpsertRow = Record<string, unknown>;
+
+async function upsertRows(tableName: string, rows: UpsertRow[]): Promise<void> {
+  if (rows.length === 0) return;
+
+  const db = await getDb();
+  const tenantId = await resolveTenantIdForTable(db, tableName);
+  const conflictColumns = await getConflictColumns(db, tableName, ['id', 'is_published'], tenantId);
+  const rowsWithTenant = await Promise.all(
+    rows.map((row) => addTenantIdToRow(db, tableName, row, tenantId ?? undefined))
+  );
+
+  for (let i = 0; i < rowsWithTenant.length; i += SUPABASE_WRITE_BATCH_SIZE) {
+    const batch = rowsWithTenant.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
+    await db(tableName)
+      .insert(batch)
+      .onConflict(conflictColumns)
+      .merge();
+  }
+}
+
+async function deleteByIds(
+  tableName: string,
+  ids: string[],
+  isPublished: boolean
+): Promise<void> {
+  if (ids.length === 0) return;
+
+  const db = await getDb();
+  for (let i = 0; i < ids.length; i += SUPABASE_IN_FILTER_CHUNK_SIZE) {
+    const idsChunk = ids.slice(i, i + SUPABASE_IN_FILTER_CHUNK_SIZE);
+    let query = db(tableName)
+      .whereIn('id', idsChunk)
+      .where('is_published', isPublished)
+      .del();
+    query = await addTenantFilter(db, query, tableName);
+    await query;
+  }
+}
+
+async function getSlugFieldId(collectionId: string): Promise<string | null> {
+  const db = await getDb();
+  let query = db('collection_fields')
+    .select('id')
+    .where('collection_id', collectionId)
+    .where('key', 'slug')
+    .whereNull('deleted_at')
+    .limit(1);
+  query = await addTenantFilter(db, query, 'collection_fields');
+  const slugField = await query.first() as { id: string } | undefined;
+  return slugField?.id ?? null;
+}
 
 /**
  * Pre-fetched collection data, batched across all collections by the caller to
@@ -322,12 +382,6 @@ async function publishCollectionMetadata(
   prefetchedDraft?: Collection,
   prefetched?: CollectionPrefetch,
 ): Promise<boolean> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
   // Reuse the draft already fetched by the caller when available to avoid a
   // redundant per-collection round-trip.
   const draft = prefetchedDraft ?? prefetched?.draftCollection ?? await getCollectionById(collectionId, false);
@@ -347,9 +401,7 @@ async function publishCollectionMetadata(
   }
 
   // Upsert published version (composite key handles insert/update automatically)
-  const { error } = await client
-    .from('collections')
-    .upsert({
+  await upsertRows('collections', [{
       id: draft.id,
       name: draft.name,
       sorting: draft.sorting,
@@ -357,13 +409,7 @@ async function publishCollectionMetadata(
       is_published: true,
       created_at: draft.created_at,
       updated_at: new Date().toISOString(),
-    }, {
-      onConflict: 'id,is_published',
-    });
-
-  if (error) {
-    throw new Error(`Failed to publish collection: ${error.message}`);
-  }
+  }]);
 
   return true;
 }
@@ -378,12 +424,6 @@ async function publishAllFields(
   collectionId: string,
   prefetched?: CollectionPrefetch,
 ): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
   // Get all draft fields (use bulk-fetched copy when available)
   const draftFields = prefetched?.draftFields ?? await getFieldsByCollectionId(collectionId, false);
 
@@ -397,7 +437,7 @@ async function publishAllFields(
 
   // Only upsert fields that are new or changed
   const now = new Date().toISOString();
-  const fieldsToUpsert: any[] = [];
+  const fieldsToUpsert: UpsertRow[] = [];
 
   for (const field of draftFields) {
     const existing = publishedById.get(field.id);
@@ -442,16 +482,7 @@ async function publishAllFields(
     return 0;
   }
 
-  // Batch upsert changed fields
-  const { error } = await client
-    .from('collection_fields')
-    .upsert(fieldsToUpsert, {
-      onConflict: 'id,is_published', // Composite primary key
-    });
-
-  if (error) {
-    throw new Error(`Failed to publish fields: ${error.message}`);
-  }
+  await upsertRows('collection_fields', fieldsToUpsert);
 
   return fieldsToUpsert.length;
 }
@@ -469,12 +500,7 @@ async function publishSelectedItems(
   itemIds?: string[],
   prefetched?: CollectionPrefetch,
 ): Promise<{ itemsCount: number; valuesCount: number; assetsCount: number; itemsDurationMs: number; valuesDurationMs: number; renamedItemOldSlugs: string[]; unpublishedItemSlugs: string[] }> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const db = await getDb();
   let itemsToPublish: string[];
 
   if (itemIds && itemIds.length > 0) {
@@ -516,27 +542,21 @@ async function publishSelectedItems(
 
     try {
       const slugField = prefetched
-        ? prefetched.draftFields.find(f => f.key === 'slug') ?? null
-        : (await client
-          .from('collection_fields')
-          .select('id')
-          .eq('collection_id', collectionId)
-          .eq('key', 'slug')
-          .is('deleted_at', null)
-          .limit(1)
-          .single()).data;
+        ? prefetched.draftFields.find(f => f.key === 'slug')?.id ?? null
+        : await getSlugFieldId(collectionId);
 
       if (slugField) {
         for (let i = 0; i < nonPublishableIds.length; i += 500) {
           const batch = nonPublishableIds.slice(i, i + 500);
-          const { data } = await client
-            .from('collection_item_values')
+          let valuesQuery = db('collection_item_values')
             .select('value')
-            .eq('field_id', slugField.id)
-            .eq('is_published', true)
-            .is('deleted_at', null)
-            .in('item_id', batch);
-          if (data) unpublishedItemSlugs.push(...data.map(v => v.value as string).filter(Boolean));
+            .where('field_id', slugField)
+            .where('is_published', true)
+            .whereNull('deleted_at')
+            .whereIn('item_id', batch);
+          valuesQuery = await addTenantFilter(db, valuesQuery, 'collection_item_values');
+          const data = await valuesQuery as Array<{ value: string | null }>;
+          unpublishedItemSlugs.push(...data.map(v => v.value as string).filter(Boolean));
         }
       }
     } catch {
@@ -545,11 +565,12 @@ async function publishSelectedItems(
 
     for (let i = 0; i < nonPublishableIds.length; i += SUPABASE_IN_FILTER_CHUNK_SIZE) {
       const idsChunk = nonPublishableIds.slice(i, i + SUPABASE_IN_FILTER_CHUNK_SIZE);
-      await client
-        .from('collection_items')
-        .delete()
-        .in('id', idsChunk)
-        .eq('is_published', true);
+      let deleteQuery = db('collection_items')
+        .whereIn('id', idsChunk)
+        .where('is_published', true)
+        .del();
+      deleteQuery = await addTenantFilter(db, deleteQuery, 'collection_items');
+      await deleteQuery;
     }
   }
 
@@ -570,7 +591,7 @@ async function publishSelectedItems(
 
   // Only upsert items that are new or changed
   const now = new Date().toISOString();
-  const itemsToUpsert: any[] = [];
+  const itemsToUpsert: UpsertRow[] = [];
   const itemIdsToPublishValues: string[] = [];
 
   for (const item of publishableItems) {
@@ -608,15 +629,7 @@ async function publishSelectedItems(
 
   // Batch upsert changed items only
   if (itemsToUpsert.length > 0) {
-    const { error: itemsError } = await client
-      .from('collection_items')
-      .upsert(itemsToUpsert, {
-        onConflict: 'id,is_published', // Composite primary key
-      });
-
-    if (itemsError) {
-      throw new Error(`Failed to publish items: ${itemsError.message}`);
-    }
+    await upsertRows('collection_items', itemsToUpsert);
   }
 
   const itemsDurationMs = Math.round(performance.now() - itemsStart);
@@ -635,18 +648,11 @@ async function publishSelectedItems(
   try {
     // Resolve the slug field from prefetched draft fields when available to skip a round-trip.
     const slugField = prefetched
-      ? prefetched.draftFields.find(f => f.key === 'slug') ?? null
-      : (await client
-        .from('collection_fields')
-        .select('id')
-        .eq('collection_id', collectionId)
-        .eq('key', 'slug')
-        .is('deleted_at', null)
-        .limit(1)
-        .single()).data;
+      ? prefetched.draftFields.find(f => f.key === 'slug')?.id ?? null
+      : await getSlugFieldId(collectionId);
 
     if (slugField) {
-      const slugId = slugField.id;
+      const slugId = slugField;
       const oldByItem = new Map(
         publishedValues.filter(v => v.field_id === slugId).map(v => [v.item_id, v.value as string])
       );
@@ -700,12 +706,6 @@ async function publishItemValuesBatch(
   prefetchedDraftValues?: PublishValueRow[],
   prefetchedPublishedValues?: PublishValueRow[],
 ): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
   if (itemIds.length === 0) {
     return 0;
   }
@@ -751,20 +751,7 @@ async function publishItemValuesBatch(
     });
   }
 
-  // Upsert in chunks within PostgREST payload limits
-  for (let j = 0; j < valuesToUpsert.length; j += SUPABASE_WRITE_BATCH_SIZE) {
-    const chunk = valuesToUpsert.slice(j, j + SUPABASE_WRITE_BATCH_SIZE);
-    const { error } = await client
-      .from('collection_item_values')
-      .upsert(chunk, {
-        onConflict: 'id,is_published',
-      });
-
-    if (error) {
-      console.error(`[PUBLISH:VALUES] Value upsert failed:`, error.message);
-      throw new Error(`Failed to publish item values: ${error.message}`);
-    }
-  }
+  await upsertRows('collection_item_values', valuesToUpsert);
 
   return valuesToUpsert.length;
 }
@@ -880,12 +867,7 @@ async function itemsWithValueChanges(itemIds: string[]): Promise<string[]> {
 async function cleanupDeletedPublishedItems(
   collectionId: string,
 ): Promise<{ deletedCount: number; deletedSlugs: string[] }> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
+  const db = await getDb();
   const deletedDraftItems = await getAllItemsByCollectionId(
     collectionId,
     false,
@@ -901,27 +883,29 @@ async function cleanupDeletedPublishedItems(
   // Snapshot published slug values before deletion (for cache invalidation)
   let deletedSlugs: string[] = [];
   try {
-    const { data: slugField } = await client
-      .from('collection_fields')
+    let slugFieldQuery = db('collection_fields')
       .select('id')
-      .eq('collection_id', collectionId)
-      .eq('key', 'slug')
-      .is('deleted_at', null)
+      .where('collection_id', collectionId)
+      .where('key', 'slug')
+      .whereNull('deleted_at')
       .limit(1)
-      .single();
+      .first();
+    slugFieldQuery = await addTenantFilter(db, slugFieldQuery, 'collection_fields');
+    const slugField = await slugFieldQuery as { id: string } | undefined;
 
     if (slugField) {
       const allSlugValues: Array<{ value: unknown }> = [];
       for (let i = 0; i < deletedItemIds.length; i += 500) {
         const batch = deletedItemIds.slice(i, i + 500);
-        const { data } = await client
-          .from('collection_item_values')
+        let valuesQuery = db('collection_item_values')
           .select('value')
-          .eq('field_id', slugField.id)
-          .eq('is_published', true)
-          .is('deleted_at', null)
-          .in('item_id', batch);
-        if (data) allSlugValues.push(...data);
+          .where('field_id', slugField.id)
+          .where('is_published', true)
+          .whereNull('deleted_at')
+          .whereIn('item_id', batch);
+        valuesQuery = await addTenantFilter(db, valuesQuery, 'collection_item_values');
+        const values = await valuesQuery as Array<{ value: unknown }>;
+        allSlugValues.push(...values);
       }
 
       deletedSlugs = allSlugValues
@@ -933,24 +917,10 @@ async function cleanupDeletedPublishedItems(
   }
 
   // Batch hard delete published versions (CASCADE will delete values)
-  for (let i = 0; i < deletedItemIds.length; i += 500) {
-    const batch = deletedItemIds.slice(i, i + 500);
-    await client
-      .from('collection_items')
-      .delete()
-      .in('id', batch)
-      .eq('is_published', true);
-  }
+  await deleteByIds('collection_items', deletedItemIds, true);
 
   // Batch hard delete draft versions (CASCADE will delete values)
-  for (let i = 0; i < deletedItemIds.length; i += 500) {
-    const batch = deletedItemIds.slice(i, i + 500);
-    await client
-      .from('collection_items')
-      .delete()
-      .in('id', batch)
-      .eq('is_published', false);
-  }
+  await deleteByIds('collection_items', deletedItemIds, false);
 
   return { deletedCount: deletedItemIds.length, deletedSlugs };
 }
@@ -963,40 +933,27 @@ async function cleanupDeletedPublishedItems(
  */
 async function cleanupDeletedPublishedFields(collectionId: string): Promise<void> {
   // Get all fields (including soft-deleted) from draft by querying directly
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
+  const db = await getDb();
 
   // Query for soft-deleted draft fields
-  const { data: deletedDraftFields, error } = await client
-    .from('collection_fields')
+  let deletedFieldsQuery = db('collection_fields')
     .select('*')
-    .eq('collection_id', collectionId)
-    .eq('is_published', false)
-    .not('deleted_at', 'is', null); // Only get deleted fields
+    .where('collection_id', collectionId)
+    .where('is_published', false)
+    .whereNotNull('deleted_at'); // Only get deleted fields
+  deletedFieldsQuery = await addTenantFilter(db, deletedFieldsQuery, 'collection_fields');
+  const deletedDraftFields = await deletedFieldsQuery as Array<{ id: string }>;
 
-  if (error || !deletedDraftFields || deletedDraftFields.length === 0) {
+  if (deletedDraftFields.length === 0) {
     return;
   }
 
   // Extract field IDs
   const deletedFieldIds = deletedDraftFields.map(field => field.id);
 
-  // Batch hard delete published versions (CASCADE will delete values)
-  await client
-    .from('collection_fields')
-    .delete()
-    .in('id', deletedFieldIds)
-    .eq('is_published', true);
-
-  // Batch hard delete draft versions (CASCADE will delete values)
-  await client
-    .from('collection_fields')
-    .delete()
-    .in('id', deletedFieldIds)
-    .eq('is_published', false);
+  // Batch hard delete published and draft versions (CASCADE will delete values)
+  await deleteByIds('collection_fields', deletedFieldIds, true);
+  await deleteByIds('collection_fields', deletedFieldIds, false);
 }
 
 /**
@@ -1037,16 +994,9 @@ async function getCollectionIdsWithDeletedDrafts(
     }
     const rows = await query;
     return new Set(rows.map((r: { collection_id: string }) => r.collection_id));
-  } catch {
-    const client = await getSupabaseAdmin();
-    if (!client) throw new Error('Supabase client not configured');
-    const { data, error } = await client
-      .from(table)
-      .select('collection_id')
-      .eq('is_published', false)
-      .not('deleted_at', 'is', null);
-    if (error) throw new Error(`Failed to detect deleted drafts: ${error.message}`);
-    return new Set((data || []).map(r => r.collection_id));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    throw new Error(`Failed to detect deleted drafts: ${message}`);
   }
 }
 
@@ -1069,43 +1019,26 @@ export async function getCollectionsNeedingDeletionCleanup(): Promise<Set<string
  * Called during publish operations to ensure deleted collections are permanently removed
  */
 export async function cleanupDeletedCollections(): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   // Find all soft-deleted draft collections
-  const { data: deletedCollections, error } = await client
-    .from('collections')
+  let deletedCollectionsQuery = db('collections')
     .select('id')
-    .eq('is_published', false)
-    .not('deleted_at', 'is', null);
+    .where('is_published', false)
+    .whereNotNull('deleted_at');
+  deletedCollectionsQuery = await addTenantFilter(db, deletedCollectionsQuery, 'collections');
+  const deletedCollections = await deletedCollectionsQuery as Array<{ id: string }>;
 
-  if (error) {
-    throw new Error(`Failed to fetch deleted collections: ${error.message}`);
-  }
-
-  if (!deletedCollections || deletedCollections.length === 0) {
+  if (deletedCollections.length === 0) {
     return;
   }
 
   // Extract collection IDs
   const collectionIds = deletedCollections.map(c => c.id);
 
-  // Batch delete published versions (CASCADE deletes all related data: fields, items, values)
-  await client
-    .from('collections')
-    .delete()
-    .in('id', collectionIds)
-    .eq('is_published', true);
-
-  // Batch delete draft versions (CASCADE deletes all related data: fields, items, values)
-  await client
-    .from('collections')
-    .delete()
-    .in('id', collectionIds)
-    .eq('is_published', false);
+  // Batch delete published and draft versions (CASCADE deletes related data)
+  await deleteByIds('collections', collectionIds, true);
+  await deleteByIds('collections', collectionIds, false);
 }
 
 /**
@@ -1196,34 +1129,23 @@ export async function needsPublishing(collectionId: string): Promise<boolean> {
 export async function groupItemsByCollection(
   itemIds: string[]
 ): Promise<Map<string, string[]>> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
   if (itemIds.length === 0) {
     return new Map();
   }
+
+  const db = await getDb();
 
   // Chunk the id list so large `.in()` filters don't overflow the request URL
   // length limit (which returns 400 Bad Request).
   const items: Array<{ id: string; collection_id: string }> = [];
   for (let i = 0; i < itemIds.length; i += SUPABASE_IN_FILTER_CHUNK_SIZE) {
     const idsChunk = itemIds.slice(i, i + SUPABASE_IN_FILTER_CHUNK_SIZE);
-    const { data, error } = await client
-      .from('collection_items')
-      .select('id, collection_id')
-      .eq('is_published', false)
-      .in('id', idsChunk);
-
-    if (error) {
-      throw new Error(`Failed to fetch collection items: ${error.message}`);
-    }
-
-    if (data) {
-      items.push(...data);
-    }
+    let query = db('collection_items')
+      .select('id', 'collection_id')
+      .where('is_published', false)
+      .whereIn('id', idsChunk);
+    query = await addTenantFilter(db, query, 'collection_items');
+    items.push(...await query as Array<{ id: string; collection_id: string }>);
   }
 
   // Group items by collection

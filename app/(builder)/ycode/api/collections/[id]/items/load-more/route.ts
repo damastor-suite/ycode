@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import { getItemsByCollectionId } from '@/lib/repositories/collectionItemRepository';
 import { getValuesByItemIds } from '@/lib/repositories/collectionItemValueRepository';
 import { getFieldsByCollectionId } from '@/lib/repositories/collectionFieldRepository';
@@ -8,7 +9,6 @@ import { getAllPages } from '@/lib/repositories/pageRepository';
 import { getAllPageFolders } from '@/lib/repositories/pageFolderRepository';
 import { renderCollectionItemsToHtml, loadTranslationsForLocale } from '@/lib/page-fetcher';
 import { noCache } from '@/lib/api-response';
-import { fetchAllRows } from '@/lib/supabase-constants';
 import type { Layer, CollectionItem, CollectionItemWithValues } from '@/types';
 
 export const dynamic = 'force-dynamic';
@@ -17,18 +17,17 @@ export const revalidate = 0;
 const IN_CHUNK_SIZE = 150;
 
 async function chunkedQuery<T>(
-  build: (chunk: string[]) => PromiseLike<{ data: T[] | null; error: unknown }>,
+  build: (chunk: string[]) => Promise<T[]>,
   itemIds: string[],
 ): Promise<T[]> {
   if (itemIds.length === 0) return [];
   if (itemIds.length <= IN_CHUNK_SIZE) {
-    const { data } = await build(itemIds);
-    return data || [];
+    return build(itemIds);
   }
   const results: T[] = [];
   for (let i = 0; i < itemIds.length; i += IN_CHUNK_SIZE) {
-    const { data } = await build(itemIds.slice(i, i + IN_CHUNK_SIZE));
-    if (data) results.push(...data);
+    const data = await build(itemIds.slice(i, i + IN_CHUNK_SIZE));
+    results.push(...data);
   }
   return results;
 }
@@ -37,25 +36,21 @@ async function getAllItemIdsForCollection(
   collectionId: string,
   isPublished: boolean,
 ): Promise<string[]> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase client not configured');
+  const db = await getDb();
+  let query = db('collection_items')
+    .select('id')
+    .where('collection_id', collectionId)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at')
+    .orderBy('manual_order', 'asc')
+    .orderBy('created_at', 'desc');
 
-  // Page past Supabase's 1000-row default cap so collections with more items
-  // report accurate `total` / `hasMore` instead of stalling at the cap.
-  // Match SSR's ordering so any `maxTotal` slice picks the same items.
-  const rows = await fetchAllRows<{ id: string }>((from, to) => {
-    let q = client
-      .from('collection_items')
-      .select('id')
-      .eq('collection_id', collectionId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .order('manual_order', { ascending: true })
-      .order('created_at', { ascending: false })
-      .range(from, to);
-    if (isPublished) q = q.eq('is_publishable', true);
-    return q;
-  });
+  if (isPublished) {
+    query = query.where('is_publishable', true);
+  }
+
+  query = await addTenantFilter(db, query, 'collection_items');
+  const rows = await query as Array<{ id: string }>;
 
   return rows.map(r => r.id);
 }
@@ -66,17 +61,19 @@ async function getFieldValuesForItems(
   itemIds: string[],
 ): Promise<Map<string, string>> {
   if (itemIds.length === 0) return new Map();
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase client not configured');
+  const db = await getDb();
 
   const rows = await chunkedQuery<{ item_id: string; value: string | null }>(
-    chunk => client
-      .from('collection_item_values')
-      .select('item_id, value')
-      .eq('field_id', fieldId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .in('item_id', chunk),
+    async (chunk) => {
+      let query = db('collection_item_values')
+        .select('item_id', 'value')
+        .where('field_id', fieldId)
+        .where('is_published', isPublished)
+        .whereNull('deleted_at')
+        .whereIn('item_id', chunk);
+      query = await addTenantFilter(db, query, 'collection_item_values');
+      return await query as Array<{ item_id: string; value: string | null }>;
+    },
     itemIds,
   );
 

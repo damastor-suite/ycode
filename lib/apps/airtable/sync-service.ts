@@ -11,7 +11,9 @@
 
 import { randomUUID } from 'crypto';
 
-import { getSupabaseAdmin, runWithTenantId } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
+import { runWithTenantId } from '@/lib/platform/tenant';
 import { getAppSettingValue, setAppSetting } from '@/lib/repositories/appSettingsRepository';
 import { generateUniqueSlug as generateUniqueSlugFromSet } from '@/lib/collection-utils';
 import { isAssetFieldType, isMultipleAssetField, getAssetCategoryForField } from '@/lib/collection-field-utils';
@@ -355,7 +357,7 @@ export async function processWebhookNotification(
 
   const doSync = async (): Promise<SyncResult[]> => {
     // Lock must be inside doSync so it runs within the tenant context
-    // (runWithTenantId) — otherwise getSupabaseAdmin() has no tenant scope.
+    // (runWithTenantId) so tenant-scoped DB queries use the right context.
     const lockStatus = await tryClaimSyncLock(webhookId);
 
     if (lockStatus === 'busy') return [];
@@ -740,18 +742,18 @@ async function getExistingAirtableRecordIds(
 ): Promise<Set<string>> {
   if (airtableRecordIds.length === 0) return new Set();
 
-  const client = await getSupabaseAdmin();
-  if (!client) return new Set();
+  const db = await getDb();
 
-  const { data } = await client
-    .from('collection_item_values')
+  let query = db('collection_item_values')
     .select('value')
-    .eq('field_id', recordIdFieldId)
-    .eq('is_published', false)
-    .is('deleted_at', null)
-    .in('value', airtableRecordIds);
+    .where('field_id', recordIdFieldId)
+    .where('is_published', false)
+    .whereNull('deleted_at')
+    .whereIn('value', airtableRecordIds);
+  query = await addTenantFilter(db, query, 'collection_item_values');
+  const data = await query as Array<{ value: string | null }>;
 
-  return new Set((data || []).map((row) => row.value).filter(Boolean));
+  return new Set(data.map((row) => row.value).filter(Boolean) as string[]);
 }
 
 // =============================================================================
@@ -1081,16 +1083,15 @@ async function batchUpsertValues(
 
 /** Soft-delete multiple items in a single query */
 async function batchSoftDelete(itemIds: string[]): Promise<void> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase not configured');
+  if (itemIds.length === 0) return;
 
   const now = new Date().toISOString();
+  const db = await getDb();
 
-  const { error } = await client
-    .from('collection_items')
+  let query = db('collection_items')
     .update({ deleted_at: now, updated_at: now })
-    .in('id', itemIds)
-    .eq('is_published', false);
-
-  if (error) throw new Error(`Batch delete failed: ${error.message}`);
+    .whereIn('id', itemIds)
+    .where('is_published', false);
+  query = await addTenantFilter(db, query, 'collection_items');
+  await query;
 }

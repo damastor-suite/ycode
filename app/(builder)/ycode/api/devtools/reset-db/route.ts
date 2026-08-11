@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getKnexClient } from '@/lib/knex-client';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET } from '@/lib/asset-constants';
+import { getStorage } from '@/lib/platform/storage';
 import { clearAllCache } from '@/lib/services/cacheService';
 
 export const dynamic = 'force-dynamic';
@@ -18,7 +17,6 @@ export async function POST() {
     console.log('[POST /ycode/api/devtools/reset-db] Starting database reset...');
 
     const knex = await getKnexClient();
-    const supabase = await getSupabaseAdmin();
 
     // Get all tables in the public schema
     const tables = await knex.raw(`
@@ -29,29 +27,33 @@ export async function POST() {
 
     console.log('[POST /ycode/api/devtools/reset-db] Found ' + tables.rows.length + ' tables');
 
-    if (supabase) {
-      console.log('[POST /ycode/api/devtools/reset-db] Cleaning up assets storage bucket...');
+    console.log('[POST /ycode/api/devtools/reset-db] Cleaning up known storage objects...');
 
-      try {
-        // emptyBucket removes all files recursively (including nested folders)
-        const { error: emptyError } = await supabase.storage.emptyBucket(STORAGE_BUCKET);
+    try {
+      const storagePaths: string[] = [];
+      const tableNames = new Set(tables.rows.map((row: { tablename: string }) => row.tablename));
 
-        if (emptyError) {
-          console.log('[POST /ycode/api/devtools/reset-db] Error emptying bucket (may not exist):', emptyError.message);
-        } else {
-          console.log('[POST /ycode/api/devtools/reset-db] Assets bucket emptied');
-        }
-
-        const { error: deleteBucketError } = await supabase.storage.deleteBucket(STORAGE_BUCKET);
-
-        if (deleteBucketError) {
-          console.log('[POST /ycode/api/devtools/reset-db] Error deleting bucket (may not exist):', deleteBucketError.message);
-        } else {
-          console.log('[POST /ycode/api/devtools/reset-db] Assets bucket deleted');
-        }
-      } catch (storageError) {
-        console.log('[POST /ycode/api/devtools/reset-db] Storage cleanup error:', storageError);
+      if (tableNames.has('assets')) {
+        const assetRows = await knex('assets')
+          .select('storage_path')
+          .whereNotNull('storage_path') as Array<{ storage_path: string | null }>;
+        storagePaths.push(...assetRows.map((row) => row.storage_path).filter(Boolean) as string[]);
       }
+
+      if (tableNames.has('fonts')) {
+        const fontRows = await knex('fonts')
+          .select('storage_path')
+          .whereNotNull('storage_path') as Array<{ storage_path: string | null }>;
+        storagePaths.push(...fontRows.map((row) => row.storage_path).filter(Boolean) as string[]);
+      }
+
+      if (storagePaths.length > 0) {
+        const storage = await getStorage();
+        await storage.remove([...new Set(storagePaths)]);
+        console.log(`[POST /ycode/api/devtools/reset-db] Removed ${storagePaths.length} storage object(s)`);
+      }
+    } catch (storageError) {
+      console.log('[POST /ycode/api/devtools/reset-db] Storage cleanup error:', storageError);
     }
 
     await knex.raw(`

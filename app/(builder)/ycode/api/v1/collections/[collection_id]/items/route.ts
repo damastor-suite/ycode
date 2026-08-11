@@ -2,14 +2,75 @@ import { NextRequest, NextResponse } from 'next/server';
 import { validateApiKey, unauthorizedResponse } from '../../../auth';
 import { getCollectionById } from '@/lib/repositories/collectionRepository';
 import { getFieldsByCollectionId } from '@/lib/repositories/collectionFieldRepository';
-import { getItemsWithValues, createItem, getMaxIdValue } from '@/lib/repositories/collectionItemRepository';
-import { setValues } from '@/lib/repositories/collectionItemValueRepository';
+import { getDb } from '@/lib/platform/db';
+import { addTenantIdToRow, getConflictColumns } from '@/lib/repositories/knex-repository-utils';
+import { getItemsWithValues, createItem, getMaxIdValue, getItemWithValues } from '@/lib/repositories/collectionItemRepository';
+import { setValues, getValuesByItemId } from '@/lib/repositories/collectionItemValueRepository';
 import { invalidateForCollectionChange } from '@/lib/services/cacheService';
 import { transformItemToPublicWithRefs, parseFieldProjections } from '../../../reference-resolver';
+import type { CollectionItem, CollectionItemValue } from '@/types';
 
 // Disable caching for this route
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+
+async function upsertPublishedItemVersion(
+  item: CollectionItem,
+  collectionId: string
+): Promise<void> {
+  const db = await getDb();
+  const row = await addTenantIdToRow(db, 'collection_items', {
+    id: item.id,
+    collection_id: collectionId,
+    manual_order: item.manual_order,
+    is_published: true,
+    is_publishable: true,
+    content_hash: item.content_hash ?? null,
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+    deleted_at: null,
+  });
+  const tenantId = typeof row.tenant_id === 'string' ? row.tenant_id : null;
+  const conflictColumns = await getConflictColumns(db, 'collection_items', ['id', 'is_published'], tenantId);
+
+  await db('collection_items')
+    .insert(row)
+    .onConflict(conflictColumns)
+    .merge(['collection_id', 'manual_order', 'is_publishable', 'content_hash', 'updated_at', 'deleted_at']);
+}
+
+async function upsertPublishedValues(draftValues: CollectionItemValue[]): Promise<void> {
+  if (draftValues.length === 0) {
+    return;
+  }
+
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const rows = await Promise.all(
+    draftValues.map((value) => addTenantIdToRow(db, 'collection_item_values', {
+      id: value.id,
+      item_id: value.item_id,
+      field_id: value.field_id,
+      value: value.value,
+      is_published: true,
+      created_at: value.created_at,
+      updated_at: now,
+      deleted_at: null,
+    }))
+  );
+  const tenantId = typeof rows[0]?.tenant_id === 'string' ? rows[0].tenant_id : null;
+  const conflictColumns = await getConflictColumns(
+    db,
+    'collection_item_values',
+    ['id', 'is_published'],
+    tenantId
+  );
+
+  await db('collection_item_values')
+    .insert(rows)
+    .onConflict(conflictColumns)
+    .merge(['value', 'updated_at', 'deleted_at']);
+}
 
 /**
  * GET /ycode/api/v1/collections/{collection_id}/items
@@ -289,47 +350,15 @@ export async function POST(
     }
 
     // Now create the published version with the same ID
-    const { getSupabaseAdmin } = await import('@/lib/supabase-server');
-    const { getValuesByItemId } = await import('@/lib/repositories/collectionItemValueRepository');
-    const client = await getSupabaseAdmin();
+    await upsertPublishedItemVersion(item, collection_id);
 
-    if (client) {
-      // Insert published item with same ID
-      await client
-        .from('collection_items')
-        .insert({
-          id: item.id,
-          collection_id,
-          manual_order: item.manual_order,
-          is_published: true,
-          is_publishable: true,
-          created_at: item.created_at,
-          updated_at: item.updated_at,
-        });
-
-      // Copy draft values to published with SAME IDs (matching publishValues pattern)
-      if (Object.keys(valuesToSet).length > 0) {
-        const draftValues = await getValuesByItemId(item.id, false);
-        const now = new Date().toISOString();
-        
-        const publishedValues = draftValues.map(value => ({
-          id: value.id,  // Same ID as draft
-          item_id: value.item_id,
-          field_id: value.field_id,
-          value: value.value,
-          is_published: true,
-          created_at: value.created_at,
-          updated_at: now,
-        }));
-
-        await client
-          .from('collection_item_values')
-          .insert(publishedValues);
-      }
+    // Copy draft values to published with SAME IDs (matching publishValues pattern)
+    if (Object.keys(valuesToSet).length > 0) {
+      const draftValues = await getValuesByItemId(item.id, false);
+      await upsertPublishedValues(draftValues);
     }
 
     // Get the created item with values and transform with resolved references
-    const { getItemWithValues } = await import('@/lib/repositories/collectionItemRepository');
     const createdItem = await getItemWithValues(item.id, true);
     
     if (!createdItem) {

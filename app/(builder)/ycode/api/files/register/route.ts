@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { getStorage } from '@/lib/platform/storage';
 import { createAsset } from '@/lib/repositories/assetRepository';
-import { STORAGE_BUCKET, getDisplayName } from '@/lib/asset-constants';
+import { getDisplayName } from '@/lib/asset-constants';
 
 export const runtime = 'nodejs';
 
@@ -30,20 +30,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const supabase = await getSupabaseAdmin();
-
-    if (!supabase) {
-      return NextResponse.json({ error: 'Supabase not configured' }, { status: 500 });
-    }
-
-    const { data: urlData } = supabase.storage
-      .from(STORAGE_BUCKET)
-      .getPublicUrl(storagePath);
+    const storage = await getStorage();
 
     const asset = await createAsset({
       filename: getDisplayName(filename, customName),
       storage_path: storagePath,
-      public_url: urlData.publicUrl,
+      public_url: storage.getPublicUrl(storagePath),
       file_size: fileSize,
       mime_type: mimeType,
       source,

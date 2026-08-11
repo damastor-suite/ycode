@@ -14,7 +14,7 @@
  */
 
 import type { Knex } from 'knex';
-import { getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { getTenantIdFromHeaders } from '@/lib/platform/tenant';
 
 /**
  * Resolve tenant-aware WHERE condition for a given table.

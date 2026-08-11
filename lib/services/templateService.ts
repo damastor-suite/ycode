@@ -1,8 +1,8 @@
 import { getKnexClient, closeKnexClient, testKnexConnection } from '../knex-client';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { STORAGE_FOLDERS } from '@/lib/asset-constants';
 import { migrations } from '../migrations-loader';
 import { guardKnexForMigrationReplay } from '@/lib/migration-replay-guard';
+import { getStorage } from '@/lib/platform/storage';
 import { YCODE_EXTERNAL_API_URL } from '@/lib/config';
 
 /**
@@ -125,11 +125,7 @@ export async function getTemplate(id: string): Promise<TemplateDetails | null> {
  * @param knex - Knex transaction or client
  */
 async function copyTemplateAssetsToUserStorage(knex: ReturnType<typeof getKnexClient> extends Promise<infer T> ? T : never): Promise<void> {
-  const supabase = await getSupabaseAdmin();
-  if (!supabase) {
-    console.warn('[copyTemplateAssets] Supabase not configured, skipping asset copy');
-    return;
-  }
+  const storage = await getStorage();
 
   // Find all template assets that need to be copied (have public_url but no storage_path)
   const templateAssets = await knex('assets')
@@ -173,30 +169,18 @@ async function copyTemplateAssetsToUserStorage(knex: ReturnType<typeof getKnexCl
       const storagePath = `${STORAGE_FOLDERS.WEBSITE}/${timestamp}-${random}.${extension}`;
 
       // Upload to user's storage
-      const { data, error } = await supabase.storage
-        .from(STORAGE_BUCKET)
-        .upload(storagePath, buffer, {
-          contentType: asset.mime_type || 'application/octet-stream',
-          cacheControl: '3600',
-          upsert: false,
-        });
-
-      if (error) {
-        console.warn(`[copyTemplateAssets] Failed to upload ${asset.filename}:`, error);
-        continue;
-      }
-
-      // Get new public URL
-      const { data: urlData } = supabase.storage
-        .from(STORAGE_BUCKET)
-        .getPublicUrl(data.path);
+      const { path } = await storage.upload(storagePath, buffer, {
+        contentType: asset.mime_type || 'application/octet-stream',
+        cacheControl: '3600',
+        upsert: false,
+      });
 
       // Update asset record with new storage path and URL
       await knex('assets')
         .where('id', asset.id)
         .update({
-          storage_path: data.path,
-          public_url: urlData.publicUrl,
+          storage_path: path,
+          public_url: storage.getPublicUrl(path),
         });
     } catch (err) {
       console.warn(`[copyTemplateAssets] Error copying ${asset.filename}:`, err);
@@ -239,28 +223,17 @@ async function copyTemplateAssetsToUserStorage(knex: ReturnType<typeof getKnexCl
         const extension = font.kind || 'woff2';
         const storagePath = `${STORAGE_FOLDERS.WEBSITE}/fonts/${timestamp}-${random}.${extension}`;
 
-        const { data, error } = await supabase.storage
-          .from(STORAGE_BUCKET)
-          .upload(storagePath, buffer, {
-            contentType: extension === 'woff2' ? 'font/woff2' : 'font/ttf',
-            cacheControl: '31536000',
-            upsert: false,
-          });
-
-        if (error) {
-          console.warn(`[copyTemplateAssets] Failed to upload font ${font.name}:`, error);
-          continue;
-        }
-
-        const { data: urlData } = supabase.storage
-          .from(STORAGE_BUCKET)
-          .getPublicUrl(data.path);
+        const { path } = await storage.upload(storagePath, buffer, {
+          contentType: extension === 'woff2' ? 'font/woff2' : 'font/ttf',
+          cacheControl: '31536000',
+          upsert: false,
+        });
 
         await knex('fonts')
           .where('id', font.id)
           .update({
-            storage_path: data.path,
-            url: urlData.publicUrl,
+            storage_path: path,
+            url: storage.getPublicUrl(path),
           });
       } catch (err) {
         console.warn(`[copyTemplateAssets] Error copying font ${font.name}:`, err);

@@ -1,10 +1,10 @@
 /**
  * Thumbnail upload utility for component previews
- * Converts image buffers to WebP and uploads to Supabase Storage
+ * Converts image buffers to WebP and uploads to platform storage
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { getStorage } from '@/lib/platform/storage';
 import sharp from 'sharp';
 
 /**
@@ -27,32 +27,17 @@ export async function convertToWebP(imageBuffer: Buffer, quality: number = 85): 
  * @returns Public URL of the uploaded thumbnail
  */
 export async function uploadThumbnail(componentId: string, imageBuffer: Buffer): Promise<string> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
   const webpBuffer = await convertToWebP(imageBuffer);
   const storagePath = `${STORAGE_FOLDERS.COMPONENTS}/${componentId}.webp`;
+  const storage = await getStorage();
 
-  const { data, error } = await client.storage
-    .from(STORAGE_BUCKET)
-    .upload(storagePath, webpBuffer, {
-      cacheControl: '3600',
-      upsert: true,
-      contentType: 'image/webp',
-    });
+  const { path } = await storage.upload(storagePath, webpBuffer, {
+    cacheControl: '3600',
+    upsert: true,
+    contentType: 'image/webp',
+  });
 
-  if (error) {
-    throw new Error(`Failed to upload thumbnail: ${error.message}`);
-  }
-
-  const { data: urlData } = client.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(data.path);
-
-  return urlData.publicUrl;
+  return storage.getPublicUrl(path);
 }
 
 /**
@@ -60,19 +45,7 @@ export async function uploadThumbnail(componentId: string, imageBuffer: Buffer):
  * @param componentId - Component ID used as filename
  */
 export async function deleteThumbnail(componentId: string): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
   const storagePath = `${STORAGE_FOLDERS.COMPONENTS}/${componentId}.webp`;
-
-  const { error } = await client.storage
-    .from(STORAGE_BUCKET)
-    .remove([storagePath]);
-
-  if (error) {
-    throw new Error(`Failed to delete thumbnail: ${error.message}`);
-  }
+  const storage = await getStorage();
+  await storage.remove([storagePath]);
 }

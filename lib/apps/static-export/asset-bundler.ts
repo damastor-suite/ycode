@@ -6,9 +6,9 @@
  *                        We read referenced URLs off disk and add them to
  *                        the output set so S3/GitHub-hosted exports don't
  *                        404 on `/ycode/layouts/assets/*`.
- *   - Supabase assets : user-uploaded files rendered via the `/a/<hash>/<name>`
+ *   - Storage assets  : user-uploaded files rendered via the `/a/<hash>/<name>`
  *                        proxy URL pattern. We decode the hash back to an
- *                        asset UUID, look up the row, fetch `public_url`,
+ *                        asset UUID, look up the row, fetch object bytes,
  *                        and ship the bytes at the same proxy path so the
  *                        rendered HTML doesn't need rewriting.
  */
@@ -17,7 +17,8 @@ import fs from 'fs/promises'
 import path from 'path'
 
 import { base62ToUuid } from '@/lib/convertion-utils'
-import { getSupabaseAdmin } from '@/lib/supabase-server'
+import { getStorage } from '@/lib/platform/storage'
+import { getAssetById } from '@/lib/repositories/assetRepository'
 
 import { mediaContentType, type OutputFile } from './writers/types'
 
@@ -32,23 +33,6 @@ import { mediaContentType, type OutputFile } from './writers/types'
 const ASSET_PROXY_URL_RE = /\/a\/([A-Za-z0-9]{22})\/[^"'\s)<>?&]+/g
 const PROXY_FETCH_CONCURRENCY = 8
 
-interface SupabaseAssetClient {
-  from(table: 'assets'): {
-    select(cols: string): {
-      eq(col: string, val: unknown): {
-        eq(col: string, val: unknown): {
-          is(col: string, val: unknown): {
-            maybeSingle(): Promise<{
-              data: { id: string; filename: string; mime_type: string; public_url: string | null } | null
-              error: { message: string } | null
-            }>
-          }
-        }
-      }
-    }
-  }
-}
-
 export async function collectSupabaseAssets(htmlOutputs: OutputFile[]): Promise<OutputFile[]> {
   const proxyUrls = new Set<string>()
   for (const f of htmlOutputs) {
@@ -59,9 +43,9 @@ export async function collectSupabaseAssets(htmlOutputs: OutputFile[]): Promise<
   }
   if (proxyUrls.size === 0) return []
 
-  const client = (await getSupabaseAdmin()) as SupabaseAssetClient | null
-  if (!client) {
-    console.warn('[Static Export] Could not bundle Supabase assets: Supabase client unavailable')
+  const storage = await getStorage()
+  if (!storage.getObject) {
+    console.warn('[Static Export] Could not bundle storage assets: storage provider cannot read objects')
     return []
   }
 
@@ -72,7 +56,7 @@ export async function collectSupabaseAssets(htmlOutputs: OutputFile[]): Promise<
   const workers = Array.from({ length: Math.min(PROXY_FETCH_CONCURRENCY, queue.length) }, async () => {
     while (cursor < queue.length) {
       const proxyUrl = queue[cursor++]
-      const file = await fetchAssetByProxyUrl(client, proxyUrl)
+      const file = await fetchAssetByProxyUrl(storage.getObject.bind(storage), proxyUrl)
       if (file) results.push(file)
     }
   })
@@ -81,7 +65,7 @@ export async function collectSupabaseAssets(htmlOutputs: OutputFile[]): Promise<
 }
 
 async function fetchAssetByProxyUrl(
-  client: SupabaseAssetClient,
+  getObject: (path: string) => Promise<{ body: Buffer; contentType?: string } | null>,
   proxyUrl: string,
 ): Promise<OutputFile | null> {
   const match = proxyUrl.match(/\/a\/([A-Za-z0-9]{22})\//)
@@ -94,30 +78,36 @@ async function fetchAssetByProxyUrl(
     return null
   }
 
-  const { data: asset, error } = await client
-    .from('assets')
-    .select('id, filename, mime_type, public_url')
-    .eq('id', assetId)
-    .eq('is_published', true)
-    .is('deleted_at', null)
-    .maybeSingle()
-
-  if (error || !asset?.public_url) {
-    console.warn(`[Static Export] Could not look up asset for ${proxyUrl}: ${error?.message ?? 'not found'}`)
+  const asset = await getAssetById(assetId, true)
+  if (!asset) {
+    console.warn(`[Static Export] Could not look up asset for ${proxyUrl}: not found`)
     return null
   }
 
   try {
-    const response = await fetch(asset.public_url)
-    if (!response.ok) {
-      console.warn(`[Static Export] HTTP ${response.status} fetching ${asset.filename}`)
+    if (asset.content) {
+      return {
+        key: proxyUrl.replace(/^\/+/, ''),
+        body: Buffer.from(asset.content),
+        contentType: asset.mime_type || mediaContentType(proxyUrl),
+      }
+    }
+
+    if (!asset.storage_path) {
+      console.warn(`[Static Export] Asset ${asset.filename} has no storage path`)
       return null
     }
-    const buf = Buffer.from(await response.arrayBuffer())
+
+    const object = await getObject(asset.storage_path)
+    if (!object) {
+      console.warn(`[Static Export] Storage object not found for ${asset.filename}`)
+      return null
+    }
+
     return {
       key: proxyUrl.replace(/^\/+/, ''),
-      body: buf,
-      contentType: asset.mime_type || mediaContentType(proxyUrl),
+      body: object.body,
+      contentType: object.contentType || asset.mime_type || mediaContentType(proxyUrl),
     }
   } catch (err) {
     console.warn(

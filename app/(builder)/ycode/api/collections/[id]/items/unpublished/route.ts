@@ -1,11 +1,47 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { getItemsWithValues } from '@/lib/repositories/collectionItemRepository';
+import { getValueRowsForItems } from '@/lib/repositories/collectionItemValueRepository';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import { noCache } from '@/lib/api-response';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 
 // Disable caching for this route
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+
+type ValueRow = {
+  item_id: string;
+  field_id: string;
+  value: string | null;
+};
+
+function groupValuesByItem(rows: ValueRow[]): Map<string, Array<{ field_id: string; value: string | null }>> {
+  const valuesByItem = new Map<string, Array<{ field_id: string; value: string | null }>>();
+
+  for (const row of rows) {
+    const values = valuesByItem.get(row.item_id) ?? [];
+    values.push({ field_id: row.field_id, value: row.value });
+    valuesByItem.set(row.item_id, values);
+  }
+
+  return valuesByItem;
+}
+
+async function getPublishedItemIds(itemIds: string[]): Promise<Set<string>> {
+  if (itemIds.length === 0) {
+    return new Set();
+  }
+
+  const db = await getDb();
+  let query = db('collection_items')
+    .select('id')
+    .whereIn('id', itemIds)
+    .where('is_published', true);
+  query = await addTenantFilter(db, query, 'collection_items');
+
+  const rows = await query as Array<{ id: string }>;
+  return new Set(rows.map((row) => row.id));
+}
 
 /**
  * GET /ycode/api/collections/[id]/items/unpublished
@@ -23,12 +59,6 @@ export async function GET(
     const { id } = await params;
     const collectionId = id; // UUID string, no parsing needed
 
-    const client = await getSupabaseAdmin();
-
-    if (!client) {
-      return noCache({ error: 'Supabase not configured' }, 500);
-    }
-
     // Get all items including deleted ones (no pagination for unpublished check)
     const { items } = await getItemsWithValues(
       collectionId,
@@ -36,28 +66,22 @@ export async function GET(
       { deleted: undefined } // filters (include all deleted states)
     );
 
+    const itemIds = items.map((item) => item.id);
+    const [draftRows, publishedRows, publishedItemIds] = await Promise.all([
+      getValueRowsForItems(itemIds, false),
+      getValueRowsForItems(itemIds, true),
+      getPublishedItemIds(itemIds),
+    ]);
+    const draftValuesByItem = groupValuesByItem(draftRows);
+    const publishedValuesByItem = groupValuesByItem(publishedRows);
     const unpublishedItems = [];
 
     // Check each item to see if it needs publishing
     for (const item of items) {
       // If item is deleted, check if it has published values
       if (item.deleted_at) {
-        // Get published values to check if item was ever published
-        const { data: publishedValues, error: publishedCheckError } = await client
-          .from('collection_item_values')
-          .select('field_id')
-          .eq('item_id', item.id)
-          .eq('is_published', true)
-          .is('deleted_at', null)
-          .limit(1);
-
-        if (publishedCheckError) {
-          console.error(`Error checking published values for item ${item.id}:`, publishedCheckError);
-          continue;
-        }
-
         // Only show as "deleted" if there are published values to remove
-        if (publishedValues && publishedValues.length > 0) {
+        if ((publishedValuesByItem.get(item.id)?.length ?? 0) > 0) {
           unpublishedItems.push({ ...item, publish_status: 'deleted' });
         }
         // If no published values, skip this item (never published, so nothing to delete)
@@ -66,53 +90,23 @@ export async function GET(
 
       // If item is not publishable, check if it has a published version that needs removal
       if (!item.is_publishable) {
-        const { data: publishedItem } = await client
-          .from('collection_items')
-          .select('id')
-          .eq('id', item.id)
-          .eq('is_published', true)
-          .limit(1);
-
-        if (publishedItem && publishedItem.length > 0) {
+        if (publishedItemIds.has(item.id)) {
           unpublishedItems.push({ ...item, publish_status: 'deleted' });
         }
         continue;
       }
 
-      // Get draft values
-      const { data: draftValues, error: draftError } = await client
-        .from('collection_item_values')
-        .select('field_id, value')
-        .eq('item_id', item.id)
-        .eq('is_published', false)
-        .is('deleted_at', null);
-
-      if (draftError) {
-        console.error(`Error fetching draft values for item ${item.id}:`, draftError);
-        continue;
-      }
-
-      // Get published values
-      const { data: publishedValues, error: publishedError } = await client
-        .from('collection_item_values')
-        .select('field_id, value')
-        .eq('item_id', item.id)
-        .eq('is_published', true)
-        .is('deleted_at', null);
-
-      if (publishedError) {
-        console.error(`Error fetching published values for item ${item.id}:`, publishedError);
-        continue;
-      }
+      const draftValues = draftValuesByItem.get(item.id) ?? [];
+      const publishedValues = publishedValuesByItem.get(item.id) ?? [];
 
       // If no published values, item is new
-      if (!publishedValues || publishedValues.length === 0) {
+      if (publishedValues.length === 0) {
         unpublishedItems.push({ ...item, publish_status: 'new' });
         continue;
       }
 
       // Check if draft differs from published
-      const isDifferent = hasChanges(draftValues || [], publishedValues);
+      const isDifferent = hasChanges(draftValues, publishedValues);
 
       if (isDifferent) {
         unpublishedItems.push({ ...item, publish_status: 'updated' });

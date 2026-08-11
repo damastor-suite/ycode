@@ -20,7 +20,8 @@ import { getAllDraftLayers, getDraftLayers, getEmbeddedComponentIdsForCollection
 import { getAllComponents } from '@/lib/repositories/componentRepository';
 import { collectComponentIds } from '@/lib/component-utils';
 import { setSetting } from '@/lib/repositories/settingsRepository';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 
 /**
  * Extract all Tailwind classes from a layer tree.
@@ -244,18 +245,18 @@ async function getPageSettingsByIds(pageIds: string[]): Promise<Map<string, unkn
   const map = new Map<string, unknown>();
   if (pageIds.length === 0) return map;
 
-  const client = await getSupabaseAdmin();
-  if (!client) return map;
+  const db = await getDb();
 
   const { chunk } = await import('@/lib/utils');
   for (const idChunk of chunk(pageIds, 500)) {
-    const { data } = await client
-      .from('pages')
-      .select('id, settings')
-      .in('id', idChunk)
-      .eq('is_published', false)
-      .is('deleted_at', null);
-    for (const row of data ?? []) map.set(row.id as string, row.settings);
+    let query = db('pages')
+      .select('id', 'settings')
+      .whereIn('id', idChunk)
+      .where('is_published', false)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(db, query, 'pages');
+    const rows = await query as Array<{ id: string; settings: unknown }>;
+    for (const row of rows) map.set(row.id, row.settings);
   }
 
   return map;
@@ -363,21 +364,21 @@ async function updatePageGeneratedCss(
   css: string,
 ): Promise<void> {
   const { generatePageLayersHash } = await import('@/lib/hash-utils');
-  const client = await getSupabaseAdmin();
-  if (!client) return;
+  const db = await getDb();
 
   const contentHash = generatePageLayersHash({
     layers: pageLayers.layers,
     generated_css: css,
   });
 
-  await client
-    .from('page_layers')
+  let query = db('page_layers')
     .update({
       generated_css: css,
       content_hash: contentHash,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', pageLayers.id)
-    .eq('is_published', false);
+    .where('id', pageLayers.id)
+    .where('is_published', false);
+  query = await addTenantFilter(db, query, 'page_layers');
+  await query;
 }

@@ -3,7 +3,8 @@ import { connection } from 'next/server';
 import { unstable_cache } from 'next/cache';
 import { addCacheTag } from '@vercel/functions';
 import type { Metadata } from 'next';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import { buildSlugPath } from '@/lib/page-utils';
 import { generatePageMetadata, fetchGlobalPageSettings } from '@/lib/generate-page-metadata';
 import { fetchPageByPath, fetchPageByPathForMetadata, fetchErrorPage, splitPageData, reassemblePageData, slimPageData } from '@/lib/page-fetcher';
@@ -26,62 +27,55 @@ export const dynamicParams = true;
  */
 export async function generateStaticParams() {
   try {
-    const supabase = await getSupabaseAdmin();
-
-    if (!supabase) {
-      return [];
-    }
+    const db = await getDb();
 
     // Get all published pages and folders (excluding soft-deleted)
-    const { data: pages } = await supabase
-      .from('pages')
+    let pagesQuery = db('pages')
       .select('*')
-      .eq('is_published', true)
-      .is('deleted_at', null);
+      .where('is_published', true)
+      .whereNull('deleted_at');
+    pagesQuery = await addTenantFilter(db, pagesQuery, 'pages');
 
-    const { data: folders } = await supabase
-      .from('page_folders')
+    let foldersQuery = db('page_folders')
       .select('*')
-      .eq('is_published', true)
-      .is('deleted_at', null);
+      .where('is_published', true)
+      .whereNull('deleted_at');
+    foldersQuery = await addTenantFilter(db, foldersQuery, 'page_folders');
 
-    // Get all active locales
-    const { data: locales } = await supabase
-      .from('locales')
+    let localesQuery = db('locales')
       .select('*')
-      .is('deleted_at', null);
+      .whereNull('deleted_at');
+    localesQuery = await addTenantFilter(db, localesQuery, 'locales');
 
-    // Get all published translations
-    const { data: translations } = await supabase
-      .from('translations')
+    let translationsQuery = db('translations')
       .select('*')
-      .eq('is_published', true)
-      .is('deleted_at', null);
+      .where('is_published', true)
+      .whereNull('deleted_at');
+    translationsQuery = await addTenantFilter(db, translationsQuery, 'translations');
 
-    if (!pages || !folders) {
-      return [];
-    }
+    const [pages, folders, locales, translations] = await Promise.all([
+      pagesQuery as Promise<Page[]>,
+      foldersQuery as Promise<PageFolder[]>,
+      localesQuery as Promise<Array<{ id: string; code: string; is_default: boolean }>>,
+      translationsQuery as Promise<Translation[]>,
+    ]);
 
     const params: { slug: string[] }[] = [];
 
     // Build translations map for easier lookup
     const translationsMap: Record<string, Record<string, Translation>> = {};
-    if (translations) {
-      for (const translation of translations) {
-        if (!translationsMap[translation.locale_id]) {
-          translationsMap[translation.locale_id] = {};
-        }
-        const key = `${translation.source_type}:${translation.source_id}:${translation.content_key}`;
-        translationsMap[translation.locale_id][key] = translation;
+    for (const translation of translations) {
+      if (!translationsMap[translation.locale_id]) {
+        translationsMap[translation.locale_id] = {};
       }
+      const key = `${translation.source_type}:${translation.source_id}:${translation.content_key}`;
+      translationsMap[translation.locale_id][key] = translation;
     }
 
     // Generate localized homepage paths (e.g., /fr/, /es/)
-    if (locales) {
-      for (const locale of locales) {
-        if (locale.is_default) continue; // Skip default locale (/ is handled by app/page.tsx)
-        params.push({ slug: [locale.code] });
-      }
+    for (const locale of locales) {
+      if (locale.is_default) continue; // Skip default locale (/ is handled by app/page.tsx)
+      params.push({ slug: [locale.code] });
     }
 
     // Generate params for each non-dynamic page
@@ -101,41 +95,39 @@ export async function generateStaticParams() {
       }
 
       // Generate translated paths for non-default locales
-      if (locales) {
-        for (const locale of locales) {
-          if (locale.is_default) continue; // Skip default locale
+      for (const locale of locales) {
+        if (locale.is_default) continue; // Skip default locale
 
-          const localeTranslations = translationsMap[locale.id] || {};
+        const localeTranslations = translationsMap[locale.id] || {};
 
-          // Build localized path with translated slugs
-          const slugParts: string[] = [locale.code];
+        // Build localized path with translated slugs
+        const slugParts: string[] = [locale.code];
 
-          // Add translated folder path
-          let currentFolderId = page.page_folder_id;
-          const folderSegments: string[] = [];
-          while (currentFolderId) {
-            const folder = folders.find(f => f.id === currentFolderId);
-            if (!folder) break;
+        // Add translated folder path
+        let currentFolderId = page.page_folder_id;
+        const folderSegments: string[] = [];
+        while (currentFolderId) {
+          const folder = folders.find(f => f.id === currentFolderId);
+          if (!folder) break;
 
-            const translationKey = `folder:${folder.id}:slug`;
-            const translatedSlug = localeTranslations[translationKey]?.content_value || folder.slug;
-            folderSegments.unshift(translatedSlug);
+          const translationKey = `folder:${folder.id}:slug`;
+          const translatedSlug = localeTranslations[translationKey]?.content_value || folder.slug;
+          folderSegments.unshift(translatedSlug);
 
-            currentFolderId = folder.page_folder_id;
-          }
-          slugParts.push(...folderSegments);
+          currentFolderId = folder.page_folder_id;
+        }
+        slugParts.push(...folderSegments);
 
-          // Add page's own slug
-          if (!page.is_index && page.slug) {
-            const pageKey = `page:${page.id}:slug`;
-            const translatedSlug = localeTranslations[pageKey]?.content_value || page.slug;
-            slugParts.push(translatedSlug);
-          }
+        // Add page's own slug
+        if (!page.is_index && page.slug) {
+          const pageKey = `page:${page.id}:slug`;
+          const translatedSlug = localeTranslations[pageKey]?.content_value || page.slug;
+          slugParts.push(translatedSlug);
+        }
 
-          const localizedSegments = slugParts.filter(Boolean);
-          if (localizedSegments.length > 1) { // Must have at least locale + something
-            params.push({ slug: localizedSegments });
-          }
+        const localizedSegments = slugParts.filter(Boolean);
+        if (localizedSegments.length > 1) { // Must have at least locale + something
+          params.push({ slug: localizedSegments });
         }
       }
     }

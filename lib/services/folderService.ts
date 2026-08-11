@@ -4,7 +4,15 @@
  * Business logic for page folder operations
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import type { Knex } from 'knex';
+
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  getConflictColumns,
+  resolveTenantIdForTable,
+} from '@/lib/repositories/knex-repository-utils';
 import type { PageFolder } from '@/types';
 
 /**
@@ -20,32 +28,26 @@ export interface PublishFoldersResult {
  */
 async function collectAncestorFolderIds(
   pageIds: string[],
-  client: any
+  db: Knex
 ): Promise<Set<string>> {
   const folderIdsToPublish = new Set<string>();
 
   // Fetch pages to get their folder IDs
-  const { data: pagesToPublish } = await client
-    .from('pages')
+  let pagesQuery = db('pages')
     .select('page_folder_id')
-    .in('id', pageIds)
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (!pagesToPublish) {
-    return folderIdsToPublish;
-  }
+    .whereIn('id', pageIds)
+    .where('is_published', false)
+    .whereNull('deleted_at');
+  pagesQuery = await addTenantFilter(db, pagesQuery, 'pages');
+  const pagesToPublish = await pagesQuery as Array<{ page_folder_id: string | null }>;
 
   // Get all draft folders to traverse ancestors
-  const { data: allDraftFolders } = await client
-    .from('page_folders')
+  let foldersQuery = db('page_folders')
     .select('*')
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (!allDraftFolders) {
-    return folderIdsToPublish;
-  }
+    .where('is_published', false)
+    .whereNull('deleted_at');
+  foldersQuery = await addTenantFilter(db, foldersQuery, 'page_folders');
+  const allDraftFolders = await foldersQuery as PageFolder[];
 
   const foldersById = new Map<string, PageFolder>(
     allDraftFolders.map((f: PageFolder) => [f.id, f])
@@ -82,18 +84,14 @@ export async function publishFolders(
   folderIds: string[] = [],
   pageIds?: string[]
 ): Promise<PublishFoldersResult> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   const isPublishingAll = folderIds.length === 0;
   const folderIdsToPublish = new Set<string>(folderIds);
 
   // Collect ancestor folders if page IDs provided
   if (!isPublishingAll && pageIds && pageIds.length > 0) {
-    const ancestorIds = await collectAncestorFolderIds(pageIds, client);
+    const ancestorIds = await collectAncestorFolderIds(pageIds, db);
     ancestorIds.forEach(id => folderIdsToPublish.add(id));
   }
 
@@ -103,14 +101,11 @@ export async function publishFolders(
   }
 
   // Get all draft folders (including soft-deleted for cleanup)
-  const { data: allDraftFolders, error: foldersError } = await client
-    .from('page_folders')
+  let draftFoldersQuery = db('page_folders')
     .select('*')
-    .eq('is_published', false);
-
-  if (foldersError || !allDraftFolders) {
-    throw new Error(`Failed to fetch folders: ${foldersError?.message}`);
-  }
+    .where('is_published', false);
+  draftFoldersQuery = await addTenantFilter(db, draftFoldersQuery, 'page_folders');
+  const allDraftFolders = await draftFoldersQuery as PageFolder[];
 
   // Filter folders based on request
   const foldersToProcess = isPublishingAll
@@ -135,14 +130,17 @@ export async function publishFolders(
   const allIdsToCheck = [...new Set([...folderIdsToCheck, ...parentFolderIds])];
 
   // Fetch all published folders we need to reference
-  const { data: existingPublished } = await client
-    .from('page_folders')
+  let existingPublishedQuery = db('page_folders')
     .select('*')
-    .eq('is_published', true)
-    .in('id', allIdsToCheck);
+    .where('is_published', true)
+    .whereIn('id', allIdsToCheck);
+  existingPublishedQuery = await addTenantFilter(db, existingPublishedQuery, 'page_folders');
+  const existingPublished = allIdsToCheck.length > 0
+    ? await existingPublishedQuery as PageFolder[]
+    : [];
 
   const publishedFoldersById = new Map<string, PageFolder>(
-    (existingPublished || []).map((f: PageFolder) => [f.id, f])
+    existingPublished.map((f: PageFolder) => [f.id, f])
   );
   const publishedIds = new Set(publishedFoldersById.keys());
 
@@ -153,12 +151,13 @@ export async function publishFolders(
       .map((f: PageFolder) => f.id);
 
     if (idsToSoftDelete.length > 0) {
-      await client
-        .from('page_folders')
+      let softDeleteQuery = db('page_folders')
         .update({ deleted_at: new Date().toISOString() })
-        .eq('is_published', true)
-        .in('id', idsToSoftDelete)
-        .is('deleted_at', null);
+        .where('is_published', true)
+        .whereIn('id', idsToSoftDelete)
+        .whereNull('deleted_at');
+      softDeleteQuery = await addTenantFilter(db, softDeleteQuery, 'page_folders');
+      await softDeleteQuery;
     }
   }
 
@@ -231,13 +230,15 @@ export async function publishFolders(
     return { count: 0 };
   }
 
-  const { error: upsertError } = await client
-    .from('page_folders')
-    .upsert(foldersToUpsert, { onConflict: 'id,is_published' });
-
-  if (upsertError) {
-    throw new Error(`Failed to publish folders: ${upsertError.message}`);
-  }
+  const tenantId = await resolveTenantIdForTable(db, 'page_folders');
+  const conflictColumns = await getConflictColumns(db, 'page_folders', ['id', 'is_published'], tenantId);
+  const rows = await Promise.all(
+    foldersToUpsert.map((folder) => addTenantIdToRow(db, 'page_folders', folder, tenantId ?? undefined))
+  );
+  await db('page_folders')
+    .insert(rows)
+    .onConflict(conflictColumns)
+    .merge();
 
   return { count: foldersToUpsert.length };
 }

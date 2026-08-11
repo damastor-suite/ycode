@@ -4,7 +4,8 @@ import { getCollectionById } from '@/lib/repositories/collectionRepository';
 import { getFieldsByCollectionId } from '@/lib/repositories/collectionFieldRepository';
 import { getItemWithValues, deleteItem } from '@/lib/repositories/collectionItemRepository';
 import { setValues } from '@/lib/repositories/collectionItemValueRepository';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import { invalidateForCollectionChange } from '@/lib/services/cacheService';
 import type { CollectionField, CollectionItemWithValues } from '@/types';
 import { transformItemToPublicWithRefs, parseFieldProjections } from '../../../../reference-resolver';
@@ -23,6 +24,16 @@ function extractItemSlug(
   if (!slugField) return undefined;
   const value = item.values?.[slugField.id];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+async function touchItemVersions(itemId: string): Promise<void> {
+  const db = await getDb();
+  let query = db('collection_items')
+    .where('id', itemId)
+    .whereIn('is_published', [true, false]);
+  query = await addTenantFilter(db, query, 'collection_items');
+
+  await query.update({ updated_at: new Date().toISOString() });
 }
 
 // Disable caching for this route
@@ -187,14 +198,7 @@ export async function PUT(
     }
 
     // Update the item's updated_at timestamp for both draft and published
-    const client = await getSupabaseAdmin();
-    if (client) {
-      await client
-        .from('collection_items')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', item_id)
-        .in('is_published', [true, false]);
-    }
+    await touchItemVersions(item_id);
 
     // Capture the pre-mutation slug before we overwrite values. If the slug
     // field gets changed, we need to invalidate the OLD dynamic-page URL too
@@ -323,14 +327,7 @@ export async function PATCH(
     }
 
     // Update the item's updated_at timestamp for both draft and published
-    const client = await getSupabaseAdmin();
-    if (client) {
-      await client
-        .from('collection_items')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', item_id)
-        .in('is_published', [true, false]);
-    }
+    await touchItemVersions(item_id);
 
     // Capture pre-mutation slug for cache invalidation (see PUT for rationale).
     const previousSlug = extractItemSlug(existingItem, fields);

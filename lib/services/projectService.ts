@@ -8,10 +8,10 @@ import { scryptSync, randomBytes, createCipheriv, createDecipheriv } from 'crypt
 import { gzipSync, gunzipSync } from 'zlib';
 import type { Knex } from 'knex';
 import { getKnexClient, closeKnexClient, testKnexConnection } from '../knex-client';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { STORAGE_FOLDERS } from '@/lib/asset-constants';
 import { migrations } from '../migrations-loader';
 import { guardKnexForMigrationReplay } from '@/lib/migration-replay-guard';
+import { getStorage } from '@/lib/platform/storage';
 
 /**
  * Tables in FK-safe order (parents before children).
@@ -606,12 +606,12 @@ export function generateStoragePath(originalPath: string): string {
 
 // ─── Asset File Helpers ──────────────────────────────────────────────
 
-/** Collect asset files from Supabase Storage as base64 (parallel). */
+/** Collect asset files from platform storage as base64 (parallel). */
 export async function collectAssetFiles(
   assetRows: Record<string, unknown>[]
 ): Promise<ExportFile[]> {
-  const client = await getSupabaseAdmin();
-  if (!client) return [];
+  const storage = await getStorage();
+  if (!storage.getObject) return [];
 
   const storagePaths = assetRows
     .map(r => r.storage_path as string | null)
@@ -622,20 +622,16 @@ export async function collectAssetFiles(
 
   return processInParallel(uniquePaths, async (storagePath): Promise<ExportFile | null> => {
     try {
-      const { data, error } = await client.storage
-        .from(STORAGE_BUCKET)
-        .download(storagePath);
-
-      if (error || !data) {
-        console.warn(`[collectAssetFiles] Failed to download ${storagePath}:`, error);
+      const object = await storage.getObject(storagePath);
+      if (!object) {
+        console.warn(`[collectAssetFiles] Failed to download ${storagePath}: object not found`);
         return null;
       }
 
-      const buffer = await data.arrayBuffer();
       return {
         storagePath,
-        base64: Buffer.from(buffer).toString('base64'),
-        mimeType: data.type || 'application/octet-stream',
+        base64: object.body.toString('base64'),
+        mimeType: object.contentType || 'application/octet-stream',
       };
     } catch (err) {
       console.warn(`[collectAssetFiles] Error processing ${storagePath}:`, err);
@@ -644,37 +640,27 @@ export async function collectAssetFiles(
   });
 }
 
-/** Upload asset files to Supabase Storage and batch-update DB records. */
+/** Upload asset files to platform storage and batch-update DB records. */
 export async function restoreAssetFiles(
   files: ExportFile[],
   db: Knex
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
-  if (!client || files.length === 0) return;
+  if (files.length === 0) return;
+
+  const storage = await getStorage();
 
   const pathUpdates = await processInParallel(files, async (file): Promise<{ oldPath: string; newPath: string; publicUrl: string } | null> => {
     try {
       const buffer = Buffer.from(file.base64, 'base64');
       const newPath = generateStoragePath(file.storagePath);
 
-      const { data, error } = await client.storage
-        .from(STORAGE_BUCKET)
-        .upload(newPath, buffer, {
-          contentType: file.mimeType,
-          cacheControl: '3600',
-          upsert: false,
-        });
+      const { path } = await storage.upload(newPath, buffer, {
+        contentType: file.mimeType,
+        cacheControl: '3600',
+        upsert: false,
+      });
 
-      if (error || !data) {
-        console.warn(`[restoreAssetFiles] Failed to upload ${file.storagePath}:`, error);
-        return null;
-      }
-
-      const { data: urlData } = client.storage
-        .from(STORAGE_BUCKET)
-        .getPublicUrl(data.path);
-
-      return { oldPath: file.storagePath, newPath: data.path, publicUrl: urlData.publicUrl };
+      return { oldPath: file.storagePath, newPath: path, publicUrl: storage.getPublicUrl(path) };
     } catch (err) {
       console.warn(`[restoreAssetFiles] Error uploading ${file.storagePath}:`, err);
       return null;

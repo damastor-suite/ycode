@@ -4,8 +4,10 @@
  * Functions to find and count asset usage across pages, components, and CMS items
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Knex } from 'knex';
+
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
 import type { Layer } from '@/types';
 import { ASSET_FIELD_TYPES, findDisplayField } from './collection-field-utils';
 
@@ -30,6 +32,37 @@ export interface AssetUsageResult {
   cmsItems: CmsItemUsageEntry[];
   fieldDefaults: FieldDefaultUsageEntry[];
   total: number;
+}
+
+type DbClient = Awaited<ReturnType<typeof getDb>>;
+
+async function scopedQuery<T>(
+  db: DbClient,
+  tableName: string,
+  query: Knex.QueryBuilder
+): Promise<T[]> {
+  const scoped = await addTenantFilter(db, query, tableName);
+  return await scoped as T[];
+}
+
+async function updateScoped(
+  db: DbClient,
+  tableName: string,
+  query: Knex.QueryBuilder
+): Promise<number> {
+  const scoped = await addTenantFilter(db, query, tableName);
+  return await scoped as number;
+}
+
+async function selectDraftRows<T>(
+  db: DbClient,
+  tableName: string,
+  columns: string[]
+): Promise<T[]> {
+  return scopedQuery<T>(db, tableName, db(tableName)
+    .select(...columns)
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 }
 
 /**
@@ -185,24 +218,19 @@ function fieldDefaultReferencesAsset(defaultVal: string, assetId: string, parsed
 
 /** Fetch collection names by IDs and return a lookup map */
 async function fetchCollectionNames(
-  client: SupabaseClient,
+  db: DbClient,
   collectionIds: string[]
 ): Promise<Record<string, string>> {
   if (collectionIds.length === 0) return {};
 
-  const { data, error } = await client
-    .from('collections')
-    .select('id, name')
-    .in('id', collectionIds)
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (error) {
-    throw new Error(`Failed to fetch collections: ${error.message}`);
-  }
+  const data = await scopedQuery<Array<{ id: string; name: string | null }>[number]>(db, 'collections', db('collections')
+    .select('id', 'name')
+    .whereIn('id', collectionIds)
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 
   const map: Record<string, string> = {};
-  (data || []).forEach((c: any) => {
+  data.forEach((c) => {
     map[c.id] = c.name ?? 'Unknown Collection';
   });
   return map;
@@ -217,32 +245,22 @@ interface AssetFieldDefault {
 
 /** Fetch asset-type collection fields that have a non-null default value */
 async function fetchAssetFieldsWithDefaults(
-  client: SupabaseClient,
-  selectColumns: string = 'id, name, collection_id, default'
+  db: DbClient,
+  columns: string[] = ['id', 'name', 'collection_id', 'default']
 ): Promise<AssetFieldDefault[]> {
-  const { data, error } = await client
-    .from('collection_fields')
-    .select(selectColumns)
-    .in('type', ASSET_FIELD_TYPES)
-    .eq('is_published', false)
-    .is('deleted_at', null)
-    .not('default', 'is', null);
-
-  if (error) {
-    throw new Error(`Failed to fetch field defaults: ${error.message}`);
-  }
-  return (data || []) as unknown as AssetFieldDefault[];
+  return scopedQuery<AssetFieldDefault>(db, 'collection_fields', db('collection_fields')
+    .select(...columns)
+    .whereIn('type', ASSET_FIELD_TYPES)
+    .where('is_published', false)
+    .whereNull('deleted_at')
+    .whereNotNull('default'));
 }
 
 /**
  * Get asset usage with names across pages, components, and CMS items
  */
 export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   const pageEntries: AssetUsageEntry[] = [];
   const componentEntries: AssetUsageEntry[] = [];
@@ -252,34 +270,26 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
   const pageIdsWithAsset = new Set<string>();
 
   // Check page layers (draft versions)
-  const { data: pageLayersRecords, error: pageLayersError } = await client
-    .from('page_layers')
-    .select('id, page_id, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const pageLayersRecords = await selectDraftRows<Array<{ id: string; page_id: string; layers: Layer[] | null }>[number]>(
+    db,
+    'page_layers',
+    ['id', 'page_id', 'layers']
+  );
 
-  if (pageLayersError) {
-    throw new Error(`Failed to fetch page layers: ${pageLayersError.message}`);
-  }
-
-  for (const record of pageLayersRecords || []) {
+  for (const record of pageLayersRecords) {
     if (record.layers && layersContainAsset(record.layers, assetId)) {
       pageIdsWithAsset.add(record.page_id);
     }
   }
 
   // Check page settings for SEO images
-  const { data: pagesData, error: pagesError } = await client
-    .from('pages')
-    .select('id, name, settings')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const pagesData = await selectDraftRows<Array<{ id: string; name: string | null; settings: any }>[number]>(
+    db,
+    'pages',
+    ['id', 'name', 'settings']
+  );
 
-  if (pagesError) {
-    throw new Error(`Failed to fetch pages: ${pagesError.message}`);
-  }
-
-  for (const page of pagesData || []) {
+  for (const page of pagesData) {
     if (page.settings && pageSettingsContainAsset(page.settings, assetId)) {
       pageIdsWithAsset.add(page.id);
     }
@@ -287,88 +297,64 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
 
   // Build page entries with names
   const pageIds = Array.from(pageIdsWithAsset);
-  const pagesWithAsset = (pagesData || []).filter((p) => pageIds.includes(p.id));
+  const pagesWithAsset = pagesData.filter((p) => pageIds.includes(p.id));
   for (const pageId of pageIds) {
     const page = pagesWithAsset.find((p) => p.id === pageId);
     pageEntries.push({ id: pageId, name: page?.name ?? 'Unknown Page' });
   }
 
   // Check components (draft versions)
-  const { data: components, error: componentsError } = await client
-    .from('components')
-    .select('id, name, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const components = await selectDraftRows<Array<{ id: string; name: string | null; layers: Layer[] | null }>[number]>(
+    db,
+    'components',
+    ['id', 'name', 'layers']
+  );
 
-  if (componentsError) {
-    throw new Error(`Failed to fetch components: ${componentsError.message}`);
-  }
-
-  for (const component of components || []) {
+  for (const component of components) {
     if (component.layers && layersContainAsset(component.layers, assetId)) {
       componentEntries.push({ id: component.id, name: component.name ?? 'Unknown Component' });
     }
   }
 
   // Check CMS collection item values (image/file fields)
-  const { data: imageFields, error: fieldsError } = await client
-    .from('collection_fields')
-    .select('id, collection_id')
-    .in('type', ['image', 'file'])
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const imageFields = await scopedQuery<Array<{ id: string; collection_id: string }>[number]>(db, 'collection_fields', db('collection_fields')
+    .select('id', 'collection_id')
+    .whereIn('type', ['image', 'file'])
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 
-  if (fieldsError) {
-    throw new Error(`Failed to fetch collection fields: ${fieldsError.message}`);
-  }
-
-  if (imageFields && imageFields.length > 0) {
+  if (imageFields.length > 0) {
     const fieldIds = imageFields.map((f) => f.id);
 
-    const { data: itemValues, error: valuesError } = await client
-      .from('collection_item_values')
+    const itemValues = await scopedQuery<Array<{ item_id: string }>[number]>(db, 'collection_item_values', db('collection_item_values')
       .select('item_id')
-      .in('field_id', fieldIds)
-      .eq('value', assetId)
-      .eq('is_published', false)
-      .is('deleted_at', null);
+      .whereIn('field_id', fieldIds)
+      .where('value', assetId)
+      .where('is_published', false)
+      .whereNull('deleted_at'));
 
-    if (valuesError) {
-      throw new Error(`Failed to fetch item values: ${valuesError.message}`);
-    }
-
-    const uniqueItemIds = [...new Set(itemValues?.map((v) => v.item_id) || [])];
+    const uniqueItemIds = [...new Set(itemValues.map((v) => v.item_id))];
     if (uniqueItemIds.length > 0) {
       // Get items with collection_id
-      const { data: items, error: itemsError } = await client
-        .from('collection_items')
-        .select('id, collection_id')
-        .in('id', uniqueItemIds)
-        .eq('is_published', false)
-        .is('deleted_at', null);
+      const items = await scopedQuery<Array<{ id: string; collection_id: string }>[number]>(db, 'collection_items', db('collection_items')
+        .select('id', 'collection_id')
+        .whereIn('id', uniqueItemIds)
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
-      if (itemsError) {
-        throw new Error(`Failed to fetch collection items: ${itemsError.message}`);
-      }
-
-      const cmsCollectionIds = [...new Set((items || []).map((i) => i.collection_id))];
+      const cmsCollectionIds = [...new Set(items.map((i) => i.collection_id))];
 
       // Get fields for display name (key=name, title, or first text field)
-      const { data: allFields, error: allFieldsError } = await client
-        .from('collection_fields')
-        .select('id, key, type, fillable, collection_id')
-        .in('collection_id', cmsCollectionIds)
-        .eq('is_published', false)
-        .is('deleted_at', null);
-
-      if (allFieldsError) {
-        throw new Error(`Failed to fetch collection fields: ${allFieldsError.message}`);
-      }
+      const allFields = await scopedQuery<Array<{ id: string; key: string | null; type: string; fillable: boolean; collection_id: string }>[number]>(db, 'collection_fields', db('collection_fields')
+        .select('id', 'key', 'type', 'fillable', 'collection_id')
+        .whereIn('collection_id', cmsCollectionIds)
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
       // Find display field per collection
       const displayFieldByCollection: Record<string, { id: string }> = {};
       for (const collectionId of cmsCollectionIds) {
-        const fields = (allFields || []).filter((f) => f.collection_id === collectionId);
+        const fields = allFields.filter((f) => f.collection_id === collectionId);
         const displayField = findDisplayField(fields as any);
         if (displayField) {
           displayFieldByCollection[collectionId] = { id: displayField.id };
@@ -377,24 +363,21 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
 
       // Get values for display fields
       const displayFieldIds = Object.values(displayFieldByCollection).map((f) => f.id);
-      const { data: displayValues, error: displayValuesError } = await client
-        .from('collection_item_values')
-        .select('item_id, field_id, value')
-        .in('item_id', uniqueItemIds)
-        .in('field_id', displayFieldIds)
-        .eq('is_published', false)
-        .is('deleted_at', null);
-
-      if (displayValuesError) {
-        throw new Error(`Failed to fetch display values: ${displayValuesError.message}`);
-      }
+      const displayValues = displayFieldIds.length > 0
+        ? await scopedQuery<Array<{ item_id: string; field_id: string; value: string | null }>[number]>(db, 'collection_item_values', db('collection_item_values')
+          .select('item_id', 'field_id', 'value')
+          .whereIn('item_id', uniqueItemIds)
+          .whereIn('field_id', displayFieldIds)
+          .where('is_published', false)
+          .whereNull('deleted_at'))
+        : [];
 
       const valueByItem: Record<string, string> = {};
-      displayValues?.forEach((row: any) => {
+      displayValues.forEach((row) => {
         valueByItem[`${row.item_id}:${row.field_id}`] = row.value ?? '';
       });
 
-      for (const item of items || []) {
+      for (const item of items) {
         const displayField = displayFieldByCollection[item.collection_id];
         const name =
           displayField && valueByItem[`${item.id}:${displayField.id}`]
@@ -406,35 +389,25 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
   }
 
   // Check CMS link field values that embed an asset reference in JSON
-  const { data: linkFields, error: linkFieldsError } = await client
-    .from('collection_fields')
-    .select('id, collection_id')
-    .eq('type', 'link')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const linkFields = await scopedQuery<Array<{ id: string; collection_id: string }>[number]>(db, 'collection_fields', db('collection_fields')
+    .select('id', 'collection_id')
+    .where('type', 'link')
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 
-  if (linkFieldsError) {
-    throw new Error(`Failed to fetch link fields: ${linkFieldsError.message}`);
-  }
-
-  if (linkFields && linkFields.length > 0) {
+  if (linkFields.length > 0) {
     const linkFieldIds = linkFields.map((f) => f.id);
 
     // Fetch values that contain the asset ID substring (pre-filter)
-    const { data: linkItemValues, error: linkValuesError } = await client
-      .from('collection_item_values')
-      .select('item_id, value')
-      .in('field_id', linkFieldIds)
-      .like('value', `%${assetId}%`)
-      .eq('is_published', false)
-      .is('deleted_at', null);
-
-    if (linkValuesError) {
-      throw new Error(`Failed to fetch link field values: ${linkValuesError.message}`);
-    }
+    const linkItemValues = await scopedQuery<Array<{ item_id: string; value: string | null }>[number]>(db, 'collection_item_values', db('collection_item_values')
+      .select('item_id', 'value')
+      .whereIn('field_id', linkFieldIds)
+      .whereLike('value', `%${assetId}%`)
+      .where('is_published', false)
+      .whereNull('deleted_at'));
 
     // Parse JSON and verify it's actually an asset link
-    const linkItemIds = (linkItemValues || [])
+    const linkItemIds = linkItemValues
       .filter((v) => v.value && collectionLinkValueHasAsset(v.value, assetId))
       .map((v) => v.item_id);
 
@@ -443,30 +416,24 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
     );
 
     if (uniqueLinkItemIds.length > 0) {
-      const { data: linkItems, error: linkItemsError } = await client
-        .from('collection_items')
-        .select('id, collection_id')
-        .in('id', uniqueLinkItemIds)
-        .eq('is_published', false)
-        .is('deleted_at', null);
+      const linkItems = await scopedQuery<Array<{ id: string; collection_id: string }>[number]>(db, 'collection_items', db('collection_items')
+        .select('id', 'collection_id')
+        .whereIn('id', uniqueLinkItemIds)
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
-      if (linkItemsError) {
-        throw new Error(`Failed to fetch link items: ${linkItemsError.message}`);
-      }
-
-      const linkCollectionIds = [...new Set((linkItems || []).map((i) => i.collection_id))];
+      const linkCollectionIds = [...new Set(linkItems.map((i) => i.collection_id))];
 
       // Get display fields for these collections
-      const { data: linkAllFields } = await client
-        .from('collection_fields')
-        .select('id, key, type, fillable, collection_id')
-        .in('collection_id', linkCollectionIds)
-        .eq('is_published', false)
-        .is('deleted_at', null);
+      const linkAllFields = await scopedQuery<Array<{ id: string; key: string | null; type: string; fillable: boolean; collection_id: string }>[number]>(db, 'collection_fields', db('collection_fields')
+        .select('id', 'key', 'type', 'fillable', 'collection_id')
+        .whereIn('collection_id', linkCollectionIds)
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
       const linkDisplayFieldByCollection: Record<string, { id: string }> = {};
       for (const collectionId of linkCollectionIds) {
-        const fields = (linkAllFields || []).filter((f) => f.collection_id === collectionId);
+        const fields = linkAllFields.filter((f) => f.collection_id === collectionId);
         const displayField = findDisplayField(fields as any);
         if (displayField) {
           linkDisplayFieldByCollection[collectionId] = { id: displayField.id };
@@ -474,20 +441,21 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
       }
 
       const linkDisplayFieldIds = Object.values(linkDisplayFieldByCollection).map((f) => f.id);
-      const { data: linkDisplayValues } = await client
-        .from('collection_item_values')
-        .select('item_id, field_id, value')
-        .in('item_id', uniqueLinkItemIds)
-        .in('field_id', linkDisplayFieldIds)
-        .eq('is_published', false)
-        .is('deleted_at', null);
+      const linkDisplayValues = linkDisplayFieldIds.length > 0
+        ? await scopedQuery<Array<{ item_id: string; field_id: string; value: string | null }>[number]>(db, 'collection_item_values', db('collection_item_values')
+          .select('item_id', 'field_id', 'value')
+          .whereIn('item_id', uniqueLinkItemIds)
+          .whereIn('field_id', linkDisplayFieldIds)
+          .where('is_published', false)
+          .whereNull('deleted_at'))
+        : [];
 
       const linkValueByItem: Record<string, string> = {};
-      linkDisplayValues?.forEach((row: any) => {
+      linkDisplayValues.forEach((row) => {
         linkValueByItem[`${row.item_id}:${row.field_id}`] = row.value ?? '';
       });
 
-      for (const item of linkItems || []) {
+      for (const item of linkItems) {
         const displayField = linkDisplayFieldByCollection[item.collection_id];
         const name =
           displayField && linkValueByItem[`${item.id}:${displayField.id}`]
@@ -500,7 +468,7 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
 
   // Check collection field defaults that reference this asset
   const fieldDefaultEntries: FieldDefaultUsageEntry[] = [];
-  const assetFieldsWithDefaults = await fetchAssetFieldsWithDefaults(client);
+  const assetFieldsWithDefaults = await fetchAssetFieldsWithDefaults(db);
 
   for (const field of assetFieldsWithDefaults) {
     const defaultVal = field.default as string;
@@ -521,7 +489,7 @@ export async function getAssetUsage(assetId: string): Promise<AssetUsageResult> 
       ...fieldDefaultEntries.map((e) => e.collectionId),
     ]),
   ];
-  const collectionNamesById = await fetchCollectionNames(client, allCollectionIds);
+  const collectionNamesById = await fetchCollectionNames(db, allCollectionIds);
 
   for (const entry of cmsItemEntries) {
     entry.collectionName = collectionNamesById[entry.collectionId] ?? 'Unknown Collection';
@@ -550,11 +518,7 @@ export async function getBulkAssetUsage(
     return {};
   }
 
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   // Initialize results
   const results: Record<string, AssetUsageResult> = {};
@@ -566,15 +530,11 @@ export async function getBulkAssetUsage(
   const assetIdSet = new Set(assetIds);
 
   // Check page layers
-  const { data: pageLayersRecords, error: pageLayersError } = await client
-    .from('page_layers')
-    .select('id, page_id, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (pageLayersError) {
-    throw new Error(`Failed to fetch page layers: ${pageLayersError.message}`);
-  }
+  const pageLayersRecords = await selectDraftRows<Array<{ id: string; page_id: string; layers: Layer[] | null }>[number]>(
+    db,
+    'page_layers',
+    ['id', 'page_id', 'layers']
+  );
 
   // Track page IDs per asset
   const pageIdsByAsset: Record<string, Set<string>> = {};
@@ -582,7 +542,7 @@ export async function getBulkAssetUsage(
     pageIdsByAsset[assetId] = new Set();
   }
 
-  for (const record of pageLayersRecords || []) {
+  for (const record of pageLayersRecords) {
     if (!record.layers) continue;
 
     for (const assetId of assetIds) {
@@ -593,17 +553,13 @@ export async function getBulkAssetUsage(
   }
 
   // Check page settings
-  const { data: pages, error: pagesError } = await client
-    .from('pages')
-    .select('id, settings')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const pages = await selectDraftRows<Array<{ id: string; settings: any }>[number]>(
+    db,
+    'pages',
+    ['id', 'settings']
+  );
 
-  if (pagesError) {
-    throw new Error(`Failed to fetch pages: ${pagesError.message}`);
-  }
-
-  for (const page of pages || []) {
+  for (const page of pages) {
     if (!page.settings) continue;
 
     for (const assetId of assetIds) {
@@ -617,12 +573,11 @@ export async function getBulkAssetUsage(
   const pageIds = [...new Set(assetIds.flatMap((id) => [...pageIdsByAsset[id]]))];
   let pageNamesById: Record<string, string> = {};
   if (pageIds.length > 0) {
-    const { data: pagesWithNames } = await client
-      .from('pages')
-      .select('id, name')
-      .in('id', pageIds)
-      .eq('is_published', false);
-    pageNamesById = (pagesWithNames || []).reduce((acc, p) => ({ ...acc, [p.id]: p.name ?? 'Unknown Page' }), {});
+    const pagesWithNames = await scopedQuery<Array<{ id: string; name: string | null }>[number]>(db, 'pages', db('pages')
+      .select('id', 'name')
+      .whereIn('id', pageIds)
+      .where('is_published', false));
+    pageNamesById = pagesWithNames.reduce((acc, p) => ({ ...acc, [p.id]: p.name ?? 'Unknown Page' }), {});
   }
 
   for (const assetId of assetIds) {
@@ -633,17 +588,13 @@ export async function getBulkAssetUsage(
   }
 
   // Check components
-  const { data: components, error: componentsError } = await client
-    .from('components')
-    .select('id, name, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const components = await selectDraftRows<Array<{ id: string; name: string | null; layers: Layer[] | null }>[number]>(
+    db,
+    'components',
+    ['id', 'name', 'layers']
+  );
 
-  if (componentsError) {
-    throw new Error(`Failed to fetch components: ${componentsError.message}`);
-  }
-
-  for (const component of components || []) {
+  for (const component of components) {
     if (!component.layers) continue;
 
     for (const assetId of assetIds) {
@@ -656,38 +607,28 @@ export async function getBulkAssetUsage(
   // Check CMS items
   let cmsCollectionIds: string[] = [];
 
-  const { data: imageFields, error: fieldsError } = await client
-    .from('collection_fields')
+  const imageFields = await scopedQuery<Array<{ id: string }>[number]>(db, 'collection_fields', db('collection_fields')
     .select('id')
-    .in('type', ['image', 'file'])
-    .eq('is_published', false)
-    .is('deleted_at', null);
+    .whereIn('type', ['image', 'file'])
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 
-  if (fieldsError) {
-    throw new Error(`Failed to fetch collection fields: ${fieldsError.message}`);
-  }
-
-  if (imageFields && imageFields.length > 0) {
+  if (imageFields.length > 0) {
     const fieldIds = imageFields.map((f) => f.id);
 
-    const { data: itemValues, error: valuesError } = await client
-      .from('collection_item_values')
-      .select('item_id, value')
-      .in('field_id', fieldIds)
-      .in('value', assetIds)
-      .eq('is_published', false)
-      .is('deleted_at', null);
-
-    if (valuesError) {
-      throw new Error(`Failed to fetch item values: ${valuesError.message}`);
-    }
+    const itemValues = await scopedQuery<Array<{ item_id: string; value: string | null }>[number]>(db, 'collection_item_values', db('collection_item_values')
+      .select('item_id', 'value')
+      .whereIn('field_id', fieldIds)
+      .whereIn('value', assetIds)
+      .where('is_published', false)
+      .whereNull('deleted_at'));
 
     const itemIdsByAsset: Record<string, Set<string>> = {};
     for (const assetId of assetIds) {
       itemIdsByAsset[assetId] = new Set();
     }
 
-    for (const v of itemValues || []) {
+    for (const v of itemValues) {
       if (v.value && assetIdSet.has(v.value)) {
         itemIdsByAsset[v.value].add(v.item_id);
       }
@@ -697,14 +638,13 @@ export async function getBulkAssetUsage(
     const itemCollectionById: Record<string, string> = {};
 
     if (uniqueItemIds.length > 0) {
-      const { data: items } = await client
-        .from('collection_items')
-        .select('id, collection_id')
-        .in('id', uniqueItemIds)
-        .eq('is_published', false)
-        .is('deleted_at', null);
+      const items = await scopedQuery<Array<{ id: string; collection_id: string }>[number]>(db, 'collection_items', db('collection_items')
+        .select('id', 'collection_id')
+        .whereIn('id', uniqueItemIds)
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
-      (items || []).forEach((i: any) => {
+      items.forEach((i) => {
         itemCollectionById[i.id] = i.collection_id;
       });
     }
@@ -720,32 +660,26 @@ export async function getBulkAssetUsage(
   }
 
   // Check CMS link field values that embed asset references in JSON
-  const { data: linkFields, error: linkFieldsError } = await client
-    .from('collection_fields')
+  const linkFields = await scopedQuery<Array<{ id: string }>[number]>(db, 'collection_fields', db('collection_fields')
     .select('id')
-    .eq('type', 'link')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+    .where('type', 'link')
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 
-  if (linkFieldsError) {
-    throw new Error(`Failed to fetch link fields: ${linkFieldsError.message}`);
-  }
-
-  if (linkFields && linkFields.length > 0) {
+  if (linkFields.length > 0) {
     const linkFieldIds = linkFields.map((f) => f.id);
 
     // Fetch link values that contain any of the asset IDs (pre-filter with OR of LIKE patterns)
     // For bulk, we check each asset individually since LIKE doesn't support IN
     for (const assetId of assetIds) {
-      const { data: linkItemValues } = await client
-        .from('collection_item_values')
-        .select('item_id, value')
-        .in('field_id', linkFieldIds)
-        .like('value', `%${assetId}%`)
-        .eq('is_published', false)
-        .is('deleted_at', null);
+      const linkItemValues = await scopedQuery<Array<{ item_id: string; value: string | null }>[number]>(db, 'collection_item_values', db('collection_item_values')
+        .select('item_id', 'value')
+        .whereIn('field_id', linkFieldIds)
+        .whereLike('value', `%${assetId}%`)
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
-      for (const v of linkItemValues || []) {
+      for (const v of linkItemValues) {
         if (v.value && collectionLinkValueHasAsset(v.value, assetId)) {
           const alreadyTracked = results[assetId].cmsItems.some((e) => e.id === v.item_id);
           if (!alreadyTracked) {
@@ -769,15 +703,14 @@ export async function getBulkAssetUsage(
     }
 
     if (linkItemIds.size > 0) {
-      const { data: linkItems } = await client
-        .from('collection_items')
-        .select('id, collection_id')
-        .in('id', [...linkItemIds])
-        .eq('is_published', false)
-        .is('deleted_at', null);
+      const linkItems = await scopedQuery<Array<{ id: string; collection_id: string }>[number]>(db, 'collection_items', db('collection_items')
+        .select('id', 'collection_id')
+        .whereIn('id', [...linkItemIds])
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
       const linkItemCollectionById: Record<string, string> = {};
-      (linkItems || []).forEach((i: any) => {
+      linkItems.forEach((i) => {
         linkItemCollectionById[i.id] = i.collection_id;
       });
 
@@ -793,7 +726,7 @@ export async function getBulkAssetUsage(
   }
 
   // Check collection field defaults
-  const assetFieldsWithDefaults = await fetchAssetFieldsWithDefaults(client);
+  const assetFieldsWithDefaults = await fetchAssetFieldsWithDefaults(db);
 
   for (const field of assetFieldsWithDefaults) {
     const defaultVal = field.default as string;
@@ -818,7 +751,7 @@ export async function getBulkAssetUsage(
     }
   }
   const allCollectionIds = [...new Set([...cmsCollectionIds, ...defaultCollectionIds])];
-  const collectionNamesById = await fetchCollectionNames(client, allCollectionIds);
+  const collectionNamesById = await fetchCollectionNames(db, allCollectionIds);
 
   for (const assetId of assetIds) {
     for (const entry of results[assetId].cmsItems) {
@@ -977,11 +910,7 @@ export interface AssetCleanupResult {
  * Returns affected entities with before/after states for version tracking
  */
 export async function cleanupAssetReferences(assetId: string): Promise<AssetCleanupResult> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   let pagesUpdated = 0;
   let componentsUpdated = 0;
@@ -990,19 +919,15 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   const affectedComponents: AffectedComponentEntity[] = [];
 
   // 1. Update page layers (draft versions)
-  const { data: pageLayersRecords, error: pageLayersError } = await client
-    .from('page_layers')
-    .select('id, page_id, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (pageLayersError) {
-    throw new Error(`Failed to fetch page layers: ${pageLayersError.message}`);
-  }
+  const pageLayersRecords = await selectDraftRows<Array<{ id: string; page_id: string; layers: Layer[] | null }>[number]>(
+    db,
+    'page_layers',
+    ['id', 'page_id', 'layers']
+  );
 
   const pageLayersToUpdate: Array<{ id: string; pageId: string; previousLayers: Layer[]; newLayers: Layer[] }> = [];
 
-  for (const record of pageLayersRecords || []) {
+  for (const record of pageLayersRecords) {
     if (record.layers && layersContainAsset(record.layers, assetId)) {
       const cleanedLayers = removeAssetFromLayers(record.layers, assetId);
       pageLayersToUpdate.push({
@@ -1017,35 +942,31 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   // Batch update page layers
   if (pageLayersToUpdate.length > 0) {
     for (const { id, pageId, previousLayers, newLayers } of pageLayersToUpdate) {
-      const { error } = await client
-        .from('page_layers')
+      let updateQuery = db('page_layers')
         .update({ layers: newLayers, updated_at: new Date().toISOString() })
-        .eq('id', id)
-        .eq('is_published', false);
+        .where('id', id)
+        .where('is_published', false);
 
-      if (error) {
-        console.error(`Failed to update page_layers ${id}:`, error);
-      } else {
+      try {
+        await updateScoped(db, 'page_layers', updateQuery);
         pagesUpdated++;
         affectedPages.push({ pageId, previousLayers, newLayers });
+      } catch (error) {
+        console.error(`Failed to update page_layers ${id}:`, error);
       }
     }
   }
 
   // 2. Update page settings (SEO images)
-  const { data: pagesData, error: pagesError } = await client
-    .from('pages')
-    .select('id, settings')
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (pagesError) {
-    throw new Error(`Failed to fetch pages: ${pagesError.message}`);
-  }
+  const pagesData = await selectDraftRows<Array<{ id: string; settings: any }>[number]>(
+    db,
+    'pages',
+    ['id', 'settings']
+  );
 
   const pagesToUpdate: Array<{ id: string; settings: any }> = [];
 
-  for (const page of pagesData || []) {
+  for (const page of pagesData) {
     if (pageSettingsContainAsset(page.settings, assetId)) {
       const newSettings = JSON.parse(JSON.stringify(page.settings));
       if (newSettings.seo?.image === assetId) {
@@ -1058,13 +979,14 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   // Batch update pages
   if (pagesToUpdate.length > 0) {
     for (const { id, settings } of pagesToUpdate) {
-      const { error } = await client
-        .from('pages')
+      let updateQuery = db('pages')
         .update({ settings, updated_at: new Date().toISOString() })
-        .eq('id', id)
-        .eq('is_published', false);
+        .where('id', id)
+        .where('is_published', false);
 
-      if (error) {
+      try {
+        await updateScoped(db, 'pages', updateQuery);
+      } catch (error) {
         console.error(`Failed to update page ${id}:`, error);
       }
       // Note: page settings changes don't need layer version tracking
@@ -1072,19 +994,15 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   }
 
   // 3. Update components (draft versions)
-  const { data: components, error: componentsError } = await client
-    .from('components')
-    .select('id, layers')
-    .eq('is_published', false)
-    .is('deleted_at', null);
-
-  if (componentsError) {
-    throw new Error(`Failed to fetch components: ${componentsError.message}`);
-  }
+  const components = await selectDraftRows<Array<{ id: string; layers: Layer[] | null }>[number]>(
+    db,
+    'components',
+    ['id', 'layers']
+  );
 
   const componentsToUpdate: Array<{ id: string; previousLayers: Layer[]; newLayers: Layer[] }> = [];
 
-  for (const component of components || []) {
+  for (const component of components) {
     if (component.layers && layersContainAsset(component.layers, assetId)) {
       const cleanedLayers = removeAssetFromLayers(component.layers, assetId);
       componentsToUpdate.push({
@@ -1098,101 +1016,90 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   // Batch update components
   if (componentsToUpdate.length > 0) {
     for (const { id, previousLayers, newLayers } of componentsToUpdate) {
-      const { error } = await client
-        .from('components')
+      let updateQuery = db('components')
         .update({ layers: newLayers, updated_at: new Date().toISOString() })
-        .eq('id', id)
-        .eq('is_published', false);
+        .where('id', id)
+        .where('is_published', false);
 
-      if (error) {
-        console.error(`Failed to update component ${id}:`, error);
-      } else {
+      try {
+        await updateScoped(db, 'components', updateQuery);
         componentsUpdated++;
         affectedComponents.push({ componentId: id, previousLayers, newLayers });
+      } catch (error) {
+        console.error(`Failed to update component ${id}:`, error);
       }
     }
   }
 
   // 4. Update CMS collection item values (nullify asset references)
-  const { data: imageFields, error: fieldsError } = await client
-    .from('collection_fields')
+  const imageFields = await scopedQuery<Array<{ id: string }>[number]>(db, 'collection_fields', db('collection_fields')
     .select('id')
-    .in('type', ['image', 'file'])
-    .eq('is_published', false)
-    .is('deleted_at', null);
+    .whereIn('type', ['image', 'file'])
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 
-  if (fieldsError) {
-    throw new Error(`Failed to fetch collection fields: ${fieldsError.message}`);
-  }
-
-  if (imageFields && imageFields.length > 0) {
+  if (imageFields.length > 0) {
     const fieldIds = imageFields.map((f) => f.id);
 
     // Update all values that reference this asset to null
-    const { data: updatedValues, error: updateError } = await client
-      .from('collection_item_values')
+    let updateValuesQuery = db('collection_item_values')
       .update({ value: null, updated_at: new Date().toISOString() })
-      .in('field_id', fieldIds)
-      .eq('value', assetId)
-      .eq('is_published', false)
-      .is('deleted_at', null)
-      .select('id');
+      .whereIn('field_id', fieldIds)
+      .where('value', assetId)
+      .where('is_published', false)
+      .whereNull('deleted_at')
+      .returning('id');
 
-    if (updateError) {
+    try {
+      const updatedValues = await scopedQuery<Array<{ id: string }>[number]>(db, 'collection_item_values', updateValuesQuery);
+      cmsItemsUpdated = updatedValues.length;
+    } catch (updateError) {
       console.error('Failed to update CMS values:', updateError);
-    } else {
-      cmsItemsUpdated = updatedValues?.length ?? 0;
     }
   }
 
   // 5. Update CMS link field values that embed asset references in JSON
-  const { data: linkFields, error: linkFieldsError } = await client
-    .from('collection_fields')
+  const linkFields = await scopedQuery<Array<{ id: string }>[number]>(db, 'collection_fields', db('collection_fields')
     .select('id')
-    .eq('type', 'link')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+    .where('type', 'link')
+    .where('is_published', false)
+    .whereNull('deleted_at'));
 
-  if (linkFieldsError) {
-    throw new Error(`Failed to fetch link fields: ${linkFieldsError.message}`);
-  }
-
-  if (linkFields && linkFields.length > 0) {
+  if (linkFields.length > 0) {
     const linkFieldIds = linkFields.map((f) => f.id);
 
-    const { data: linkItemValues, error: linkValuesError } = await client
-      .from('collection_item_values')
-      .select('id, value')
-      .in('field_id', linkFieldIds)
-      .like('value', `%${assetId}%`)
-      .eq('is_published', false)
-      .is('deleted_at', null);
+    try {
+      const linkItemValues = await scopedQuery<Array<{ id: string; value: string | null }>[number]>(db, 'collection_item_values', db('collection_item_values')
+        .select('id', 'value')
+        .whereIn('field_id', linkFieldIds)
+        .whereLike('value', `%${assetId}%`)
+        .where('is_published', false)
+        .whereNull('deleted_at'));
 
-    if (linkValuesError) {
-      console.error('Failed to fetch link field values:', linkValuesError);
-    } else {
-      for (const row of linkItemValues || []) {
+      for (const row of linkItemValues) {
         if (!row.value || !collectionLinkValueHasAsset(row.value, assetId)) continue;
 
         const cleanedValue = nullifyAssetInCollectionLinkValue(row.value);
-        const { error: updateError } = await client
-          .from('collection_item_values')
+        let updateQuery = db('collection_item_values')
           .update({ value: cleanedValue, updated_at: new Date().toISOString() })
-          .eq('id', row.id)
-          .eq('is_published', false);
+          .where('id', row.id)
+          .where('is_published', false);
 
-        if (updateError) {
-          console.error(`Failed to update link field value ${row.id}:`, updateError);
-        } else {
+        try {
+          await updateScoped(db, 'collection_item_values', updateQuery);
           cmsItemsUpdated++;
+        } catch (updateError) {
+          console.error(`Failed to update link field value ${row.id}:`, updateError);
         }
       }
+    } catch (linkValuesError) {
+      console.error('Failed to fetch link field values:', linkValuesError);
     }
   }
 
   // 6. Update collection field defaults that reference this asset
   let fieldDefaultsUpdated = 0;
-  const assetFieldsWithDefaults = await fetchAssetFieldsWithDefaults(client, 'id, default');
+  const assetFieldsWithDefaults = await fetchAssetFieldsWithDefaults(db, ['id', 'default']);
 
   for (const field of assetFieldsWithDefaults) {
     const defaultVal = field.default as string;
@@ -1207,16 +1114,16 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
       newDefault = filtered.length > 0 ? JSON.stringify(filtered) : null;
     }
 
-    const { error: updateError } = await client
-      .from('collection_fields')
+    let updateQuery = db('collection_fields')
       .update({ default: newDefault, updated_at: new Date().toISOString() })
-      .eq('id', field.id)
-      .eq('is_published', false);
+      .where('id', field.id)
+      .where('is_published', false);
 
-    if (updateError) {
-      console.error(`Failed to update field default ${field.id}:`, updateError);
-    } else {
+    try {
+      await updateScoped(db, 'collection_fields', updateQuery);
       fieldDefaultsUpdated++;
+    } catch (updateError) {
+      console.error(`Failed to update field default ${field.id}:`, updateError);
     }
   }
 

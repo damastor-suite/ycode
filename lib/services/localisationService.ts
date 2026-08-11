@@ -7,7 +7,13 @@
  * OLD URL when a slug or locale code is renamed.
  */
 
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  getConflictColumns,
+  resolveTenantIdForTable,
+} from '@/lib/repositories/knex-repository-utils';
 import { SUPABASE_IN_FILTER_CHUNK_SIZE, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
 import { getAllTranslationRows } from '@/lib/repositories/translationRepository';
 import type { Locale, Translation, TranslationSourceType } from '@/types';
@@ -127,11 +133,7 @@ function buildSlugSnapshot(
  * downstream cache invalidation can reconstruct OLD URLs for slug renames.
  */
 export async function publishLocalisation(): Promise<PublishLocalisationResult> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  const db = await getDb();
 
   const deletedAt = new Date().toISOString();
   let publishedLocalesCount = 0;
@@ -151,14 +153,16 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
   // through both the existing-published snapshot and the draft fetch below.
   // A single-shot SELECT silently truncated the publish set, leaving rows
   // 1001..N permanently in draft.
-  const [existingPublishedLocalesRes, existingPublishedTranslations] = await Promise.all([
-    client.from('locales').select('*').eq('is_published', true),
+  let existingLocalesQuery = db('locales')
+    .select('*')
+    .where('is_published', true);
+  existingLocalesQuery = await addTenantFilter(db, existingLocalesQuery, 'locales');
+  const [existingPublishedLocales, existingPublishedTranslations] = await Promise.all([
+    existingLocalesQuery as Promise<Locale[]>,
     // Single direct-DB read of the whole published catalogue instead of
     // paginated PostgREST round-trips.
     getAllTranslationRows<Translation>(true),
   ]);
-
-  const existingPublishedLocales: Locale[] = existingPublishedLocalesRes.data || [];
 
   const publishedLocalesById = new Map<string, Locale>();
   for (const l of existingPublishedLocales) publishedLocalesById.set(l.id, l);
@@ -172,14 +176,11 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
   const localesStart = performance.now();
 
   // Step 1: Fetch all draft locales (including soft-deleted)
-  const { data: allDraftLocales, error: localesError } = await client
-    .from('locales')
+  let draftLocalesQuery = db('locales')
     .select('*')
-    .eq('is_published', false);
-
-  if (localesError) {
-    throw new Error(`Failed to fetch draft locales: ${localesError.message}`);
-  }
+    .where('is_published', false);
+  draftLocalesQuery = await addTenantFilter(db, draftLocalesQuery, 'locales');
+  const allDraftLocales = await draftLocalesQuery as Locale[];
 
   // ──────────────────────────────────────────────────────────────────────
   // DIFF: Compare each draft locale to its published counterpart.
@@ -234,16 +235,13 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
     // Step 2: Soft-delete published versions of soft-deleted draft locales (single query)
     if (softDeletedDraftLocales.length > 0) {
       const localeIds = softDeletedDraftLocales.map((locale: Locale) => locale.id);
-      const { error: deleteLocalesError } = await client
-        .from('locales')
+      let deleteLocalesQuery = db('locales')
         .update({ deleted_at: deletedAt })
-        .in('id', localeIds)
-        .eq('is_published', true)
-        .is('deleted_at', null);
-
-      if (deleteLocalesError) {
-        throw new Error(`Failed to soft-delete locales: ${deleteLocalesError.message}`);
-      }
+        .whereIn('id', localeIds)
+        .where('is_published', true)
+        .whereNull('deleted_at');
+      deleteLocalesQuery = await addTenantFilter(db, deleteLocalesQuery, 'locales');
+      await deleteLocalesQuery;
     }
 
     // Step 3: Upsert published locales
@@ -259,15 +257,15 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
         deleted_at: null,
       }));
 
-      const { error: upsertError } = await client
-        .from('locales')
-        .upsert(publishedLocales, {
-          onConflict: 'id,is_published',
-        });
-
-      if (upsertError) {
-        throw new Error(`Failed to upsert published locales: ${upsertError.message}`);
-      }
+      const tenantId = await resolveTenantIdForTable(db, 'locales');
+      const conflictColumns = await getConflictColumns(db, 'locales', ['id', 'is_published'], tenantId);
+      const rows = await Promise.all(
+        publishedLocales.map((locale) => addTenantIdToRow(db, 'locales', locale, tenantId ?? undefined))
+      );
+      await db('locales')
+        .insert(rows)
+        .onConflict(conflictColumns)
+        .merge();
 
       publishedLocalesCount = activeDraftLocales.length;
     }
@@ -352,16 +350,13 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
 
       for (let i = 0; i < translationIds.length; i += SUPABASE_IN_FILTER_CHUNK_SIZE) {
         const idsChunk = translationIds.slice(i, i + SUPABASE_IN_FILTER_CHUNK_SIZE);
-        const { error: deleteTranslationsError } = await client
-          .from('translations')
+        let deleteTranslationsQuery = db('translations')
           .update({ deleted_at: deletedAt })
-          .in('id', idsChunk)
-          .eq('is_published', true)
-          .is('deleted_at', null);
-
-        if (deleteTranslationsError) {
-          throw new Error(`Failed to soft-delete translations: ${deleteTranslationsError.message}`);
-        }
+          .whereIn('id', idsChunk)
+          .where('is_published', true)
+          .whereNull('deleted_at');
+        deleteTranslationsQuery = await addTenantFilter(db, deleteTranslationsQuery, 'translations');
+        await deleteTranslationsQuery;
       }
     }
 
@@ -391,13 +386,15 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
 
       for (let i = 0; i < publishedTranslations.length; i += SUPABASE_WRITE_BATCH_SIZE) {
         const batch = publishedTranslations.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-        const { error: upsertError } = await client
-          .from('translations')
-          .upsert(batch, { onConflict: 'id,is_published' });
-
-        if (upsertError) {
-          throw new Error(`Failed to upsert published translations: ${upsertError.message}`);
-        }
+        const tenantId = await resolveTenantIdForTable(db, 'translations');
+        const conflictColumns = await getConflictColumns(db, 'translations', ['id', 'is_published'], tenantId);
+        const rows = await Promise.all(
+          batch.map((translation) => addTenantIdToRow(db, 'translations', translation, tenantId ?? undefined))
+        );
+        await db('translations')
+          .insert(rows)
+          .onConflict(conflictColumns)
+          .merge();
       }
 
       publishedTranslationsCount = translationsToPublish.length;

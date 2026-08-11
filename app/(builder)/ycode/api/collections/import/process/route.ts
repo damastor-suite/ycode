@@ -24,8 +24,7 @@ import { uploadFile } from '@/lib/file-upload';
 import { findAssetsByFilenames } from '@/lib/repositories/assetRepository';
 import { generateCollectionItemContentHash } from '@/lib/hash-utils';
 import { noCache } from '@/lib/api-response';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET } from '@/lib/asset-constants';
+import { getStorage } from '@/lib/platform/storage';
 import { randomUUID } from 'crypto';
 import type { CollectionField } from '@/types';
 
@@ -227,36 +226,33 @@ function prepareRow(
 }
 
 /**
- * Load a batch of rows from a JSON file in Supabase Storage.
+ * Load a batch of rows from a JSON file in storage.
  * Used when rows are too large for the request body — the client uploads
  * each batch as a small JSON file instead of sending the full CSV.
  */
 async function loadBatchFromStorage(
   batchPath: string,
-): Promise<{ rows: Record<string, string>[]; supabase: Awaited<ReturnType<typeof getSupabaseAdmin>> }> {
-  const supabase = await getSupabaseAdmin();
-  if (!supabase) {
+): Promise<Record<string, string>[]> {
+  const storage = await getStorage();
+  if (!storage.getObject) {
     throw new Error('Storage not configured');
   }
 
-  const { data: fileBlob, error: downloadError } = await supabase.storage
-    .from(STORAGE_BUCKET)
-    .download(batchPath);
-
-  if (downloadError || !fileBlob) {
-    console.error('Failed to download batch from storage:', downloadError);
+  const object = await storage.getObject(batchPath);
+  if (!object) {
+    console.error('Failed to download batch from storage:', batchPath);
     throw new Error('Failed to read batch file from storage');
   }
 
-  const text = await fileBlob.text();
+  const text = object.body.toString('utf-8');
   console.warn(`[csv-import] Downloaded batch from storage: ${(text.length / 1024).toFixed(0)}KB`);
   const rows = JSON.parse(text) as Record<string, string>[];
 
   try {
-    await supabase.storage.from(STORAGE_BUCKET).remove([batchPath]);
+    await storage.remove([batchPath]);
   } catch { /* best-effort cleanup */ }
 
-  return { rows, supabase };
+  return rows;
 }
 
 /**
@@ -324,7 +320,6 @@ export async function POST(request: NextRequest) {
 
     // Resolve rows: body → batch file in storage
     let rowsToProcess: Record<string, string>[];
-    let supabaseForCleanup: Awaited<ReturnType<typeof getSupabaseAdmin>> = null;
     let isStorageFallback = false;
 
     if (clientRows && Array.isArray(clientRows) && clientRows.length > 0) {
@@ -332,9 +327,7 @@ export async function POST(request: NextRequest) {
       console.warn(`[csv-import] Client body: ${clientRows.length} rows, startIndex=${startIndex}`);
     } else if (batchStoragePath) {
       console.warn(`[csv-import] Batch from storage: ${batchStoragePath}, startIndex=${startIndex}`);
-      const storageResult = await loadBatchFromStorage(batchStoragePath);
-      rowsToProcess = storageResult.rows;
-      supabaseForCleanup = storageResult.supabase;
+      rowsToProcess = await loadBatchFromStorage(batchStoragePath);
       isStorageFallback = true;
     } else {
       rowsToProcess = [];
@@ -602,10 +595,8 @@ export async function POST(request: NextRequest) {
       // Clean up the CSV file from storage
       if (csvMeta?.storage_path) {
         try {
-          const supabase = supabaseForCleanup || await getSupabaseAdmin();
-          if (supabase) {
-            await supabase.storage.from(STORAGE_BUCKET).remove([csvMeta.storage_path]);
-          }
+          const storage = await getStorage();
+          await storage.remove([csvMeta.storage_path]);
         } catch { /* best-effort cleanup */ }
       }
     }
