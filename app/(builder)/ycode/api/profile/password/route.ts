@@ -39,7 +39,8 @@ export async function PUT(request: NextRequest) {
     const db = await getDb();
     const account = await db<AccountRow>('account')
       .select('id', 'password')
-      .where({ userId: auth.user.id, providerId: 'credential' })
+      .where('userId', auth.user.id)
+      .where('providerId', 'credential')
       .first();
 
     if (!account?.password || !await verifyPassword({ hash: account.password, password: currentPassword })) {

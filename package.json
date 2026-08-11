@@ -130,6 +130,7 @@
     "@types/lodash.debounce": "^4.0.9",
     "@types/node": "^20.19.23",
     "@types/nodemailer": "^7.0.9",
+    "@types/pg": "^8.21.0",
     "@types/prismjs": "^1.26.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",

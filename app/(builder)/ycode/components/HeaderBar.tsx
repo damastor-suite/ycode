@@ -28,7 +28,6 @@ import { buildSlugPath, buildDynamicPageUrl, buildLocalizedSlugPath, buildLocali
 
 // 5. Types
 import type { Page } from '@/types';
-import type { User } from '@supabase/supabase-js';
 import ActiveUsersInHeader from './ActiveUsersInHeader';
 import InviteUserButton from './InviteUserButton';
 import { LocaleSelector } from './LocaleSelector';
@@ -41,7 +40,7 @@ import { isCloudVersion } from '@/lib/utils';
 import { useRole } from '@/hooks/use-role';
 
 interface HeaderBarProps {
-  user: User | null;
+  user: unknown | null;
   signOut: () => Promise<void>;
   showPageDropdown: boolean;
   setShowPageDropdown: (show: boolean) => void;

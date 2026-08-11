@@ -40,7 +40,7 @@ export async function up(knex: Knex): Promise<void> {
       });
     }
 
-    await knex.schema.raw(
+    await knex.raw(
       `CREATE INDEX IF NOT EXISTS ?? ON ?? (tenant_id)`,
       [`idx_${tableName}_tenant_id`, tableName]
     );
@@ -52,7 +52,7 @@ export async function down(knex: Knex): Promise<void> {
     const hasTable = await knex.schema.hasTable(tableName);
     if (!hasTable) continue;
 
-    await knex.schema.raw('DROP INDEX IF EXISTS ??', [`idx_${tableName}_tenant_id`]);
+    await knex.raw('DROP INDEX IF EXISTS ??', [`idx_${tableName}_tenant_id`]);
 
     const hasTenantId = await knex.schema.hasColumn(tableName, 'tenant_id');
     if (hasTenantId) {

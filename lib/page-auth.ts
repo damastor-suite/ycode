@@ -1,6 +1,6 @@
 import type { Page, PageFolder } from '@/types';
 import { createHmac, randomUUID } from 'crypto';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { getDbOrNull } from '@/lib/platform/db';
 
 /**
  * Page Password Protection Utilities
@@ -199,14 +199,11 @@ export function getPasswordProtection(
  * @returns Array of page folders
  */
 export async function fetchFoldersForAuth(isPublished: boolean): Promise<PageFolder[]> {
-  const supabase = await getSupabaseAdmin();
-  if (!supabase) return [];
+  const db = await getDbOrNull();
+  if (!db) return [];
 
-  const { data } = await supabase
-    .from('page_folders')
+  return db<PageFolder>('page_folders')
     .select('*')
-    .eq('is_published', isPublished)
-    .is('deleted_at', null);
-
-  return (data as PageFolder[]) || [];
+    .where('is_published', isPublished)
+    .whereNull('deleted_at');
 }
