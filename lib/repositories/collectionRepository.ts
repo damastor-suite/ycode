@@ -1,4 +1,5 @@
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, resolveTenantId, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import { getKnexClient } from '@/lib/knex-client';
 import { SUPABASE_IN_FILTER_CHUNK_SIZE } from '@/lib/supabase-constants';
 import type { Collection, CreateCollectionData, UpdateCollectionData } from '@/types';
@@ -53,6 +54,8 @@ export async function getAllCollections(filters?: QueryFilters): Promise<Collect
     query = query.is('deleted_at', null);
   }
 
+  query = (await applyTenantEq(query)).query;
+
   const { data, error } = await query;
 
   if (error) {
@@ -93,7 +96,7 @@ export async function getAllCollections(filters?: QueryFilters): Promise<Collect
 export async function getCollectionsRaw(isPublished: boolean, tenantId?: string): Promise<Collection[]> {
   try {
     const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+    const resolvedTenantId = await resolveTenantId(tenantId);
     let query = knex('collections')
       .select('*')
       .where('is_published', isPublished)
@@ -106,11 +109,13 @@ export async function getCollectionsRaw(isPublished: boolean, tenantId?: string)
     const client = await getSupabaseAdmin(tenantId);
     if (!client) throw new Error('Supabase client not configured');
 
-    const { data, error } = await client
+    let query1 = client
       .from('collections')
       .select('*')
       .eq('is_published', isPublished)
       .is('deleted_at', null);
+    query1 = (await applyTenantEq(query1, tenantId)).query;
+    const { data, error } = await query1;
 
     if (error) throw new Error(`Failed to fetch collections: ${error.message}`);
     return data || [];
@@ -130,12 +135,14 @@ export async function getPublishedCollectionIds(collectionIds: string[]): Promis
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collections')
     .select('id')
     .in('id', collectionIds)
     .eq('is_published', true)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to check published collections: ${error.message}`);
@@ -172,6 +179,8 @@ export async function getCollectionById(
     query = query.is('deleted_at', null);
   }
 
+  query = (await applyTenantEq(query)).query;
+
   const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
@@ -193,13 +202,14 @@ export async function getCollectionByName(name: string, isPublished: boolean = f
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collections')
     .select('*')
     .eq('name', name)
     .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to fetch collection: ${error.message}`);
@@ -223,14 +233,14 @@ export async function createCollection(collectionData: CreateCollectionData): Pr
 
   const { data, error } = await client
     .from('collections')
-    .insert({
+    .insert(await stampTenantId({
       id,
       ...collectionData,
       order: collectionData.order ?? 0,
       is_published: isPublished,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    })
+    }))
     .select()
     .single();
 
@@ -258,7 +268,7 @@ export async function updateCollection(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collections')
     .update({
       ...collectionData,
@@ -267,8 +277,9 @@ export async function updateCollection(
     .eq('id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null)
-    .select()
-    .single();
+    .select();
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     throw new Error(`Failed to update collection: ${error.message}`);
@@ -293,7 +304,7 @@ export async function deleteCollection(id: string, isPublished: boolean = false)
   const now = new Date().toISOString();
 
   // Soft delete the collection
-  const { error: collectionError } = await client
+  let query = client
     .from('collections')
     .update({
       deleted_at: now,
@@ -302,13 +313,15 @@ export async function deleteCollection(id: string, isPublished: boolean = false)
     .eq('id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { error: collectionError } = await query;
 
   if (collectionError) {
     throw new Error(`Failed to delete collection: ${collectionError.message}`);
   }
 
   // Soft delete all related fields
-  const { error: fieldsError } = await client
+  let query1 = client
     .from('collection_fields')
     .update({
       deleted_at: now,
@@ -317,13 +330,15 @@ export async function deleteCollection(id: string, isPublished: boolean = false)
     .eq('collection_id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null);
+  query1 = (await applyTenantEq(query1)).query;
+  const { error: fieldsError } = await query1;
 
   if (fieldsError) {
     console.error('Error soft-deleting collection fields:', fieldsError);
   }
 
   // Soft delete all related items
-  const { error: itemsError } = await client
+  let query2 = client
     .from('collection_items')
     .update({
       deleted_at: now,
@@ -332,6 +347,8 @@ export async function deleteCollection(id: string, isPublished: boolean = false)
     .eq('collection_id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null);
+  query2 = (await applyTenantEq(query2)).query;
+  const { error: itemsError } = await query2;
 
   if (itemsError) {
     console.error('Error soft-deleting collection items:', itemsError);
@@ -339,11 +356,13 @@ export async function deleteCollection(id: string, isPublished: boolean = false)
 
   // Soft delete all item values (these are linked to items via FK)
   // We need to get all items first to delete their values
-  const { data: items } = await client
+  let query3 = client
     .from('collection_items')
     .select('id')
     .eq('collection_id', id)
     .eq('is_published', isPublished);
+  query3 = (await applyTenantEq(query3)).query;
+  const { data: items } = await query3;
 
   if (items && items.length > 0) {
     const itemIds = items.map(item => item.id);
@@ -352,7 +371,7 @@ export async function deleteCollection(id: string, isPublished: boolean = false)
     // length limit (which returns 400 Bad Request).
     for (let i = 0; i < itemIds.length; i += SUPABASE_IN_FILTER_CHUNK_SIZE) {
       const idsChunk = itemIds.slice(i, i + SUPABASE_IN_FILTER_CHUNK_SIZE);
-      const { error: valuesError } = await client
+      let query4 = client
         .from('collection_item_values')
         .update({
           deleted_at: now,
@@ -361,6 +380,8 @@ export async function deleteCollection(id: string, isPublished: boolean = false)
         .in('item_id', idsChunk)
         .eq('is_published', isPublished)
         .is('deleted_at', null);
+      query4 = (await applyTenantEq(query4)).query;
+      const { error: valuesError } = await query4;
 
       if (valuesError) {
         console.error('Error soft-deleting collection item values:', valuesError);
@@ -384,11 +405,13 @@ export async function hardDeleteCollection(id: string, isPublished: boolean = fa
   }
 
   // Hard delete the collection (CASCADE will delete all related data)
-  const { error } = await client
+  let query = client
     .from('collections')
     .delete()
     .eq('id', id)
     .eq('is_published', isPublished);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to hard delete collection: ${error.message}`);
@@ -417,7 +440,7 @@ export async function publishCollection(id: string): Promise<Collection> {
   // Upsert published version (composite key handles insert/update automatically)
   const { data, error } = await client
     .from('collections')
-    .upsert({
+    .upsert(await stampTenantId({
       id: draft.id, // Same UUID
       name: draft.name,
       sorting: draft.sorting,
@@ -425,7 +448,7 @@ export async function publishCollection(id: string): Promise<Collection> {
       is_published: true,
       created_at: draft.created_at,
       updated_at: new Date().toISOString(),
-    }, {
+    }), {
       onConflict: 'id,is_published', // Composite primary key
     }).select()
     .single();
@@ -467,11 +490,13 @@ export async function getUnpublishedCollections(): Promise<Collection[]> {
 
   // Batch fetch all published collections for comparison
   const draftIds = draftCollections.map(c => c.id);
-  const { data: publishedCollections, error: publishedError } = await client
+  let query = client
     .from('collections')
     .select('*')
     .in('id', draftIds)
     .eq('is_published', true);
+  query = (await applyTenantEq(query)).query;
+  const { data: publishedCollections, error: publishedError } = await query;
 
   if (publishedError) {
     throw new Error(`Failed to fetch published collections: ${publishedError.message}`);
@@ -503,8 +528,10 @@ export async function reorderCollections(isPublished: boolean, collectionIds: st
   }
 
   // Update order for each collection
-  const updates = collectionIds.map((id, index) =>
-    client
+  const updates = [];
+  for (let index = 0; index < collectionIds.length; index++) {
+    const id = collectionIds[index];
+    let updateQuery = client
       .from('collections')
       .update({
         order: index,
@@ -512,8 +539,10 @@ export async function reorderCollections(isPublished: boolean, collectionIds: st
       })
       .eq('id', id)
       .eq('is_published', isPublished)
-      .is('deleted_at', null)
-  );
+      .is('deleted_at', null);
+    updateQuery = (await applyTenantEq(updateQuery)).query;
+    updates.push(updateQuery);
+  }
 
   const results = await Promise.all(updates);
 

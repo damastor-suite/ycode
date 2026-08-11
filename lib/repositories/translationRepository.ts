@@ -5,7 +5,8 @@
  * Supports draft/published workflow with composite primary key (id, is_published)
  */
 
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, resolveTenantId, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import { fetchAllRows } from '@/lib/supabase-constants';
 import { getKnexClient } from '@/lib/knex-client';
 import type { Translation, CreateTranslationData, UpdateTranslationData } from '@/types';
@@ -30,7 +31,7 @@ export async function getAllTranslationRows<T = Translation>(
 ): Promise<T[]> {
   try {
     const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+    const resolvedTenantId = await resolveTenantId(tenantId);
     let query = knex('translations').select(columns).where('is_published', isPublished);
     if (resolvedTenantId) {
       query = query.where('tenant_id', resolvedTenantId);
@@ -40,9 +41,16 @@ export async function getAllTranslationRows<T = Translation>(
     const client = await getSupabaseAdmin(tenantId);
     if (!client) return [];
     const select = columns.includes('*') ? '*' : columns.join(', ');
-    return await fetchAllRows<T>((from, to) =>
-      client.from('translations').select(select).eq('is_published', isPublished).order('id', { ascending: true }).range(from, to) as unknown as PromiseLike<{ data: T[] | null; error: unknown }>,
-    );
+    return await fetchAllRows<T>(async (from, to) => {
+      let query = client
+        .from('translations')
+        .select(select)
+        .eq('is_published', isPublished)
+        .order('id', { ascending: true })
+        .range(from, to);
+      query = (await applyTenantEq(query, tenantId)).query;
+      return query as unknown as PromiseLike<{ data: T[] | null; error: unknown }>;
+    });
   }
 }
 
@@ -66,7 +74,7 @@ export async function getTranslationsByLocale(
   const results: Translation[] = [];
 
   for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await client
+    let query = client
       .from('translations')
       .select('*')
       .eq('locale_id', localeId)
@@ -74,6 +82,8 @@ export async function getTranslationsByLocale(
       .is('deleted_at', null)
       .order('created_at', { ascending: true })
       .range(from, from + PAGE_SIZE - 1);
+    query = (await applyTenantEq(query, tenantId)).query;
+    const { data, error } = await query;
 
     if (error) {
       throw new Error(`Failed to fetch translations: ${error.message}`);
@@ -142,8 +152,8 @@ export async function getLocaleScaffoldTranslations(
   };
 
   // Non-CMS rows (page / folder / component).
-  await pageThrough((from, to) =>
-    client
+  await pageThrough(async (from, to) => {
+    let query = client
       .from('translations')
       .select('*')
       .eq('locale_id', localeId)
@@ -151,12 +161,14 @@ export async function getLocaleScaffoldTranslations(
       .is('deleted_at', null)
       .in('source_type', NON_CMS_SOURCE_TYPES)
       .order('created_at', { ascending: true })
-      .range(from, to) as unknown as PromiseLike<{ data: Translation[] | null; error: { message: string } | null }>,
-  );
+      .range(from, to);
+    query = (await applyTenantEq(query, tenantId)).query;
+    return query as unknown as PromiseLike<{ data: Translation[] | null; error: { message: string } | null }>;
+  });
 
   // CMS slug rows (needed to match/build localized dynamic-page URLs).
-  await pageThrough((from, to) =>
-    client
+  await pageThrough(async (from, to) => {
+    let query = client
       .from('translations')
       .select('*')
       .eq('locale_id', localeId)
@@ -165,8 +177,10 @@ export async function getLocaleScaffoldTranslations(
       .eq('source_type', 'cms')
       .in('content_key', SLUG_CONTENT_KEYS)
       .order('created_at', { ascending: true })
-      .range(from, to) as unknown as PromiseLike<{ data: Translation[] | null; error: { message: string } | null }>,
-  );
+      .range(from, to);
+    query = (await applyTenantEq(query, tenantId)).query;
+    return query as unknown as PromiseLike<{ data: Translation[] | null; error: { message: string } | null }>;
+  });
 
   return results;
 }
@@ -192,7 +206,7 @@ export async function getCmsTranslationsForItems(
   const results: Translation[] = [];
 
   for (const chunk of chunkIds(itemIds, IN_CHUNK_SIZE)) {
-    const { data, error } = await client
+    let query = client
       .from('translations')
       .select('*')
       .eq('locale_id', localeId)
@@ -200,6 +214,8 @@ export async function getCmsTranslationsForItems(
       .is('deleted_at', null)
       .eq('source_type', 'cms')
       .in('source_id', chunk);
+    query = (await applyTenantEq(query, tenantId)).query;
+    const { data, error } = await query;
 
     if (error) {
       throw new Error(`Failed to fetch CMS translations: ${error.message}`);
@@ -230,7 +246,7 @@ export async function getSlugTranslationsByLocale(
   const results: Translation[] = [];
 
   for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await client
+    let query = client
       .from('translations')
       .select('*')
       .eq('locale_id', localeId)
@@ -239,6 +255,8 @@ export async function getSlugTranslationsByLocale(
       .in('content_key', SLUG_CONTENT_KEYS)
       .order('created_at', { ascending: true })
       .range(from, from + PAGE_SIZE - 1);
+    query = (await applyTenantEq(query, tenantId)).query;
+    const { data, error } = await query;
 
     if (error) {
       throw new Error(`Failed to fetch slug translations: ${error.message}`);
@@ -265,7 +283,7 @@ export async function getTranslationsBySource(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('translations')
     .select('*')
     .eq('source_type', sourceType)
@@ -273,6 +291,8 @@ export async function getTranslationsBySource(
     .eq('is_published', isPublished)
     .is('deleted_at', null)
     .order('created_at', { ascending: true });
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch translations: ${error.message}`);
@@ -294,13 +314,14 @@ export async function getTranslationById(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('translations')
     .select('*')
     .eq('id', id)
     .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -328,7 +349,7 @@ export async function getTranslationByKey(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('translations')
     .select('*')
     .eq('locale_id', localeId)
@@ -336,8 +357,9 @@ export async function getTranslationByKey(
     .eq('source_id', sourceId)
     .eq('content_key', contentKey)
     .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -365,7 +387,7 @@ export async function createTranslation(
   const { data, error } = await client
     .from('translations')
     .upsert(
-      {
+      await stampTenantId({
         locale_id: translationData.locale_id,
         source_type: translationData.source_type,
         source_id: translationData.source_id,
@@ -375,7 +397,7 @@ export async function createTranslation(
         is_completed: translationData.is_completed ?? false,
         is_published: false,
         deleted_at: null, // Restore if previously deleted
-      },
+      }),
       {
         onConflict: 'locale_id,source_type,source_id,content_key,is_published',
       }
@@ -403,7 +425,7 @@ export async function updateTranslation(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('translations')
     .update({
       ...updates,
@@ -412,8 +434,9 @@ export async function updateTranslation(
     })
     .eq('id', id)
     .eq('is_published', false)
-    .select()
-    .single();
+    .select();
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     throw new Error(`Failed to update translation: ${error.message}`);
@@ -432,11 +455,13 @@ export async function deleteTranslation(id: string): Promise<void> {
     throw new Error('Supabase not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('translations')
     .update({ deleted_at: new Date().toISOString() })
     .eq('id', id)
     .eq('is_published', false);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete translation: ${error.message}`);
@@ -488,6 +513,8 @@ export async function deleteTranslationsInBulk(
     query = query.in('content_key', contentKeys);
   }
 
+  query = (await applyTenantEq(query)).query;
+
   const { error } = await query;
 
   if (error) {
@@ -513,7 +540,7 @@ export async function markTranslationsIncomplete(
     return; // Nothing to update
   }
 
-  const { error } = await client
+  let query = client
     .from('translations')
     .update({
       is_completed: false,
@@ -524,6 +551,8 @@ export async function markTranslationsIncomplete(
     .in('content_key', contentKeys)
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to mark translations as incomplete: ${error.message}`);
@@ -559,7 +588,7 @@ export async function upsertTranslations(
 
   const { data, error } = await client
     .from('translations')
-    .upsert(translationsToUpsert, {
+    .upsert(await stampTenantIdMany(translationsToUpsert), {
       onConflict: 'locale_id,source_type,source_id,content_key,is_published',
     })
     .select();

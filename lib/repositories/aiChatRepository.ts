@@ -14,6 +14,7 @@
  */
 
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, stampTenantId } from '@/lib/tenant';
 import type { AiChat, AiChatSummary, UpsertAiChatData } from '@/types';
 
 /** Fetch all chats without their transcripts, newest activity first. */
@@ -24,10 +25,13 @@ export async function getAllAiChatSummaries(tenantId?: string): Promise<AiChatSu
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('ai_chats')
     .select('id, title, updated_at')
     .order('updated_at', { ascending: false });
+
+  query = (await applyTenantEq(query, tenantId)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch AI chats: ${error.message}`);
@@ -44,11 +48,13 @@ export async function getAiChatById(id: string, tenantId?: string): Promise<AiCh
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('ai_chats')
     .select('*')
-    .eq('id', id)
-    .single();
+    .eq('id', id);
+
+  query = (await applyTenantEq(query, tenantId)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -73,17 +79,19 @@ export async function upsertAiChat(chatData: UpsertAiChatData, tenantId?: string
     throw new Error('Supabase not configured');
   }
 
+  const row = await stampTenantId(
+    {
+      id: chatData.id,
+      title: chatData.title,
+      messages: chatData.messages,
+      updated_at: new Date().toISOString(),
+    },
+    tenantId
+  );
+
   const { error } = await client
     .from('ai_chats')
-    .upsert(
-      {
-        id: chatData.id,
-        title: chatData.title,
-        messages: chatData.messages,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'id' },
-    );
+    .upsert(row, { onConflict: 'id' });
 
   if (error) {
     throw new Error(`Failed to save AI chat: ${error.message}`);
@@ -97,10 +105,13 @@ export async function deleteAiChat(id: string, tenantId?: string): Promise<void>
     throw new Error('Supabase not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('ai_chats')
     .delete()
     .eq('id', id);
+
+  query = (await applyTenantEq(query, tenantId)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete AI chat: ${error.message}`);
