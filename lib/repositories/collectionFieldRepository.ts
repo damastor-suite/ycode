@@ -1,4 +1,5 @@
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, resolveTenantId, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import { SUPABASE_QUERY_LIMIT } from '@/lib/supabase-constants';
 import { getKnexClient } from '@/lib/knex-client';
 import type { CollectionField, CreateCollectionFieldData, UpdateCollectionFieldData } from '@/types';
@@ -30,7 +31,7 @@ export async function getAllFields(
   // Fast path: single direct-DB (Knex) read instead of paginated PostgREST.
   try {
     const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+    const resolvedTenantId = await resolveTenantId(tenantId);
     let query = knex('collection_fields')
       .select('*')
       .where('is_published', is_published)
@@ -57,7 +58,7 @@ export async function getAllFields(
   let hasMore = true;
 
   while (hasMore) {
-    const { data, error } = await client
+    let query1 = client
       .from('collection_fields')
       .select('*')
       .eq('is_published', is_published)
@@ -65,6 +66,8 @@ export async function getAllFields(
       .order('collection_id', { ascending: true })
       .order('order', { ascending: true })
       .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
+    query1 = (await applyTenantEq(query1, tenantId)).query;
+    const { data, error } = await query1;
 
     if (error) {
       throw new Error(`Failed to fetch all collection fields: ${error.message}`);
@@ -118,6 +121,8 @@ export async function getFieldsByCollectionId(
     query = query.ilike('name', searchTerm);
   }
 
+  query = (await applyTenantEq(query, tenantId)).query;
+
   const { data, error } = await query;
 
   if (error) {
@@ -144,13 +149,15 @@ export async function getFieldsByKeyAcrossCollections(
   const result = new Map<string, CollectionField>();
   if (collectionIds.length === 0) return result;
 
-  const { data, error } = await client
+  let query = client
     .from('collection_fields')
     .select('*')
     .eq('key', key)
     .in('collection_id', collectionIds)
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch fields by key: ${error.message}`);
@@ -175,13 +182,14 @@ export async function getFieldById(id: string, isPublished: boolean = false): Pr
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_fields')
     .select('*')
     .eq('id', id)
     .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to fetch collection field: ${error.message}`);
@@ -205,7 +213,7 @@ export async function createField(fieldData: CreateCollectionFieldData): Promise
 
   const { data, error } = await client
     .from('collection_fields')
-    .insert({
+    .insert(await stampTenantId({
       id,
       ...fieldData,
       fillable: fieldData.fillable ?? true,
@@ -216,7 +224,7 @@ export async function createField(fieldData: CreateCollectionFieldData): Promise
       is_published: isPublished,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    })
+    }))
     .select()
     .single();
 
@@ -244,7 +252,7 @@ export async function updateField(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_fields')
     .update({
       ...fieldData,
@@ -253,8 +261,9 @@ export async function updateField(
     .eq('id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null)
-    .select()
-    .single();
+    .select();
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     throw new Error(`Failed to update collection field: ${error.message}`);
@@ -280,7 +289,7 @@ export async function deleteField(id: string, isPublished: boolean = false): Pro
   const now = new Date().toISOString();
 
   // Soft delete the field
-  const { error: fieldError } = await client
+  let query = client
     .from('collection_fields')
     .update({
       deleted_at: now,
@@ -289,13 +298,15 @@ export async function deleteField(id: string, isPublished: boolean = false): Pro
     .eq('id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { error: fieldError } = await query;
 
   if (fieldError) {
     throw new Error(`Failed to delete collection field: ${fieldError.message}`);
   }
 
   // Soft delete all collection_item_values for this field (same published state)
-  const { error: valuesError } = await client
+  let query1 = client
     .from('collection_item_values')
     .update({
       deleted_at: now,
@@ -304,6 +315,8 @@ export async function deleteField(id: string, isPublished: boolean = false): Pro
     .eq('field_id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null);
+  query1 = (await applyTenantEq(query1)).query;
+  const { error: valuesError } = await query1;
 
   if (valuesError) {
     throw new Error(`Failed to delete field values: ${valuesError.message}`);
@@ -328,8 +341,10 @@ export async function reorderFields(
   }
 
   // Update order for each field
-  const updates = field_ids.map((field_id, index) =>
-    client
+  const updates = [];
+  for (let index = 0; index < field_ids.length; index++) {
+    const field_id = field_ids[index];
+    let updateQuery = client
       .from('collection_fields')
       .update({
         order: index,
@@ -338,8 +353,10 @@ export async function reorderFields(
       .eq('id', field_id)
       .eq('collection_id', collection_id)
       .eq('is_published', is_published)
-      .is('deleted_at', null)
-  );
+      .is('deleted_at', null);
+    updateQuery = (await applyTenantEq(updateQuery)).query;
+    updates.push(updateQuery);
+  }
 
   const results = await Promise.all(updates);
 
@@ -365,11 +382,13 @@ export async function hardDeleteField(id: string, isPublished: boolean = false):
   }
 
   // Hard delete the field (CASCADE will delete values)
-  const { error } = await client
+  let query = client
     .from('collection_fields')
     .delete()
     .eq('id', id)
     .eq('is_published', isPublished);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to hard delete collection field: ${error.message}`);
@@ -398,7 +417,7 @@ export async function publishField(id: string): Promise<CollectionField> {
   // Upsert published version (composite key handles insert/update automatically)
   const { data, error } = await client
     .from('collection_fields')
-    .upsert({
+    .upsert(await stampTenantId({
       id: draft.id, // Same UUID
       name: draft.name,
       key: draft.key,
@@ -413,7 +432,7 @@ export async function publishField(id: string): Promise<CollectionField> {
       is_published: true,
       created_at: draft.created_at,
       updated_at: new Date().toISOString(),
-    }, {
+    }), {
       onConflict: 'id,is_published', // Composite primary key
     }).select()
     .single();

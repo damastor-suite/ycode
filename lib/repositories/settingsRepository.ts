@@ -5,6 +5,12 @@
  */
 
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import {
+  applyTenantEq,
+  resolveTenantId,
+  stampTenantId,
+  stampTenantIdMany,
+} from '@/lib/tenant';
 import type { Setting } from '@/types';
 
 // Postgres "undefined_table" — the settings table is briefly absent right after
@@ -28,10 +34,11 @@ export async function getAllSettings(): Promise<Setting[]> {
     throw new Error('Failed to initialize Supabase client');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('settings')
-    .select('*')
-    .order('key', { ascending: true });
+    .select('*');
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.order('key', { ascending: true });
 
   if (error) {
     if (isMissingTableError(error)) {
@@ -50,17 +57,18 @@ export async function getAllSettings(): Promise<Setting[]> {
  * @param tenantId - Optional tenant scope (ignored in single-tenant deployments)
  * @returns Promise resolving to the setting value or null if not found
  */
-export async function getSettingByKey(key: string, tenantId?: string): Promise<any | null> {
+export async function getSettingByKey(key: string, tenantId?: string): Promise<Setting['value'] | null> {
   const client = await getSupabaseAdmin(tenantId);
   if (!client) {
     throw new Error('Failed to initialize Supabase client');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('settings')
     .select('value')
-    .eq('key', key)
-    .single();
+    .eq('key', key);
+  query = (await applyTenantEq(query, tenantId)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116' || isMissingTableError(error)) {
@@ -70,7 +78,7 @@ export async function getSettingByKey(key: string, tenantId?: string): Promise<a
     throw new Error(`Failed to fetch setting: ${error.message}`);
   }
 
-  return data?.value || null;
+  return data?.value ?? null;
 }
 
 /**
@@ -79,7 +87,7 @@ export async function getSettingByKey(key: string, tenantId?: string): Promise<a
  * @param keys - Array of setting keys to fetch
  * @returns Promise resolving to a map of key -> value
  */
-export async function getSettingsByKeys(keys: string[]): Promise<Record<string, any>> {
+export async function getSettingsByKeys(keys: string[]): Promise<Record<string, Setting['value']>> {
   if (keys.length === 0) {
     return {};
   }
@@ -89,10 +97,12 @@ export async function getSettingsByKeys(keys: string[]): Promise<Record<string, 
     throw new Error('Failed to initialize Supabase client');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('settings')
     .select('key, value')
     .in('key', keys);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     if (isMissingTableError(error)) {
@@ -101,7 +111,7 @@ export async function getSettingsByKeys(keys: string[]): Promise<Record<string, 
     throw new Error(`Failed to fetch settings: ${error.message}`);
   }
 
-  const result: Record<string, any> = {};
+  const result: Record<string, Setting['value']> = {};
   for (const setting of data || []) {
     result[setting.key] = setting.value;
   }
@@ -116,20 +126,23 @@ export async function getSettingsByKeys(keys: string[]): Promise<Record<string, 
  * @param value - The value to store
  * @returns Promise resolving to the created/updated setting
  */
-export async function setSetting(key: string, value: any): Promise<Setting> {
+export async function setSetting(key: string, value: Setting['value']): Promise<Setting> {
   const client = await getSupabaseAdmin();
   if (!client) {
     throw new Error('Failed to initialize Supabase client');
   }
 
+  const tenantId = await resolveTenantId();
+  const record = await stampTenantId({
+    key,
+    value,
+    updated_at: new Date().toISOString(),
+  });
+
   const { data, error } = await client
     .from('settings')
-    .upsert({
-      key,
-      value,
-      updated_at: new Date().toISOString(),
-    }, {
-      onConflict: 'key',
+    .upsert(record, {
+      onConflict: tenantId ? 'tenant_id,key' : 'key',
     })
     .select()
     .single();
@@ -148,7 +161,7 @@ export async function setSetting(key: string, value: any): Promise<Setting> {
  * @param settings - Object with key-value pairs to store
  * @returns Promise resolving to the number of settings updated
  */
-export async function setSettings(settings: Record<string, any>): Promise<number> {
+export async function setSettings(settings: Record<string, Setting['value']>): Promise<number> {
   const entries = Object.entries(settings);
   if (entries.length === 0) {
     return 0;
@@ -159,8 +172,10 @@ export async function setSettings(settings: Record<string, any>): Promise<number
     throw new Error('Failed to initialize Supabase client');
   }
 
+  const tenantId = await resolveTenantId();
+
   // Separate entries: null/undefined values should be deleted, others upserted
-  const toUpsert: [string, any][] = [];
+  const toUpsert: [string, Setting['value']][] = [];
   const toDelete: string[] = [];
 
   for (const [key, value] of entries) {
@@ -173,10 +188,12 @@ export async function setSettings(settings: Record<string, any>): Promise<number
 
   // Delete settings with null values
   if (toDelete.length > 0) {
-    const { error: deleteError } = await client
+    let deleteQuery = client
       .from('settings')
       .delete()
       .in('key', toDelete);
+    deleteQuery = (await applyTenantEq(deleteQuery)).query;
+    const { error: deleteError } = await deleteQuery;
 
     if (deleteError) {
       throw new Error(`Failed to delete settings: ${deleteError.message}`);
@@ -186,16 +203,18 @@ export async function setSettings(settings: Record<string, any>): Promise<number
   // Upsert settings with non-null values
   if (toUpsert.length > 0) {
     const now = new Date().toISOString();
-    const records = toUpsert.map(([key, value]) => ({
-      key,
-      value,
-      updated_at: now,
-    }));
+    const records = await stampTenantIdMany(
+      toUpsert.map(([key, value]) => ({
+        key,
+        value,
+        updated_at: now,
+      }))
+    );
 
     const { error } = await client
       .from('settings')
       .upsert(records, {
-        onConflict: 'key',
+        onConflict: tenantId ? 'tenant_id,key' : 'key',
       });
 
     if (error) {

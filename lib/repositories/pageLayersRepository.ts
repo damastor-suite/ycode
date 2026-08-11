@@ -1,4 +1,9 @@
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import {
+  applyTenantEq,
+  stampTenantId,
+  stampTenantIdMany,
+} from '@/lib/tenant';
 import type { PageLayers, Layer } from '../../types';
 import { generatePageLayersHash } from '../hash-utils';
 import { deleteTranslationsInBulk, markTranslationsIncomplete } from '@/lib/repositories/translationRepository';
@@ -28,6 +33,7 @@ export async function getLayersByPageId(
     query = query.eq('is_published', isPublished);
   }
 
+  query = (await applyTenantEq(query)).query;
   const { data, error } = await query
     .order('created_at', { ascending: false })
     .limit(1)
@@ -53,15 +59,16 @@ export async function getDraftLayers(pageId: string): Promise<PageLayers | null>
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_layers')
     .select('*')
     .eq('page_id', pageId)
     .eq('is_published', false)
     .is('deleted_at', null)
     .order('created_at', { ascending: false })
-    .limit(1)
-    .single();
+    .limit(1);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -83,15 +90,16 @@ export async function getPublishedLayers(pageId: string): Promise<PageLayers | n
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_layers')
     .select('*')
     .eq('page_id', pageId)
     .eq('is_published', true)
     .is('deleted_at', null)
     .order('created_at', { ascending: false })
-    .limit(1)
-    .single();
+    .limit(1);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -178,13 +186,14 @@ export async function upsertDraftLayers(
 
   if (resolvedDraft) {
     // Update existing draft
-    const { data, error } = await client
+    let query = client
       .from('page_layers')
       .update(updateData)
       .eq('id', resolvedDraft.id)
       .eq('is_published', false)
-      .select()
-      .single();
+      .select();
+    query = (await applyTenantEq(query)).query;
+    const { data, error } = await query.single();
 
     if (error) {
       throw new Error(`Failed to update draft: ${error.message}`);
@@ -203,7 +212,7 @@ export async function upsertDraftLayers(
 
     const { data, error } = await client
       .from('page_layers')
-      .insert(insertData)
+      .insert(await stampTenantId(insertData as unknown as Record<string, unknown>))
       .select()
       .single();
 
@@ -226,12 +235,14 @@ export async function getAllDraftLayers(): Promise<PageLayers[]> {
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_layers')
     .select('*')
     .eq('is_published', false)
     .is('deleted_at', null)
     .order('created_at', { ascending: false });
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch draft layers: ${error.message}`);
@@ -255,13 +266,15 @@ export async function getDraftLayersForPages(pageIds: string[]): Promise<PageLay
     return [];
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_layers')
     .select('*')
     .in('page_id', pageIds)
     .eq('is_published', false)
     .is('deleted_at', null)
     .order('created_at', { ascending: false });
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch draft layers: ${error.message}`);
@@ -285,12 +298,14 @@ export async function getPublishedLayersByIds(ids: string[]): Promise<PageLayers
     return [];
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_layers')
     .select('*')
     .in('id', ids)
     .eq('is_published', true)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch published layers: ${error.message}`);
@@ -310,13 +325,14 @@ export async function getPublishedLayersById(id: string): Promise<PageLayers | n
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_layers')
     .select('*')
     .eq('id', id)
     .eq('is_published', true)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -367,13 +383,14 @@ export async function publishPageLayers(draftPageId: string, publishedPageId: st
         updated_at: new Date().toISOString(),
       };
 
-      const { data, error } = await client
+      let query = client
         .from('page_layers')
         .update(updateData)
         .eq('id', existingPublished.id)
         .eq('is_published', true)
-        .select()
-        .single();
+        .select();
+      query = (await applyTenantEq(query)).query;
+      const { data, error } = await query.single();
 
       if (error) {
         throw new Error(`Failed to update published layers: ${error.message}`);
@@ -396,7 +413,7 @@ export async function publishPageLayers(draftPageId: string, publishedPageId: st
 
     const { data, error } = await client
       .from('page_layers')
-      .insert(insertData)
+      .insert(await stampTenantId(insertData as unknown as Record<string, unknown>))
       .select()
       .single();
 
@@ -444,18 +461,26 @@ export async function batchPublishPageLayers(
     pageIdsToPublish = pageIds;
   } else {
     const [draftHashes, publishedHashes] = await Promise.all([
-      client
-        .from('page_layers')
-        .select('id, page_id, content_hash')
-        .in('page_id', pageIds)
-        .eq('is_published', false)
-        .is('deleted_at', null),
-      client
-        .from('page_layers')
-        .select('id, content_hash')
-        .in('page_id', pageIds)
-        .eq('is_published', true)
-        .is('deleted_at', null),
+      (async () => {
+        let query = client
+          .from('page_layers')
+          .select('id, page_id, content_hash')
+          .in('page_id', pageIds)
+          .eq('is_published', false)
+          .is('deleted_at', null);
+        query = (await applyTenantEq(query)).query;
+        return query;
+      })(),
+      (async () => {
+        let query = client
+          .from('page_layers')
+          .select('id, content_hash')
+          .in('page_id', pageIds)
+          .eq('is_published', true)
+          .is('deleted_at', null);
+        query = (await applyTenantEq(query)).query;
+        return query;
+      })(),
     ]);
 
     if (draftHashes.error) {
@@ -504,7 +529,7 @@ export async function batchPublishPageLayers(
   if (layersToUpsert.length > 0) {
     const { error } = await client
       .from('page_layers')
-      .upsert(layersToUpsert, {
+      .upsert(await stampTenantIdMany(layersToUpsert as unknown as Array<Record<string, unknown>>), {
         onConflict: 'id,is_published',
       });
 
@@ -529,12 +554,14 @@ export async function getPageLayers(pageId: string): Promise<PageLayers[]> {
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('page_layers')
     .select('*')
     .eq('page_id', pageId)
     .is('deleted_at', null)
     .order('created_at', { ascending: false });
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch layers: ${error.message}`);
@@ -567,11 +594,13 @@ async function expandThroughComponents(
 ): Promise<string[]> {
   if (componentIds.length === 0 && styleIds.length === 0) return [];
 
-  const { data: allComponents } = await client
+  let query = client
     .from('components')
     .select('id, layers')
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: allComponents } = await query;
 
   if (!allComponents || allComponents.length === 0) return [];
 
@@ -638,11 +667,13 @@ async function findComponentsEmbeddingCollections(
 ): Promise<string[]> {
   if (collectionIds.length === 0) return [];
 
-  const { data: allComponents } = await client
+  let query = client
     .from('components')
     .select('id, layers')
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: allComponents } = await query;
 
   if (!allComponents || allComponents.length === 0) return [];
 
@@ -712,11 +743,13 @@ export async function findAffectedPages(
   const collectionMatchIds = new Set([...collectionIds, ...collectionEmbeddingComponentIds]);
 
   // Single scan of all draft page_layers
-  const { data: allLayers } = await client
+  let query = client
     .from('page_layers')
     .select('page_id, layers')
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: allLayers } = await query;
 
   if (allLayers) {
     const componentSet = new Set(allComponentIds);
@@ -753,11 +786,13 @@ export async function findAffectedPages(
 
   // Collections also need pages.settings search (dynamic template pages)
   if (hasCollections) {
-    const { data: allPages } = await client
+    let query = client
       .from('pages')
       .select('id, settings')
       .eq('is_published', false)
       .is('deleted_at', null);
+    query = (await applyTenantEq(query)).query;
+    const { data: allPages } = await query;
 
     if (allPages) {
       const collectionPageSet = new Set(result.collectionPageIds);
@@ -804,12 +839,14 @@ export async function findCollectionsEmbeddingComponents(
   // published field id matches `collection_item_values.field_id` on published
   // values, and the field carries its own `collection_id` — no item lookup
   // needed to map a match back to a collection.
-  const { data: richTextFields } = await client
+  let query = client
     .from('collection_fields')
     .select('id, collection_id')
     .eq('type', 'rich_text')
     .eq('is_published', true)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: richTextFields } = await query;
 
   if (!richTextFields || richTextFields.length === 0) return [];
 
@@ -828,12 +865,14 @@ export async function findCollectionsEmbeddingComponents(
   // Scan published rich-text values only. The cheap `richTextComponent` marker
   // check skips values that hold no embedded component before the id match.
   for (const idChunk of chunk(fieldIds, 500)) {
-    const { data: values } = await client
+    let query = client
       .from('collection_item_values')
       .select('field_id, value')
       .eq('is_published', true)
       .is('deleted_at', null)
       .in('field_id', idChunk);
+    query = (await applyTenantEq(query)).query;
+    const { data: values } = await query;
 
     for (const row of values ?? []) {
       if (!row.value) continue;
@@ -897,13 +936,15 @@ export async function getEmbeddedComponentIdsForCollections(
   const client = await getSupabaseAdmin();
   if (!client) return result;
 
-  const { data: richTextFields } = await client
+  let query = client
     .from('collection_fields')
     .select('id, collection_id')
     .eq('type', 'rich_text')
     .eq('is_published', isPublished)
     .is('deleted_at', null)
     .in('collection_id', collectionIds);
+  query = (await applyTenantEq(query)).query;
+  const { data: richTextFields } = await query;
 
   if (!richTextFields || richTextFields.length === 0) return result;
 
@@ -916,12 +957,14 @@ export async function getEmbeddedComponentIdsForCollections(
   const { chunk } = await import('@/lib/utils');
 
   for (const idChunk of chunk(fieldIds, 500)) {
-    const { data: values } = await client
+    let query = client
       .from('collection_item_values')
       .select('field_id, value')
       .eq('is_published', isPublished)
       .is('deleted_at', null)
       .in('field_id', idChunk);
+    query = (await applyTenantEq(query)).query;
+    const { data: values } = await query;
 
     for (const row of values ?? []) {
       if (!row.value) continue;

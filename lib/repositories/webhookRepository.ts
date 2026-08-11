@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, stampTenantId } from '@/lib/tenant';
 
 /**
  * Webhook Repository
@@ -104,10 +105,13 @@ export async function getAllWebhooks(): Promise<Webhook[]> {
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('webhooks')
     .select('*')
     .order('created_at', { ascending: false });
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch webhooks: ${error.message}`);
@@ -126,11 +130,13 @@ export async function getWebhookById(id: string): Promise<Webhook | null> {
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('webhooks')
     .select('*')
-    .eq('id', id)
-    .single();
+    .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to fetch webhook: ${error.message}`);
@@ -149,10 +155,13 @@ export async function getWebhooksForEvent(eventType: WebhookEventType): Promise<
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('webhooks')
     .select('*')
     .eq('enabled', true);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch webhooks for event: ${error.message}`);
@@ -174,19 +183,21 @@ export async function createWebhook(webhookData: CreateWebhookData): Promise<Web
     throw new Error('Supabase client not configured');
   }
 
+  const row = await stampTenantId({
+    name: webhookData.name,
+    url: webhookData.url,
+    secret: webhookData.secret || null,
+    events: webhookData.events,
+    filters: webhookData.filters || null,
+    enabled: true,
+    failure_count: 0,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
   const { data, error } = await client
     .from('webhooks')
-    .insert({
-      name: webhookData.name,
-      url: webhookData.url,
-      secret: webhookData.secret || null,
-      events: webhookData.events,
-      filters: webhookData.filters || null,
-      enabled: true,
-      failure_count: 0,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
+    .insert(row)
     .select()
     .single();
 
@@ -218,12 +229,13 @@ export async function updateWebhook(id: string, updates: UpdateWebhookData): Pro
   if (updates.filters !== undefined) updateData.filters = updates.filters;
   if (updates.enabled !== undefined) updateData.enabled = updates.enabled;
 
-  const { data, error } = await client
+  let query = client
     .from('webhooks')
     .update(updateData)
-    .eq('id', id)
-    .select()
-    .single();
+    .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.select().single();
 
   if (error) {
     throw new Error(`Failed to update webhook: ${error.message}`);
@@ -242,10 +254,13 @@ export async function deleteWebhook(id: string): Promise<void> {
     throw new Error('Supabase client not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('webhooks')
     .delete()
     .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete webhook: ${error.message}`);
@@ -263,7 +278,7 @@ export async function markWebhookTriggered(id: string, success: boolean): Promis
   }
 
   if (success) {
-    await client
+    let query = client
       .from('webhooks')
       .update({
         last_triggered_at: new Date().toISOString(),
@@ -271,6 +286,8 @@ export async function markWebhookTriggered(id: string, success: boolean): Promis
         updated_at: new Date().toISOString(),
       })
       .eq('id', id);
+    query = (await applyTenantEq(query)).query;
+    await query;
   } else {
     // Increment failure count
     await client.rpc('increment_webhook_failure_count', { webhook_id: id });
@@ -288,7 +305,7 @@ export async function incrementWebhookFailureCount(id: string): Promise<void> {
   }
 
   // Use raw SQL to increment
-  const { error } = await client
+  let query = client
     .from('webhooks')
     .update({
       failure_count: client.rpc('increment', { x: 1 }) as unknown as number,
@@ -296,17 +313,22 @@ export async function incrementWebhookFailureCount(id: string): Promise<void> {
     })
     .eq('id', id);
 
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
+
   // Fallback: fetch and update if rpc fails
   if (error) {
     const webhook = await getWebhookById(id);
     if (webhook) {
-      await client
+      let fallbackQuery = client
         .from('webhooks')
         .update({
           failure_count: webhook.failure_count + 1,
           updated_at: new Date().toISOString(),
         })
         .eq('id', id);
+      fallbackQuery = (await applyTenantEq(fallbackQuery)).query;
+      await fallbackQuery;
     }
   }
 }
@@ -327,16 +349,18 @@ export async function createWebhookDelivery(
     throw new Error('Supabase client not configured');
   }
 
+  const row = await stampTenantId({
+    webhook_id: deliveryData.webhook_id,
+    event_type: deliveryData.event_type,
+    payload: deliveryData.payload,
+    status: deliveryData.status || 'pending',
+    attempts: deliveryData.attempts || 1,
+    created_at: new Date().toISOString(),
+  });
+
   const { data, error } = await client
     .from('webhook_deliveries')
-    .insert({
-      webhook_id: deliveryData.webhook_id,
-      event_type: deliveryData.event_type,
-      payload: deliveryData.payload,
-      status: deliveryData.status || 'pending',
-      attempts: deliveryData.attempts || 1,
-      created_at: new Date().toISOString(),
-    })
+    .insert(row)
     .select()
     .single();
 
@@ -360,10 +384,13 @@ export async function updateWebhookDelivery(
     throw new Error('Supabase client not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('webhook_deliveries')
     .update(updates)
     .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to update webhook delivery: ${error.message}`);
@@ -387,22 +414,28 @@ export async function getWebhookDeliveries(
   const offset = options.offset || 0;
 
   // Get total count
-  const { count, error: countError } = await client
+  let countQuery = client
     .from('webhook_deliveries')
     .select('*', { count: 'exact', head: true })
     .eq('webhook_id', webhookId);
+
+  countQuery = (await applyTenantEq(countQuery)).query;
+  const { count, error: countError } = await countQuery;
 
   if (countError) {
     throw new Error(`Failed to count webhook deliveries: ${countError.message}`);
   }
 
   // Get paginated results
-  const { data, error } = await client
+  let query = client
     .from('webhook_deliveries')
     .select('*')
     .eq('webhook_id', webhookId)
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch webhook deliveries: ${error.message}`);
@@ -427,11 +460,13 @@ export async function deleteOldWebhookDeliveries(olderThanDays: number = 30): Pr
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
 
-  const { data, error } = await client
+  let query = client
     .from('webhook_deliveries')
     .delete()
-    .lt('created_at', cutoffDate.toISOString())
-    .select('id');
+    .lt('created_at', cutoffDate.toISOString());
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.select('id');
 
   if (error) {
     throw new Error(`Failed to delete old webhook deliveries: ${error.message}`);
@@ -443,19 +478,19 @@ export async function deleteOldWebhookDeliveries(olderThanDays: number = 30): Pr
 // =============================================================================
 // Helpers
 // =============================================================================
- 
-function mapWebhookFromDb(data: any): Webhook {
+
+function mapWebhookFromDb(data: Record<string, unknown>): Webhook {
   return {
-    id: data.id,
-    name: data.name,
-    url: data.url,
-    secret: data.secret,
-    events: Array.isArray(data.events) ? data.events : [],
-    filters: data.filters || null,
-    enabled: data.enabled,
-    last_triggered_at: data.last_triggered_at,
-    failure_count: data.failure_count || 0,
-    created_at: data.created_at,
-    updated_at: data.updated_at,
+    id: data.id as string,
+    name: data.name as string,
+    url: data.url as string,
+    secret: data.secret as string | null,
+    events: Array.isArray(data.events) ? data.events as WebhookEventType[] : [],
+    filters: (data.filters as WebhookFilters | null) || null,
+    enabled: data.enabled as boolean,
+    last_triggered_at: data.last_triggered_at as string | null,
+    failure_count: (data.failure_count as number) || 0,
+    created_at: data.created_at as string,
+    updated_at: data.updated_at as string,
   };
 }

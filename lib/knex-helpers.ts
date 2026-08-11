@@ -14,7 +14,7 @@
  */
 
 import type { Knex } from 'knex';
-import { getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { resolveTenantId } from '@/lib/tenant';
 
 /**
  * Resolve tenant-aware WHERE condition for a given table.
@@ -24,7 +24,7 @@ async function resolveTenantCondition(
   knex: Knex,
   tableName: string
 ): Promise<{ clause: string; params: (string | number)[] }> {
-  const tenantId = await getTenantIdFromHeaders();
+  const tenantId = await resolveTenantId();
   if (!tenantId) return { clause: '', params: [] };
 
   const hasColumn = await knex.schema.hasColumn(tableName, 'tenant_id');
@@ -114,14 +114,16 @@ export async function incrementColumn(
  * @param knex - Knex instance (for schema introspection)
  * @param queryBuilder - The query builder to augment
  * @param tableName - Table name (to check for tenant_id column)
+ * @param explicitTenantId - Optional explicit tenant (e.g. inside unstable_cache)
  * @returns The (possibly augmented) query builder
  */
 export async function addTenantFilter(
   knex: Knex,
   queryBuilder: Knex.QueryBuilder,
-  tableName: string
+  tableName: string,
+  explicitTenantId?: string | null
 ): Promise<Knex.QueryBuilder> {
-  const tenantId = await getTenantIdFromHeaders();
+  const tenantId = await resolveTenantId(explicitTenantId);
   if (!tenantId) return queryBuilder;
 
   const hasColumn = await knex.schema.hasColumn(tableName, 'tenant_id');

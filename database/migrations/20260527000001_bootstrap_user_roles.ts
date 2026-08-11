@@ -1,16 +1,23 @@
 import type { Knex } from 'knex';
 
 /**
- * Bootstrap user roles in Supabase auth.users.
+ * Bootstrap user roles in Supabase auth.users (opensource single-tenant).
  *
  * - The earliest-created user (the person who set up the app) becomes 'owner'.
  * - All other users without a role default to 'designer'.
  *
  * Roles are stored in raw_app_meta_data (Supabase's app_metadata),
  * which is only writable via the Admin API or direct SQL.
+ *
+ * Cloud shared-DB: skip global promotion — first owner is per tenant via
+ * tenant_memberships / bootstrap_tenant_owner() (see 20260811000002).
  */
 
 export async function up(knex: Knex): Promise<void> {
+  if (process.env.SKIP_SETUP === 'true') {
+    return;
+  }
+
   // Set the first-ever user as owner (if they don't already have a role)
   await knex.raw(`
     UPDATE auth.users

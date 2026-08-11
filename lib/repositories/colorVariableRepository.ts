@@ -7,6 +7,7 @@
 
 import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { generateContentHash } from '@/lib/hash-utils';
+import { applyTenantEq, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import type { ColorVariable } from '@/types';
 
 export interface CreateColorVariableData {
@@ -55,11 +56,14 @@ export async function getAllColorVariables(): Promise<ColorVariable[]> {
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('color_variables')
     .select('*')
     .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true });
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch color variables: ${error.message}`);
@@ -75,11 +79,13 @@ export async function getColorVariableById(id: string): Promise<ColorVariable | 
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('color_variables')
     .select('*')
-    .eq('id', id)
-    .single();
+    .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -101,17 +107,21 @@ export async function createColorVariable(
   }
 
   // Get max sort_order to append at end
-  const { data: maxRow } = await client
+  let maxQuery = client
     .from('color_variables')
     .select('sort_order')
     .order('sort_order', { ascending: false })
-    .limit(1)
-    .single();
+    .limit(1);
+
+  maxQuery = (await applyTenantEq(maxQuery)).query;
+  const { data: maxRow } = await maxQuery.single();
   const nextOrder = (maxRow?.sort_order ?? -1) + 1;
+
+  const row = await stampTenantId({ ...variableData, sort_order: nextOrder });
 
   const { data, error } = await client
     .from('color_variables')
-    .insert({ ...variableData, sort_order: nextOrder })
+    .insert(row)
     .select()
     .single();
 
@@ -132,12 +142,13 @@ export async function updateColorVariable(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('color_variables')
     .update({ ...updates, updated_at: new Date().toISOString() })
-    .eq('id', id)
-    .select()
-    .single();
+    .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.select().single();
 
   if (error) {
     throw new Error(`Failed to update color variable: ${error.message}`);
@@ -153,10 +164,13 @@ export async function deleteColorVariable(id: string): Promise<void> {
     throw new Error('Supabase not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('color_variables')
     .delete()
     .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete color variable: ${error.message}`);
@@ -173,10 +187,13 @@ export async function reorderColorVariables(
   }
 
   // Fetch full rows so upsert includes all NOT NULL columns
-  const { data: existing, error: fetchError } = await client
+  let fetchQuery = client
     .from('color_variables')
     .select('*')
     .in('id', orderedIds);
+
+  fetchQuery = (await applyTenantEq(fetchQuery)).query;
+  const { data: existing, error: fetchError } = await fetchQuery;
 
   if (fetchError) {
     throw new Error(`Failed to fetch color variables for reorder: ${fetchError.message}`);
@@ -191,11 +208,13 @@ export async function reorderColorVariables(
       if (!row) return null;
       return { ...row, sort_order: index, updated_at: now };
     })
-    .filter(Boolean);
+    .filter((row): row is NonNullable<typeof row> => row !== null);
+
+  const stamped = await stampTenantIdMany(updates);
 
   const { error } = await client
     .from('color_variables')
-    .upsert(updates, { onConflict: 'id' });
+    .upsert(stamped, { onConflict: 'id' });
 
   if (error) {
     throw new Error(`Failed to reorder color variables: ${error.message}`);

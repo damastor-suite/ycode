@@ -1,4 +1,5 @@
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, resolveTenantId, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import { getKnexClient } from '@/lib/knex-client';
 import { SUPABASE_IN_FILTER_CHUNK_SIZE, SUPABASE_QUERY_LIMIT, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
 import type { CollectionField, CollectionItem, CollectionItemWithValues } from '@/types';
@@ -80,6 +81,8 @@ export async function getTopItemsPerCollection(
         if (is_published) {
           query = query.eq('is_publishable', true);
         }
+
+        query = (await applyTenantEq(query)).query;
 
         const { data: rows, error: rowsError } = await query;
         if (rowsError) {
@@ -202,6 +205,9 @@ export async function getItemsByCollectionId(
     query = query.range(filters.offset, filters.offset + (filters.limit || 25) - 1);
   }
 
+  countQuery = (await applyTenantEq(countQuery)).query;
+  query = (await applyTenantEq(query)).query;
+
   // Run count and data queries in parallel
   const [countResult, dataResult] = await Promise.all([countQuery, query]);
 
@@ -242,12 +248,14 @@ export async function fetchPublishedHashMap(
     // limit and returns 400 Bad Request. Fetch chunks in parallel and merge.
     const chunkResults = await Promise.all(
       chunk(itemIds, SUPABASE_IN_FILTER_CHUNK_SIZE).map(async (idsChunk) => {
-        const { data, error } = await client
+        let query = client
           .from('collection_items')
           .select('id, content_hash')
           .in('id', idsChunk)
           .eq('is_published', true)
           .is('deleted_at', null);
+        query = (await applyTenantEq(query)).query;
+        const { data, error } = await query;
 
         if (error) {
           console.error('Failed to fetch published items for status:', error.message);
@@ -280,11 +288,13 @@ export async function fetchPublishedHashMap(
         pubValues.map(v => ({ field_id: v.field_id, value: v.value }))
       );
       publishedHashMap.set(row.id, hash);
-      await client
+      let query1 = client
         .from('collection_items')
         .update({ content_hash: hash })
         .eq('id', row.id)
         .eq('is_published', true);
+      query1 = (await applyTenantEq(query1)).query;
+      await query1;
     });
     await Promise.all(backfillPromises);
   }
@@ -347,7 +357,7 @@ export async function getAllItemsRaw(
 ): Promise<CollectionItem[]> {
   try {
     const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+    const resolvedTenantId = await resolveTenantId(tenantId);
     let query = knex('collection_items')
       .select('*')
       .where('is_published', is_published)
@@ -366,13 +376,15 @@ export async function getAllItemsRaw(
     let offset = 0;
     let hasMore = true;
     while (hasMore) {
-      const { data, error } = await client
+      let query1 = client
         .from('collection_items')
         .select('*')
         .eq('is_published', is_published)
         .is('deleted_at', null)
         .order('id', { ascending: true })
         .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
+      query1 = (await applyTenantEq(query1, tenantId)).query;
+      const { data, error } = await query1;
 
       if (error) {
         throw new Error(`Failed to fetch collection items: ${error.message}`);
@@ -400,7 +412,7 @@ export async function getAllItemsByCollectionId(
   // Fast path: one direct-DB (Knex) query instead of paginated PostgREST reads.
   try {
     const knex = await getKnexClient();
-    const resolvedTenantId = await getTenantIdFromHeaders();
+    const resolvedTenantId = await resolveTenantId();
     let query = knex('collection_items')
       .select('*')
       .where('collection_id', collection_id)
@@ -430,7 +442,7 @@ export async function getAllItemsByCollectionId(
     let hasMore = true;
 
     while (hasMore) {
-      let query = client
+      let query1 = client
         .from('collection_items')
         .select('*')
         .eq('collection_id', collection_id)
@@ -441,16 +453,18 @@ export async function getAllItemsByCollectionId(
 
       // For published queries, only include publishable items
       if (is_published) {
-        query = query.eq('is_publishable', true);
+        query1 = query1.eq('is_publishable', true);
       }
 
       if (includeDeleted) {
-        query = query.not('deleted_at', 'is', null);
+        query1 = query1.not('deleted_at', 'is', null);
       } else {
-        query = query.is('deleted_at', null);
+        query1 = query1.is('deleted_at', null);
       }
 
-      const { data, error } = await query;
+      query1 = (await applyTenantEq(query1)).query;
+
+      const { data, error } = await query1;
 
       if (error) {
         throw new Error(`Failed to fetch collection items: ${error.message}`);
@@ -481,12 +495,13 @@ export async function getItemById(id: string, isPublished: boolean = false, tena
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_items')
     .select('*')
     .eq('id', id)
-    .eq('is_published', isPublished)
-    .single();
+    .eq('is_published', isPublished);
+  query = (await applyTenantEq(query, tenantId)).query;
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to fetch collection item: ${error.message}`);
@@ -511,7 +526,7 @@ export async function getItemsByIds(ids: string[], isPublished: boolean = false,
   // round-trips per call into one — the dominant cost of publishing.
   try {
     const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+    const resolvedTenantId = await resolveTenantId(tenantId);
     let query = knex('collection_items')
       .select('*')
       .whereIn('id', ids)
@@ -531,12 +546,14 @@ export async function getItemsByIds(ids: string[], isPublished: boolean = false,
     const allItems: CollectionItem[] = [];
     for (let i = 0; i < ids.length; i += SUPABASE_WRITE_BATCH_SIZE) {
       const batchIds = ids.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-      const { data, error } = await client
+      let query1 = client
         .from('collection_items')
         .select('*')
         .in('id', batchIds)
         .eq('is_published', isPublished)
         .is('deleted_at', null);
+      query1 = (await applyTenantEq(query1, tenantId)).query;
+      const { data, error } = await query1;
 
       if (error) {
         throw new Error(`Failed to fetch collection items: ${error.message}`);
@@ -578,6 +595,8 @@ export async function getItemWithValues(id: string, is_published: boolean = fals
   if (!item.deleted_at) {
     valuesQuery = valuesQuery.is('deleted_at', null);
   }
+
+  valuesQuery = (await applyTenantEq(valuesQuery, tenantId)).query;
 
   const { data: valuesData, error: valuesError } = await valuesQuery;
 
@@ -622,13 +641,15 @@ export async function getItemIdsByFieldValue(
   // For single reference: value = targetValue (exact match)
   // For multi_reference: value is a JSON string like '["uuid1","uuid2"]' containing targetValue
   // We query for both patterns using OR with LIKE for JSON array containment
-  const { data, error } = await client
+  let query = client
     .from('collection_item_values')
     .select('item_id')
     .eq('field_id', fieldId)
     .eq('is_published', isPublished)
     .is('deleted_at', null)
     .or(`value.eq.${targetValue},value.like.%"${targetValue}"%`);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to query inverse references: ${error.message}`);
@@ -639,13 +660,15 @@ export async function getItemIdsByFieldValue(
   // Get unique item IDs that also belong to the target collection and are not deleted
   const candidateIds = [...new Set(data.map(v => v.item_id))];
 
-  const { data: validItems, error: itemError } = await client
+  let query1 = client
     .from('collection_items')
     .select('id')
     .eq('collection_id', collectionId)
     .eq('is_published', isPublished)
     .is('deleted_at', null)
     .in('id', candidateIds);
+  query1 = (await applyTenantEq(query1)).query;
+  const { data: validItems, error: itemError } = await query1;
 
   if (itemError) {
     throw new Error(`Failed to validate inverse reference items: ${itemError.message}`);
@@ -894,15 +917,16 @@ export async function getMaxManualOrder(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_items')
     .select('manual_order')
     .eq('collection_id', collectionId)
     .eq('is_published', isPublished)
     .is('deleted_at', null)
     .order('manual_order', { ascending: false })
-    .limit(1)
-    .single();
+    .limit(1);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error || !data) return -1;
   return data.manual_order ?? -1;
@@ -985,7 +1009,7 @@ export async function createItemsBulk(
 
   const { data, error } = await client
     .from('collection_items')
-    .insert(itemsToInsert)
+    .insert(await stampTenantIdMany(itemsToInsert))
     .select();
 
   if (error) {
@@ -1010,7 +1034,7 @@ export async function createItem(itemData: CreateCollectionItemData): Promise<Co
 
   const { data, error } = await client
     .from('collection_items')
-    .insert({
+    .insert(await stampTenantId({
       id,
       ...itemData,
       manual_order: itemData.manual_order ?? 0,
@@ -1018,7 +1042,7 @@ export async function createItem(itemData: CreateCollectionItemData): Promise<Co
       is_publishable: itemData.is_publishable ?? true,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    })
+    }))
     .select()
     .single();
 
@@ -1046,7 +1070,7 @@ export async function updateItem(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_items')
     .update({
       ...itemData,
@@ -1055,8 +1079,9 @@ export async function updateItem(
     .eq('id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null)
-    .select()
-    .single();
+    .select();
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     throw new Error(`Failed to update collection item: ${error.message}`);
@@ -1083,7 +1108,7 @@ export async function deleteItem(id: string, isPublished: boolean = false): Prom
   const now = new Date().toISOString();
 
   // Soft delete the collection item
-  const { error: itemError } = await client
+  let query = client
     .from('collection_items')
     .update({
       deleted_at: now,
@@ -1092,13 +1117,15 @@ export async function deleteItem(id: string, isPublished: boolean = false): Prom
     .eq('id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { error: itemError } = await query;
 
   if (itemError) {
     throw new Error(`Failed to delete collection item: ${itemError.message}`);
   }
 
   // Soft delete all collection_item_values for this item (same published state)
-  const { error: valuesError } = await client
+  let query1 = client
     .from('collection_item_values')
     .update({
       deleted_at: now,
@@ -1107,6 +1134,8 @@ export async function deleteItem(id: string, isPublished: boolean = false): Prom
     .eq('item_id', id)
     .eq('is_published', isPublished)
     .is('deleted_at', null);
+  query1 = (await applyTenantEq(query1)).query;
+  const { error: valuesError } = await query1;
 
   if (valuesError) {
     throw new Error(`Failed to delete collection item values: ${valuesError.message}`);
@@ -1127,11 +1156,13 @@ export async function hardDeleteItem(id: string, isPublished: boolean = false): 
     throw new Error('Supabase client not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('collection_items')
     .delete()
     .eq('id', id)
     .eq('is_published', isPublished);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to hard delete collection item: ${error.message}`);
@@ -1223,7 +1254,7 @@ export async function duplicateItem(itemId: string, isPublished: boolean = false
   const newId = randomUUID();
   const { data: newItem, error: itemError } = await client
     .from('collection_items')
-    .insert({
+    .insert(await stampTenantId({
       id: newId,
       collection_id: originalItem.collection_id,
       manual_order: originalItem.manual_order,
@@ -1231,7 +1262,7 @@ export async function duplicateItem(itemId: string, isPublished: boolean = false
       is_publishable: originalItem.is_publishable,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    })
+    }))
     .select()
     .single();
 
@@ -1258,7 +1289,7 @@ export async function duplicateItem(itemId: string, isPublished: boolean = false
   if (valuesToInsert.length > 0) {
     const { error: valuesError } = await client
       .from('collection_item_values')
-      .insert(valuesToInsert);
+      .insert(await stampTenantIdMany(valuesToInsert));
 
     if (valuesError) {
       // If values insertion fails, we should still return the item
@@ -1301,19 +1332,21 @@ export async function searchItems(
   // Search in item values
   const searchTerm = `%${query.toLowerCase()}%`;
 
-  const { data: matchingValues, error } = await client
+  let valuesQuery = client
     .from('collection_item_values')
     .select('item_id')
     .ilike('value', searchTerm)
     .eq('is_published', is_published)
     .is('deleted_at', null);
+  valuesQuery = (await applyTenantEq(valuesQuery)).query;
+  const { data: matchingValues, error } = await valuesQuery;
 
   if (error) {
     throw new Error(`Failed to search items: ${error.message}`);
   }
 
   // Get unique item IDs
-  const itemIds = [...new Set(matchingValues?.map(v => v.item_id) || [])];
+  const itemIds = [...new Set((matchingValues || []).map((v: { item_id: string }) => v.item_id))];
 
   // Filter items and get with values
   const filteredItems = items.filter(item => itemIds.includes(item.id));
@@ -1347,7 +1380,7 @@ export async function publishItem(id: string): Promise<CollectionItem> {
   // Upsert published version (composite key handles insert/update automatically)
   const { data, error } = await client
     .from('collection_items')
-    .upsert({
+    .upsert(await stampTenantId({
       id: draft.id, // Same UUID
       collection_id: draft.collection_id,
       manual_order: draft.manual_order,
@@ -1355,7 +1388,7 @@ export async function publishItem(id: string): Promise<CollectionItem> {
       is_published: true,
       created_at: draft.created_at,
       updated_at: new Date().toISOString(),
-    }, {
+    }), {
       onConflict: 'id,is_published', // Composite primary key
     }).select()
     .single();
@@ -1379,11 +1412,13 @@ export async function getTotalPublishableItemsCount(): Promise<number> {
     throw new Error('Supabase client not configured');
   }
 
-  const { data: collections, error: collectionsError } = await client
+  let query = client
     .from('collections')
     .select('id')
     .eq('is_published', false)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: collections, error: collectionsError } = await query;
 
   if (collectionsError) {
     throw new Error(`Failed to fetch collections: ${collectionsError.message}`);
@@ -1401,7 +1436,7 @@ export async function getTotalPublishableItemsCount(): Promise<number> {
     let offset = 0;
 
     while (true) {
-      let query = client
+      let query1 = client
         .from('collection_items')
         .select('id, manual_order')
         .in('collection_id', collectionIds)
@@ -1410,10 +1445,12 @@ export async function getTotalPublishableItemsCount(): Promise<number> {
         .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
 
       if (!isPublished) {
-        query = query.eq('is_publishable', true).is('deleted_at', null);
+        query1 = query1.eq('is_publishable', true).is('deleted_at', null);
       }
 
-      const { data, error } = await query;
+      query1 = (await applyTenantEq(query1)).query;
+
+      const { data, error } = await query1;
       if (error) {
         throw new Error(`Failed to fetch ${isPublished ? 'published' : 'draft'} items: ${error.message}`);
       }
@@ -1529,18 +1566,22 @@ export async function unpublishSingleItem(itemId: string): Promise<void> {
   if (!client) throw new Error('Supabase client not configured');
 
   // Delete published row (CASCADE deletes published values)
-  await client
+  let query = client
     .from('collection_items')
     .delete()
     .eq('id', itemId)
     .eq('is_published', true);
+  query = (await applyTenantEq(query)).query;
+  await query;
 
   // Set draft as not publishable
-  await client
+  let query1 = client
     .from('collection_items')
     .update({ is_publishable: false, updated_at: new Date().toISOString() })
     .eq('id', itemId)
     .eq('is_published', false);
+  query1 = (await applyTenantEq(query1)).query;
+  await query1;
 }
 
 /**
@@ -1553,30 +1594,35 @@ export async function stageSingleItem(itemId: string): Promise<boolean> {
   if (!client) throw new Error('Supabase client not configured');
 
   // Check if a published version exists
-  const { data: published } = await client
+  let query = client
     .from('collection_items')
     .select('id')
     .eq('id', itemId)
-    .eq('is_published', true)
-    .maybeSingle();
+    .eq('is_published', true);
+  query = (await applyTenantEq(query)).query;
+  const { data: published } = await query.maybeSingle();
 
   const hadPublished = !!published;
 
   // Remove published version if it exists (CASCADE deletes published values)
   if (hadPublished) {
-    await client
+    let query1 = client
       .from('collection_items')
       .delete()
       .eq('id', itemId)
       .eq('is_published', true);
+    query1 = (await applyTenantEq(query1)).query;
+    await query1;
   }
 
   // Set draft as publishable
-  await client
+  let query2 = client
     .from('collection_items')
     .update({ is_publishable: true, updated_at: new Date().toISOString() })
     .eq('id', itemId)
     .eq('is_published', false);
+  query2 = (await applyTenantEq(query2)).query;
+  await query2;
 
   return hadPublished;
 }
@@ -1590,13 +1636,14 @@ export async function publishSingleItem(itemId: string): Promise<void> {
   if (!client) throw new Error('Supabase client not configured');
 
   // Get draft item
-  const { data: draftItem, error: draftErr } = await client
+  let query = client
     .from('collection_items')
     .select('*')
     .eq('id', itemId)
     .eq('is_published', false)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: draftItem, error: draftErr } = await query.single();
 
   if (draftErr || !draftItem) {
     throw new Error('Draft item not found');
@@ -1606,11 +1653,13 @@ export async function publishSingleItem(itemId: string): Promise<void> {
 
   // Ensure draft is marked publishable
   if (!draftItem.is_publishable) {
-    await client
+    let query1 = client
       .from('collection_items')
       .update({ is_publishable: true, updated_at: now })
       .eq('id', itemId)
       .eq('is_published', false);
+    query1 = (await applyTenantEq(query1)).query;
+    await query1;
   }
 
   // Ensure published fields exist (values FK requires them)
@@ -1635,13 +1684,13 @@ export async function publishSingleItem(itemId: string): Promise<void> {
     }));
     await client
       .from('collection_fields')
-      .upsert(fieldsToUpsert, { onConflict: 'id,is_published' });
+      .upsert(await stampTenantIdMany(fieldsToUpsert), { onConflict: 'id,is_published' });
   }
 
   // Upsert published item row
   await client
     .from('collection_items')
-    .upsert({
+    .upsert(await stampTenantId({
       id: draftItem.id,
       collection_id: draftItem.collection_id,
       manual_order: draftItem.manual_order,
@@ -1650,7 +1699,7 @@ export async function publishSingleItem(itemId: string): Promise<void> {
       content_hash: draftItem.content_hash,
       created_at: draftItem.created_at,
       updated_at: now,
-    }, { onConflict: 'id,is_published' });
+    }), { onConflict: 'id,is_published' });
 
   // Copy draft values to published via existing publishValues utility
   const { publishValues } = await import('@/lib/repositories/collectionItemValueRepository');

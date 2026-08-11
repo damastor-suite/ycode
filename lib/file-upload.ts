@@ -7,6 +7,7 @@ import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { createAsset } from '@/lib/repositories/assetRepository';
 import { isAssetOfType } from './asset-utils';
 import { ASSET_CATEGORIES, STORAGE_BUCKET, generateStoragePath, getDisplayName } from '@/lib/asset-constants';
+import { resolveTenantId } from '@/lib/tenant';
 import sharp from 'sharp';
 import type { Asset } from '@/types';
 
@@ -261,7 +262,8 @@ export async function uploadFile(
     const effectiveFilename = webpConversion
       ? `${file.name.replace(/\.[^/.]+$/, '')}.${fileExtension}`
       : file.name;
-    const storagePath = generateStoragePath(effectiveFilename);
+    const tenantId = await resolveTenantId();
+    const storagePath = generateStoragePath(effectiveFilename, undefined, tenantId);
 
     const { data, error } = await supabase.storage
       .from(STORAGE_BUCKET)

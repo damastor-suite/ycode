@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, stampTenantId } from '@/lib/tenant';
 
 /**
  * App Settings Repository
@@ -34,11 +35,14 @@ export async function getAppSettings(appId: string): Promise<AppSetting[]> {
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('app_settings')
     .select('*')
     .eq('app_id', appId)
     .order('key', { ascending: true });
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch app settings: ${error.message}`);
@@ -60,12 +64,14 @@ export async function getAppSetting(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('app_settings')
     .select('*')
     .eq('app_id', appId)
-    .eq('key', key)
-    .single();
+    .eq('key', key);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to fetch app setting: ${error.message}`);
@@ -106,10 +112,13 @@ export async function getConnectedAppIds(): Promise<string[]> {
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('app_settings')
     .select('app_id')
     .order('app_id');
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch connected apps: ${error.message}`);
@@ -138,17 +147,16 @@ export async function setAppSetting(
     throw new Error('Supabase client not configured');
   }
 
+  const row = await stampTenantId({
+    app_id: appId,
+    key,
+    value,
+    updated_at: new Date().toISOString(),
+  });
+
   const { data, error } = await client
     .from('app_settings')
-    .upsert(
-      {
-        app_id: appId,
-        key,
-        value,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'app_id,key' }
-    )
+    .upsert(row, { onConflict: 'app_id,key' })
     .select()
     .single();
 
@@ -172,11 +180,14 @@ export async function deleteAppSetting(
     throw new Error('Supabase client not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('app_settings')
     .delete()
     .eq('app_id', appId)
     .eq('key', key);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete app setting: ${error.message}`);
@@ -193,10 +204,13 @@ export async function deleteAllAppSettings(appId: string): Promise<void> {
     throw new Error('Supabase client not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('app_settings')
     .delete()
     .eq('app_id', appId);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete app settings: ${error.message}`);

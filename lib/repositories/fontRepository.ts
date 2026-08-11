@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import { SUPABASE_QUERY_LIMIT, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
 import { cleanupOrphanedStorageFiles } from '@/lib/storage-utils';
 import { generateFontContentHash } from '@/lib/hash-utils';
@@ -14,13 +15,16 @@ export async function getAllFonts(): Promise<Font[]> {
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('fonts')
     .select('*')
     .eq('is_published', false)
     .is('deleted_at', null)
     .order('created_at', { ascending: true })
     .limit(SUPABASE_QUERY_LIMIT);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) throw new Error(`Failed to fetch fonts: ${error.message}`);
 
@@ -37,13 +41,16 @@ export async function getPublishedFonts(): Promise<Font[]> {
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('fonts')
     .select('*')
     .eq('is_published', true)
     .is('deleted_at', null)
     .order('created_at', { ascending: true })
     .limit(SUPABASE_QUERY_LIMIT);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) throw new Error(`Failed to fetch published fonts: ${error.message}`);
 
@@ -60,13 +67,15 @@ export async function getFontById(id: string): Promise<Font | null> {
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('fonts')
     .select('*')
     .eq('id', id)
     .eq('is_published', false)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to fetch font: ${error.message}`);
@@ -87,23 +96,25 @@ export async function createFont(fontData: CreateFontData): Promise<Font> {
 
   const contentHash = generateFontContentHash(fontData);
 
+  const row = await stampTenantId({
+    name: fontData.name,
+    family: fontData.family,
+    type: fontData.type,
+    variants: fontData.variants,
+    weights: fontData.weights,
+    category: fontData.category,
+    axes: fontData.axes ?? null,
+    kind: fontData.kind ?? null,
+    url: fontData.url ?? null,
+    storage_path: fontData.storage_path ?? null,
+    file_hash: fontData.file_hash ?? null,
+    content_hash: contentHash,
+    is_published: false,
+  });
+
   const { data, error } = await client
     .from('fonts')
-    .insert({
-      name: fontData.name,
-      family: fontData.family,
-      type: fontData.type,
-      variants: fontData.variants,
-      weights: fontData.weights,
-      category: fontData.category,
-      axes: fontData.axes ?? null,
-      kind: fontData.kind ?? null,
-      url: fontData.url ?? null,
-      storage_path: fontData.storage_path ?? null,
-      file_hash: fontData.file_hash ?? null,
-      content_hash: contentHash,
-      is_published: false,
-    })
+    .insert(row)
     .select()
     .single();
 
@@ -146,14 +157,15 @@ export async function updateFont(id: string, fontData: UpdateFontData): Promise<
     updatePayload.content_hash = generateFontContentHash(merged);
   }
 
-  const { data, error } = await client
+  let query = client
     .from('fonts')
     .update(updatePayload)
     .eq('id', id)
     .eq('is_published', false)
-    .is('deleted_at', null)
-    .select()
-    .single();
+    .is('deleted_at', null);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.select().single();
 
   if (error) throw new Error(`Failed to update font: ${error.message}`);
 
@@ -170,11 +182,14 @@ export async function deleteFont(id: string): Promise<void> {
     throw new Error('Supabase not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('fonts')
     .update({ deleted_at: new Date().toISOString() })
     .eq('id', id)
     .eq('is_published', false);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) throw new Error(`Failed to delete font: ${error.message}`);
 }
@@ -190,20 +205,26 @@ export async function getUnpublishedFonts(): Promise<Font[]> {
   }
 
   // Get all draft fonts (including soft-deleted ones for cleanup)
-  const { data: draftFonts, error: draftError } = await client
+  let draftQuery = client
     .from('fonts')
     .select('*')
     .eq('is_published', false)
     .limit(SUPABASE_QUERY_LIMIT);
 
+  draftQuery = (await applyTenantEq(draftQuery)).query;
+  const { data: draftFonts, error: draftError } = await draftQuery;
+
   if (draftError) throw new Error(`Failed to fetch draft fonts: ${draftError.message}`);
 
   // Get all published fonts
-  const { data: publishedFonts, error: publishedError } = await client
+  let publishedQuery = client
     .from('fonts')
     .select('*')
     .eq('is_published', true)
     .limit(SUPABASE_QUERY_LIMIT);
+
+  publishedQuery = (await applyTenantEq(publishedQuery)).query;
+  const { data: publishedFonts, error: publishedError } = await publishedQuery;
 
   if (publishedError) throw new Error(`Failed to fetch published fonts: ${publishedError.message}`);
 
@@ -231,20 +252,26 @@ export async function publishFonts(): Promise<{ added: number; updated: number; 
   const stats = { added: 0, updated: 0, deleted: 0 };
 
   // Get all draft fonts
-  const { data: draftFonts, error: draftError } = await client
+  let draftQuery = client
     .from('fonts')
     .select('*')
     .eq('is_published', false)
     .limit(SUPABASE_QUERY_LIMIT);
 
+  draftQuery = (await applyTenantEq(draftQuery)).query;
+  const { data: draftFonts, error: draftError } = await draftQuery;
+
   if (draftError) throw new Error(`Failed to fetch draft fonts: ${draftError.message}`);
 
   // Get all published fonts
-  const { data: publishedFonts, error: publishedError } = await client
+  let publishedQuery = client
     .from('fonts')
     .select('*')
     .eq('is_published', true)
     .limit(SUPABASE_QUERY_LIMIT);
+
+  publishedQuery = (await applyTenantEq(publishedQuery)).query;
+  const { data: publishedFonts, error: publishedError } = await publishedQuery;
 
   if (publishedError) throw new Error(`Failed to fetch published fonts: ${publishedError.message}`);
 
@@ -295,7 +322,7 @@ export async function publishFonts(): Promise<{ added: number; updated: number; 
 
   // Upsert changed fonts in batches
   for (let i = 0; i < toUpsert.length; i += SUPABASE_WRITE_BATCH_SIZE) {
-    const batch = toUpsert.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
+    const batch = await stampTenantIdMany(toUpsert.slice(i, i + SUPABASE_WRITE_BATCH_SIZE));
     const { error } = await client
       .from('fonts')
       .upsert(batch, { onConflict: 'id,is_published' });
@@ -309,22 +336,28 @@ export async function publishFonts(): Promise<{ added: number; updated: number; 
 
   if (deletedDraftIds.length > 0) {
     // Delete from published
-    const { error: deletePublishedError } = await client
+    let deletePublishedQuery = client
       .from('fonts')
       .delete()
       .in('id', deletedDraftIds)
       .eq('is_published', true);
+
+    deletePublishedQuery = (await applyTenantEq(deletePublishedQuery)).query;
+    const { error: deletePublishedError } = await deletePublishedQuery;
 
     if (deletePublishedError) {
       throw new Error(`Failed to delete published fonts: ${deletePublishedError.message}`);
     }
 
     // Hard-delete from draft
-    const { error: deleteDraftError } = await client
+    let deleteDraftQuery = client
       .from('fonts')
       .delete()
       .in('id', deletedDraftIds)
       .eq('is_published', false);
+
+    deleteDraftQuery = (await applyTenantEq(deleteDraftQuery)).query;
+    const { error: deleteDraftError } = await deleteDraftQuery;
 
     if (deleteDraftError) {
       throw new Error(`Failed to hard-delete draft fonts: ${deleteDraftError.message}`);
@@ -340,11 +373,14 @@ export async function publishFonts(): Promise<{ added: number; updated: number; 
 
   if (orphanedPublished.length > 0) {
     const orphanIds = orphanedPublished.map(f => f.id);
-    const { error } = await client
+    let orphanQuery = client
       .from('fonts')
       .delete()
       .in('id', orphanIds)
       .eq('is_published', true);
+
+    orphanQuery = (await applyTenantEq(orphanQuery)).query;
+    const { error } = await orphanQuery;
 
     if (error) throw new Error(`Failed to delete orphaned published fonts: ${error.message}`);
     stats.deleted += orphanedPublished.length;

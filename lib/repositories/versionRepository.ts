@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, stampTenantId } from '@/lib/tenant';
 import type { Version, CreateVersionData, VersionEntityType, VersionHistoryItem } from '@/types';
 
 /**
@@ -25,22 +26,24 @@ export async function createVersion(data: CreateVersionData): Promise<Version> {
   // Enforce version limit (keep only MAX_VERSIONS_PER_ENTITY - 1 to make room for new version)
   await enforceVersionLimit(data.entity_type, data.entity_id, MAX_VERSIONS_PER_ENTITY - 1);
 
+  const row = await stampTenantId({
+    entity_type: data.entity_type,
+    entity_id: data.entity_id,
+    action_type: data.action_type,
+    description: data.description || null,
+    redo: data.redo,
+    undo: data.undo || null,
+    snapshot: data.snapshot || null,
+    previous_hash: data.previous_hash || null,
+    current_hash: data.current_hash,
+    session_id: data.session_id || null,
+    metadata: data.metadata || null,
+  });
+
   // Insert new version
   const { data: result, error } = await client
     .from('versions')
-    .insert({
-      entity_type: data.entity_type,
-      entity_id: data.entity_id,
-      action_type: data.action_type,
-      description: data.description || null,
-      redo: data.redo,
-      undo: data.undo || null,
-      snapshot: data.snapshot || null,
-      previous_hash: data.previous_hash || null,
-      current_hash: data.current_hash,
-      session_id: data.session_id || null,
-      metadata: data.metadata || null,
-    })
+    .insert(row)
     .select()
     .single();
 
@@ -66,13 +69,16 @@ export async function getVersionHistory(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('versions')
     .select('*')
     .eq('entity_type', entityType)
     .eq('entity_id', entityId)
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch version history: ${error.message}`);
@@ -95,13 +101,16 @@ export async function getVersionHistorySummary(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('versions')
     .select('id, action_type, description, created_at')
     .eq('entity_type', entityType)
     .eq('entity_id', entityId)
     .order('created_at', { ascending: false })
     .limit(limit);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch version history summary: ${error.message}`);
@@ -120,11 +129,13 @@ export async function getVersionById(id: string): Promise<Version | null> {
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('versions')
     .select('*')
-    .eq('id', id)
-    .single();
+    .eq('id', id);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -149,14 +160,16 @@ export async function getLatestVersion(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('versions')
     .select('*')
     .eq('entity_type', entityType)
     .eq('entity_id', entityId)
     .order('created_at', { ascending: false })
-    .limit(1)
-    .single();
+    .limit(1);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -181,11 +194,14 @@ export async function getVersionCount(
     throw new Error('Supabase not configured');
   }
 
-  const { count, error } = await client
+  let query = client
     .from('versions')
     .select('*', { count: 'exact', head: true })
     .eq('entity_type', entityType)
     .eq('entity_id', entityId);
+
+  query = (await applyTenantEq(query)).query;
+  const { count, error } = await query;
 
   if (error) {
     throw new Error(`Failed to count versions: ${error.message}`);
@@ -218,15 +234,17 @@ export async function getLatestSnapshot(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('versions')
     .select('*')
     .eq('entity_type', entityType)
     .eq('entity_id', entityId)
     .not('snapshot', 'is', null)
     .order('created_at', { ascending: false })
-    .limit(1)
-    .single();
+    .limit(1);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -257,19 +275,25 @@ export async function enforceVersionLimit(
 
   // If specific entity provided, cleanup only that entity
   if (entityType && entityId) {
-    const { data: allVersions } = await client
+    let listQuery = client
       .from('versions')
       .select('id')
       .eq('entity_type', entityType)
       .eq('entity_id', entityId)
       .order('created_at', { ascending: false });
 
+    listQuery = (await applyTenantEq(listQuery)).query;
+    const { data: allVersions } = await listQuery;
+
     if (allVersions && allVersions.length > maxVersions) {
       const idsToDelete = allVersions.slice(maxVersions).map(v => v.id);
-      const { error: deleteError } = await client
+      let deleteQuery = client
         .from('versions')
         .delete()
         .in('id', idsToDelete);
+
+      deleteQuery = (await applyTenantEq(deleteQuery)).query;
+      const { error: deleteError } = await deleteQuery;
 
       if (!deleteError) {
         totalDeleted = idsToDelete.length;
@@ -280,9 +304,12 @@ export async function enforceVersionLimit(
   }
 
   // Otherwise, cleanup all entities
-  const { data: entities } = await client
+  let entitiesQuery = client
     .from('versions')
     .select('entity_type, entity_id');
+
+  entitiesQuery = (await applyTenantEq(entitiesQuery)).query;
+  const { data: entities } = await entitiesQuery;
 
   if (!entities) {
     return 0;
@@ -323,11 +350,13 @@ export async function cleanupOldVersions(
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
 
-  const { data: oldVersions, error: oldError } = await client
+  let deleteQuery = client
     .from('versions')
     .delete()
-    .lt('created_at', cutoffDate.toISOString())
-    .select('id');
+    .lt('created_at', cutoffDate.toISOString());
+
+  deleteQuery = (await applyTenantEq(deleteQuery)).query;
+  const { data: oldVersions, error: oldError } = await deleteQuery.select('id');
 
   if (oldError) {
     console.error('Failed to cleanup old versions:', oldError);
@@ -352,11 +381,14 @@ export async function getVersionsBySession(sessionId: string): Promise<Version[]
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('versions')
     .select('*')
     .eq('session_id', sessionId)
     .order('created_at', { ascending: true });
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch versions by session: ${error.message}`);
@@ -379,11 +411,14 @@ export async function deleteVersionsForEntity(
     throw new Error('Supabase not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('versions')
     .delete()
     .eq('entity_type', entityType)
     .eq('entity_id', entityId);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete versions: ${error.message}`);

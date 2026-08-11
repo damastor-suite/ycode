@@ -13,6 +13,7 @@
 
 import { cache } from 'react';
 import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import type {
   GlobalVariable,
   CreateGlobalVariableData,
@@ -50,13 +51,16 @@ export const getAllGlobalVariables = cache(async (
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('global_variables')
     .select('*')
     .eq('is_published', isPublished)
     .is('deleted_at', null)
     .order('order', { ascending: true })
     .order('created_at', { ascending: true });
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch global variables: ${error.message}`);
@@ -75,13 +79,15 @@ export async function getGlobalVariableById(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('global_variables')
     .select('*')
     .eq('id', id)
     .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -105,27 +111,31 @@ export async function createGlobalVariable(
   // Append at end unless an explicit order was provided
   let order = variableData.order;
   if (order === undefined) {
-    const { data: maxRow } = await client
+    let maxQuery = client
       .from('global_variables')
       .select('order')
       .eq('is_published', false)
       .order('order', { ascending: false })
-      .limit(1)
-      .single();
+      .limit(1);
+
+    maxQuery = (await applyTenantEq(maxQuery)).query;
+    const { data: maxRow } = await maxQuery.single();
     order = (maxRow?.order ?? -1) + 1;
   }
 
+  const row = await stampTenantId({
+    name: variableData.name,
+    key: variableData.key ?? null,
+    type: variableData.type,
+    value: variableData.value ?? null,
+    data: variableData.data ?? {},
+    order,
+    is_published: false,
+  });
+
   const { data, error } = await client
     .from('global_variables')
-    .insert({
-      name: variableData.name,
-      key: variableData.key ?? null,
-      type: variableData.type,
-      value: variableData.value ?? null,
-      data: variableData.data ?? {},
-      order,
-      is_published: false,
-    })
+    .insert(row)
     .select()
     .single();
 
@@ -146,13 +156,14 @@ export async function updateGlobalVariable(
     throw new Error('Supabase not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('global_variables')
     .update({ ...updates, updated_at: new Date().toISOString() })
     .eq('id', id)
-    .eq('is_published', false) // Update draft only
-    .select()
-    .single();
+    .eq('is_published', false); // Update draft only
+
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.select().single();
 
   if (error) {
     throw new Error(`Failed to update global variable: ${error.message}`);
@@ -174,11 +185,14 @@ export async function softDeleteGlobalVariable(id: string): Promise<void> {
     throw new Error('Supabase not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('global_variables')
     .update({ deleted_at: new Date().toISOString() })
     .eq('id', id)
     .eq('is_published', false);
+
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete global variable: ${error.message}`);
@@ -197,10 +211,13 @@ export async function getUnpublishedGlobalVariables(): Promise<GlobalVariable[]>
     throw new Error('Supabase not configured');
   }
 
-  const { data: drafts, error } = await client
+  let draftQuery = client
     .from('global_variables')
     .select('*')
     .eq('is_published', false);
+
+  draftQuery = (await applyTenantEq(draftQuery)).query;
+  const { data: drafts, error } = await draftQuery;
 
   if (error) {
     throw new Error(`Failed to fetch draft global variables: ${error.message}`);
@@ -210,11 +227,14 @@ export async function getUnpublishedGlobalVariables(): Promise<GlobalVariable[]>
     return [];
   }
 
-  const { data: published } = await client
+  let publishedQuery = client
     .from('global_variables')
     .select('*')
     .in('id', drafts.map((d) => d.id))
     .eq('is_published', true);
+
+  publishedQuery = (await applyTenantEq(publishedQuery)).query;
+  const { data: published } = await publishedQuery;
 
   const publishedById = new Map<string, GlobalVariable>(
     (published || []).map((p) => [p.id, p])
@@ -260,10 +280,13 @@ export async function publishGlobalVariables(): Promise<{ count: number; changed
     throw new Error('Supabase not configured');
   }
 
-  const { data: drafts, error } = await client
+  let draftQuery = client
     .from('global_variables')
     .select('*')
     .eq('is_published', false);
+
+  draftQuery = (await applyTenantEq(draftQuery)).query;
+  const { data: drafts, error } = await draftQuery;
 
   if (error) {
     throw new Error(`Failed to fetch draft global variables: ${error.message}`);
@@ -273,11 +296,14 @@ export async function publishGlobalVariables(): Promise<{ count: number; changed
     return { count: 0, changedIds: [] };
   }
 
-  const { data: published } = await client
+  let publishedQuery = client
     .from('global_variables')
     .select('*')
     .in('id', drafts.map((d) => d.id))
     .eq('is_published', true);
+
+  publishedQuery = (await applyTenantEq(publishedQuery)).query;
+  const { data: published } = await publishedQuery;
 
   const publishedById = new Map<string, GlobalVariable>(
     (published || []).map((p) => [p.id, p])
@@ -313,9 +339,10 @@ export async function publishGlobalVariables(): Promise<{ count: number; changed
   }
 
   if (toUpsert.length > 0) {
+    const stamped = await stampTenantIdMany(toUpsert);
     const { error: upsertError } = await client
       .from('global_variables')
-      .upsert(toUpsert, { onConflict: 'id,is_published' });
+      .upsert(stamped, { onConflict: 'id,is_published' });
 
     if (upsertError) {
       throw new Error(`Failed to publish global variables: ${upsertError.message}`);
@@ -323,11 +350,14 @@ export async function publishGlobalVariables(): Promise<{ count: number; changed
   }
 
   if (deletedIds.length > 0) {
-    const { error: deleteError } = await client
+    let deleteQuery = client
       .from('global_variables')
       .delete()
       .in('id', deletedIds)
       .eq('is_published', true);
+
+    deleteQuery = (await applyTenantEq(deleteQuery)).query;
+    const { error: deleteError } = await deleteQuery;
 
     if (deleteError) {
       throw new Error(`Failed to remove published global variables: ${deleteError.message}`);
@@ -349,11 +379,14 @@ export async function hardDeleteSoftDeletedGlobalVariables(): Promise<{ count: n
     throw new Error('Supabase not configured');
   }
 
-  const { data: deletedDrafts, error } = await client
+  let selectQuery = client
     .from('global_variables')
     .select('id')
     .eq('is_published', false)
     .not('deleted_at', 'is', null);
+
+  selectQuery = (await applyTenantEq(selectQuery)).query;
+  const { data: deletedDrafts, error } = await selectQuery;
 
   if (error) {
     throw new Error(`Failed to fetch deleted draft global variables: ${error.message}`);
@@ -365,10 +398,13 @@ export async function hardDeleteSoftDeletedGlobalVariables(): Promise<{ count: n
 
   const ids = deletedDrafts.map((d) => d.id);
 
-  const { error: deleteError } = await client
+  let deleteQuery = client
     .from('global_variables')
     .delete()
     .in('id', ids);
+
+  deleteQuery = (await applyTenantEq(deleteQuery)).query;
+  const { error: deleteError } = await deleteQuery;
 
   if (deleteError) {
     throw new Error(`Failed to hard delete global variables: ${deleteError.message}`);

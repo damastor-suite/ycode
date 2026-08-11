@@ -1,4 +1,5 @@
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
+import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { applyTenantEq, resolveTenantId, stampTenantId, stampTenantIdMany } from '@/lib/tenant';
 import { SUPABASE_QUERY_LIMIT } from '@/lib/supabase-constants';
 import { getKnexClient } from '@/lib/knex-client';
 import type { CollectionItemValue, CollectionFieldType } from '@/types';
@@ -25,11 +26,13 @@ async function updateContentHash(itemId: string, isPublished: boolean, hash: str
   const client = await getSupabaseAdmin();
   if (!client) throw new Error('Supabase client not configured');
 
-  const { error } = await client
+  let query = client
     .from('collection_items')
     .update({ content_hash: hash, updated_at: new Date().toISOString() })
     .eq('id', itemId)
     .eq('is_published', isPublished);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) throw new Error(`Failed to update content_hash: ${error.message}`);
 }
@@ -69,7 +72,7 @@ export async function insertValuesBulk(
 
   const { error } = await client
     .from('collection_item_values')
-    .insert(valuesToInsert);
+    .insert(await stampTenantIdMany(valuesToInsert));
 
   if (error) {
     throw new Error(`Failed to bulk insert values: ${error.message}`);
@@ -87,7 +90,7 @@ export async function insertValuesDirectPg(
   if (values.length === 0) return;
 
   const knex = await getKnexClient();
-  const tenantId = await getTenantIdFromHeaders();
+  const tenantId = await resolveTenantId();
   const now = new Date().toISOString();
   const rows = values.map(v => ({
     id: randomUUID(),
@@ -97,6 +100,7 @@ export async function insertValuesDirectPg(
     is_published: v.is_published ?? false,
     created_at: now,
     updated_at: now,
+    ...(tenantId ? { tenant_id: tenantId } : {}),
   }));
 
   await knex.transaction(async (trx) => {
@@ -176,6 +180,7 @@ export async function getValuesByItemIds(
         if (safeFieldIds) {
           q = q.in('field_id', safeFieldIds);
         }
+        q = (await applyTenantEq(q)).query;
         const { data, error } = await q.limit(5000);
 
         if (error) {
@@ -206,10 +211,12 @@ export async function getValuesByItemIds(
   if (!fieldTypeMap) {
     fieldTypeMap = {};
     if (discoveredFieldIds.size > 0) {
-      const { data: fields } = await client
+      let query1 = client
         .from('collection_fields')
         .select('id, type')
         .in('id', Array.from(discoveredFieldIds));
+      query1 = (await applyTenantEq(query1)).query;
+      const { data: fields } = await query1;
 
       fields?.forEach((f: any) => { fieldTypeMap![f.id] = f.type; });
     }
@@ -248,7 +255,7 @@ export async function getValueRowsForItems(
 
   try {
     const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+    const resolvedTenantId = await resolveTenantId(tenantId);
     let query = knex('collection_item_values')
       .select('id', 'item_id', 'field_id', 'value', 'created_at')
       .whereIn('item_id', itemIds)
@@ -271,7 +278,7 @@ export async function getValueRowsForItems(
       const chunkIds = itemIds.slice(i, i + ITEM_CHUNK);
       let offset = 0;
       while (true) {
-        const { data, error } = await client
+        let query1 = client
           .from('collection_item_values')
           .select('id, item_id, field_id, value, created_at')
           .in('item_id', chunkIds)
@@ -279,6 +286,8 @@ export async function getValueRowsForItems(
           .is('deleted_at', null)
           .order('id', { ascending: true })
           .range(offset, offset + PAGE_SIZE - 1);
+        query1 = (await applyTenantEq(query1, tenantId)).query;
+        const { data, error } = await query1;
 
         if (error) throw new Error(`Failed to fetch item values: ${error.message}`);
 
@@ -318,13 +327,15 @@ export async function getValueMapByFieldIds(
   let hasMore = true;
 
   while (hasMore) {
-    const { data, error } = await client
+    let query = client
       .from('collection_item_values')
       .select('item_id, field_id, value')
       .in('field_id', fieldIds)
       .eq('is_published', false)
       .is('deleted_at', null)
       .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
+    query = (await applyTenantEq(query)).query;
+    const { data, error } = await query;
 
     if (error) {
       throw new Error(`Failed to fetch field values: ${error.message}`);
@@ -361,12 +372,14 @@ export async function getValuesByItemId(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_item_values')
     .select('*')
     .eq('item_id', item_id)
     .eq('is_published', is_published)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch item values: ${error.message}`);
@@ -390,12 +403,14 @@ export async function getValuesByFieldId(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_item_values')
     .select('*')
     .eq('field_id', field_id)
     .eq('is_published', is_published)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch field values: ${error.message}`);
@@ -421,14 +436,15 @@ export async function getValue(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_item_values')
     .select('*')
     .eq('item_id', item_id)
     .eq('field_id', field_id)
     .eq('is_published', is_published)
-    .is('deleted_at', null)
-    .single();
+    .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to fetch value: ${error.message}`);
@@ -460,7 +476,7 @@ export async function setValue(
   const existing = await getValue(item_id, field_id, is_published);
   if (existing) {
     // Update existing value
-    const { data, error } = await client
+    let query = client
       .from('collection_item_values')
       .update({
         value,
@@ -468,8 +484,9 @@ export async function setValue(
       })
       .eq('id', existing.id)
       .eq('is_published', is_published)
-      .select()
-      .single();
+      .select();
+    query = (await applyTenantEq(query)).query;
+    const { data, error } = await query.single();
 
     if (error) {
       throw new Error(`Failed to update value: ${error.message}`);
@@ -480,7 +497,7 @@ export async function setValue(
     // Create new value
     const { data, error } = await client
       .from('collection_item_values')
-      .insert({
+      .insert(await stampTenantId({
         id: randomUUID(),
         item_id,
         field_id,
@@ -488,7 +505,7 @@ export async function setValue(
         is_published,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      })
+      }))
       .select()
       .single();
 
@@ -557,12 +574,14 @@ export async function setValuesByFieldName(
 
   // Get field mappings to validate field IDs and get types
   // Fields are fetched with the same is_published status as the values
-  const { data: fields, error } = await client
+  let query = client
     .from('collection_fields')
     .select('id, type, key')
     .eq('collection_id', collection_id)
     .eq('is_published', is_published)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { data: fields, error } = await query;
 
   if (error) {
     throw new Error(`Failed to fetch fields: ${error.message}`);
@@ -667,7 +686,7 @@ export async function deleteValue(
     throw new Error('Supabase client not configured');
   }
 
-  const { error } = await client
+  let query = client
     .from('collection_item_values')
     .update({
       deleted_at: new Date().toISOString(),
@@ -677,6 +696,8 @@ export async function deleteValue(
     .eq('field_id', field_id)
     .eq('is_published', is_published)
     .is('deleted_at', null);
+  query = (await applyTenantEq(query)).query;
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete value: ${error.message}`);
@@ -701,13 +722,15 @@ export async function clearValuesForField(
   }
 
   const now = new Date().toISOString();
-  const { data, error } = await client
+  let query = client
     .from('collection_item_values')
     .update({ deleted_at: now, updated_at: now })
     .eq('field_id', field_id)
     .eq('value', value)
     .is('deleted_at', null)
     .select('id');
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to clear values: ${error.message}`);
@@ -735,7 +758,7 @@ export async function renameValuesForField(
     throw new Error('Supabase client not configured');
   }
 
-  const { data, error } = await client
+  let query = client
     .from('collection_item_values')
     .update({
       value: new_value,
@@ -745,6 +768,8 @@ export async function renameValuesForField(
     .eq('value', old_value)
     .is('deleted_at', null)
     .select('id');
+  query = (await applyTenantEq(query)).query;
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to rename values: ${error.message}`);
@@ -789,7 +814,7 @@ export async function publishValues(item_id: string): Promise<number> {
   // Batch upsert all values
   const { error } = await client
     .from('collection_item_values')
-    .upsert(valuesToUpsert, {
+    .upsert(await stampTenantIdMany(valuesToUpsert), {
       onConflict: 'id,is_published', // Composite primary key
     });
 
