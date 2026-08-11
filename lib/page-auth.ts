@@ -1,5 +1,6 @@
 import type { Page, PageFolder } from '@/types';
 import { createHmac, randomUUID } from 'crypto';
+import { addTenantFilter } from '@/lib/knex-helpers';
 import { getDbOrNull } from '@/lib/platform/db';
 
 /**
@@ -202,8 +203,11 @@ export async function fetchFoldersForAuth(isPublished: boolean): Promise<PageFol
   const db = await getDbOrNull();
   if (!db) return [];
 
-  return db<PageFolder>('page_folders')
+  let query = db<PageFolder>('page_folders')
     .select('*')
     .where('is_published', isPublished)
     .whereNull('deleted_at');
+  query = await addTenantFilter(db, query, 'page_folders');
+
+  return query;
 }
