@@ -3,6 +3,7 @@ import { getKnexClient } from '@/lib/knex-client';
 import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { STORAGE_BUCKET } from '@/lib/asset-constants';
 import { clearAllCache } from '@/lib/services/cacheService';
+import { isCloudVersion } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -12,9 +13,17 @@ export const revalidate = 0;
  *
  * DANGEROUS: Deletes all tables in the public schema and empties storage buckets.
  * Authentication enforced by proxy.
+ * Forbidden in cloud (shared Supabase) — would wipe every website.
  */
 export async function POST() {
   try {
+    if (isCloudVersion() || process.env.SKIP_SETUP === 'true') {
+      return NextResponse.json(
+        { error: 'Database reset is disabled in multi-tenant cloud environments' },
+        { status: 403 }
+      );
+    }
+
     console.log('[POST /ycode/api/devtools/reset-db] Starting database reset...');
 
     const knex = await getKnexClient();

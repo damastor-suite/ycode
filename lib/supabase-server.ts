@@ -1,10 +1,9 @@
-import { AsyncLocalStorage } from 'async_hooks';
-
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { credentials } from './credentials';
 import { parseSupabaseConfig } from './supabase-config-parser';
 import type { SupabaseConfig, SupabaseCredentials } from '@/types';
 import { withLimit } from './supabase-limiter';
+import { runWithTenantId, tenantStore } from '@/lib/tenant-context';
 
 /**
  * Supabase Server Client
@@ -13,16 +12,7 @@ import { withLimit } from './supabase-limiter';
  * Credentials are fetched from file-based storage or environment variables
  */
 
-/**
- * Explicit tenant context for code running outside of a Next.js request
- * (e.g. fire-and-forget webhook processing where headers() is unavailable).
- */
-export const tenantStore = new AsyncLocalStorage<string>();
-
-/** Run an async function with an explicit tenant context. */
-export function runWithTenantId<T>(tenantId: string, fn: () => Promise<T>): Promise<T> {
-  return tenantStore.run(tenantId, fn);
-}
+export { runWithTenantId, tenantStore };
 
 /**
  * Get Supabase credentials from storage
@@ -127,13 +117,15 @@ export async function testSupabaseConnection(
 }
 
 /**
- * Get tenant ID from request headers.
+ * Get tenant ID from request context.
  *
- * Base implementation: always returns null (single-tenant, no scoping needed).
- * Overridden via path alias in multi-tenant deployments.
+ * Base implementation: reads AsyncLocalStorage (runWithTenantId) only.
+ * Opensource has no x-tenant-id proxy, so returns null outside ALS.
+ * Overridden via path alias in multi-tenant deployments to also read
+ * the x-tenant-id request header (and still honor tenantStore).
  */
 export async function getTenantIdFromHeaders(): Promise<string | null> {
-  return null;
+  return tenantStore.getStore() ?? null;
 }
 
 /**

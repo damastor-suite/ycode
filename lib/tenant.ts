@@ -6,13 +6,11 @@
  * jobs use runWithTenantId() which populates tenantStore.
  */
 
-import {
-  getTenantIdFromHeaders,
-  tenantStore,
-} from '@/lib/supabase-server';
+import { tenantStore } from '@/lib/tenant-context';
 
 /**
  * Resolve active tenant id: explicit arg → ALS store → request headers.
+ * Header lookup is dynamic to avoid pulling server-only modules into unit tests.
  */
 export async function resolveTenantId(
   explicit?: string | null
@@ -26,7 +24,12 @@ export async function resolveTenantId(
     return fromStore;
   }
 
-  return getTenantIdFromHeaders();
+  try {
+    const { getTenantIdFromHeaders } = await import('@/lib/supabase-server');
+    return getTenantIdFromHeaders();
+  } catch {
+    return null;
+  }
 }
 
 /**

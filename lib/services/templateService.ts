@@ -4,6 +4,8 @@ import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
 import { migrations } from '../migrations-loader';
 import { guardKnexForMigrationReplay } from '@/lib/migration-replay-guard';
 import { YCODE_EXTERNAL_API_URL } from '@/lib/config';
+import { clearContentTables } from '@/lib/tenant-content';
+import { resolveTenantId } from '@/lib/tenant';
 
 /**
  * Tables to truncate when applying a template.
@@ -166,11 +168,13 @@ async function copyTemplateAssetsToUserStorage(knex: ReturnType<typeof getKnexCl
       const blob = await response.blob();
       const buffer = Buffer.from(await blob.arrayBuffer());
 
-      // Generate unique storage path
+      // Generate unique storage path (tenant-prefixed in shared DB)
       const timestamp = Date.now();
       const random = Math.random().toString(36).substring(2, 15);
       const extension = asset.filename.split('.').pop() || 'bin';
-      const storagePath = `${STORAGE_FOLDERS.WEBSITE}/${timestamp}-${random}.${extension}`;
+      const tenantId = await resolveTenantId();
+      const tenantPrefix = tenantId ? `tenants/${tenantId}/` : '';
+      const storagePath = `${tenantPrefix}${STORAGE_FOLDERS.WEBSITE}/${timestamp}-${random}.${extension}`;
 
       // Upload to user's storage
       const { data, error } = await supabase.storage
@@ -237,7 +241,9 @@ async function copyTemplateAssetsToUserStorage(knex: ReturnType<typeof getKnexCl
         const timestamp = Date.now();
         const random = Math.random().toString(36).substring(2, 15);
         const extension = font.kind || 'woff2';
-        const storagePath = `${STORAGE_FOLDERS.WEBSITE}/fonts/${timestamp}-${random}.${extension}`;
+        const tenantId = await resolveTenantId();
+        const tenantPrefix = tenantId ? `tenants/${tenantId}/` : '';
+        const storagePath = `${tenantPrefix}${STORAGE_FOLDERS.WEBSITE}/fonts/${timestamp}-${random}.${extension}`;
 
         const { data, error } = await supabase.storage
           .from(STORAGE_BUCKET)
@@ -407,17 +413,8 @@ export async function applyTemplate(
         `);
       }
 
-      // 2c. Truncate content tables (only tables that exist)
-      const existingTables: string[] = [];
-      for (const table of TABLES_TO_TRUNCATE) {
-        const exists = await trx.schema.hasTable(table);
-        if (exists) {
-          existingTables.push(table);
-        }
-      }
-      if (existingTables.length > 0) {
-        await trx.raw(`TRUNCATE ${existingTables.join(', ')} CASCADE;`);
-      }
+      // 2c. Clear content tables (tenant-scoped DELETE in shared DB, TRUNCATE in OSS)
+      await clearContentTables(trx, TABLES_TO_TRUNCATE, tenantId);
 
       // 2d. Insert template data
       await trx.raw(sql.insert);

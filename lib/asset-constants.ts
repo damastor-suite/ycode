@@ -97,12 +97,21 @@ export function getAcceptString(category?: AssetCategory): string {
   return ALLOWED_MIME_TYPES[category].join(',');
 }
 
-/** Generate a unique storage path for a file upload */
-export function generateStoragePath(filename: string, folder: string = STORAGE_FOLDERS.WEBSITE): string {
+/**
+ * Generate a unique storage path for a file upload.
+ * When tenantId is set, prefixes with tenants/{tenantId}/ for shared-bucket isolation.
+ */
+export function generateStoragePath(
+  filename: string,
+  folder?: string,
+  tenantId?: string | null
+): string {
+  const resolvedFolder = folder || STORAGE_FOLDERS.WEBSITE;
   const timestamp = Date.now();
   const random = Math.random().toString(36).substring(2, 15);
   const fileExtension = filename.split('.').pop() || '';
-  return `${folder}/${timestamp}-${random}.${fileExtension}`;
+  const prefix = tenantId ? `tenants/${tenantId}/` : '';
+  return `${prefix}${resolvedFolder}/${timestamp}-${random}.${fileExtension}`;
 }
 
 /** Extract the display name from a filename (strip extension) */

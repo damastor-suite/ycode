@@ -12,6 +12,8 @@ import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
 import { migrations } from '../migrations-loader';
 import { guardKnexForMigrationReplay } from '@/lib/migration-replay-guard';
+import { clearContentTables } from '@/lib/tenant-content';
+import { resolveTenantId, stampTenantIdMany } from '@/lib/tenant';
 
 /**
  * Tables in FK-safe order (parents before children).
@@ -597,11 +599,13 @@ export async function processInParallel<T, R>(
 }
 
 /** Generate a unique storage path for an uploaded asset. */
-export function generateStoragePath(originalPath: string): string {
+export async function generateStoragePath(originalPath: string): Promise<string> {
   const extension = originalPath.split('.').pop() || 'bin';
   const timestamp = Date.now();
   const random = Math.random().toString(36).substring(2, 15);
-  return `${STORAGE_FOLDERS.WEBSITE}/${timestamp}-${random}.${extension}`;
+  const tenantId = await resolveTenantId();
+  const prefix = tenantId ? `tenants/${tenantId}/` : '';
+  return `${prefix}${STORAGE_FOLDERS.WEBSITE}/${timestamp}-${random}.${extension}`;
 }
 
 // ─── Asset File Helpers ──────────────────────────────────────────────
@@ -655,7 +659,7 @@ export async function restoreAssetFiles(
   const pathUpdates = await processInParallel(files, async (file): Promise<{ oldPath: string; newPath: string; publicUrl: string } | null> => {
     try {
       const buffer = Buffer.from(file.base64, 'base64');
-      const newPath = generateStoragePath(file.storagePath);
+      const newPath = await generateStoragePath(file.storagePath);
 
       const { data, error } = await client.storage
         .from(STORAGE_BUCKET)
@@ -832,9 +836,9 @@ export async function importProject(
       await trx.raw('SET session_replication_role = replica');
 
       const existingTables = TABLES_TO_TRUNCATE.filter(t => schema.tables.has(t));
-      if (existingTables.length > 0) {
-        await trx.raw(`TRUNCATE ${existingTables.join(', ')} CASCADE;`);
-      }
+      await clearContentTables(trx, existingTables);
+
+      const importTenantId = await resolveTenantId();
 
       for (const table of CONTENT_TABLES) {
         const rows = data[table];
@@ -843,8 +847,12 @@ export async function importProject(
 
         const jsonCols = schema.jsonColumns.get(table);
         const serialized = rows.map(r => serializeJsonColumns(r, jsonCols));
-        for (let i = 0; i < serialized.length; i += BATCH_SIZE) {
-          const batch = serialized.slice(i, i + BATCH_SIZE);
+        const stamped = await stampTenantIdMany(
+          serialized as Record<string, unknown>[],
+          importTenantId
+        );
+        for (let i = 0; i < stamped.length; i += BATCH_SIZE) {
+          const batch = stamped.slice(i, i + BATCH_SIZE);
           await trx(table).insert(batch);
         }
       }
