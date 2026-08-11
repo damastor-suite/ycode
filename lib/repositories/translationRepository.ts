@@ -1,13 +1,12 @@
-/**
- * Translation Repository
- *
- * Data access layer for translations
- * Supports draft/published workflow with composite primary key (id, is_published)
- */
-
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
-import { fetchAllRows } from '@/lib/supabase-constants';
-import { getKnexClient } from '@/lib/knex-client';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  chunkArray,
+  getConflictColumns,
+  normalizeRow,
+  normalizeRows,
+} from './knex-repository-utils';
 import type { Translation, CreateTranslationData, UpdateTranslationData } from '@/types';
 
 type TranslationDiffRow = Pick<
@@ -15,306 +14,188 @@ type TranslationDiffRow = Pick<
   'id' | 'content_value' | 'is_completed' | 'deleted_at'
 >;
 
-/**
- * Fetch every translation row (including soft-deleted) for one publish state in
- * a single direct-DB (Knex) query. Replaces paginated PostgREST reads that
- * issued ~one round-trip per 1000 rows when diffing large catalogues during
- * publish. Falls back to paginated PostgREST on error.
- *
- * @param columns - SELECT list; pass a narrow set for diff/count callers.
- */
+const PAGE_SIZE = 1000;
+const IN_CHUNK_SIZE = 300;
+const SLUG_CONTENT_KEYS = ['slug', 'field:key:slug'];
+const NON_CMS_SOURCE_TYPES = ['page', 'folder', 'component'];
+
 export async function getAllTranslationRows<T = Translation>(
   isPublished: boolean,
   columns: string[] = ['*'],
-  tenantId?: string,
+  tenantId?: string
 ): Promise<T[]> {
-  try {
-    const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
-    let query = knex('translations').select(columns).where('is_published', isPublished);
-    if (resolvedTenantId) {
-      query = query.where('tenant_id', resolvedTenantId);
-    }
-    return await query as T[];
-  } catch {
-    const client = await getSupabaseAdmin(tenantId);
-    if (!client) return [];
-    const select = columns.includes('*') ? '*' : columns.join(', ');
-    return await fetchAllRows<T>((from, to) =>
-      client.from('translations').select(select).eq('is_published', isPublished).order('id', { ascending: true }).range(from, to) as unknown as PromiseLike<{ data: T[] | null; error: unknown }>,
-    );
-  }
+  const knex = await getDb();
+  let query = knex('translations')
+    .select(columns)
+    .where('is_published', isPublished);
+  query = await applyTenantFilter(knex, query, 'translations', tenantId);
+
+  return normalizeRows(await query) as T[];
 }
 
-/**
- * Get all translations for a locale (draft by default). Pages through the
- * 1000-row PostgREST default so projects with large catalogues don't get
- * silently truncated.
- */
 export async function getTranslationsByLocale(
   localeId: string,
   isPublished: boolean = false,
   tenantId?: string
 ): Promise<Translation[]> {
-  const client = await getSupabaseAdmin(tenantId);
+  const knex = await getDb();
+  let query = knex('translations')
+    .select('*')
+    .where('locale_id', localeId)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at')
+    .orderBy('created_at', 'asc');
+  query = await applyTenantFilter(knex, query, 'translations', tenantId);
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    return normalizeRows(await query) as Translation[];
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch translations: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const PAGE_SIZE = 1000;
-  const results: Translation[] = [];
-
-  for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await client
-      .from('translations')
-      .select('*')
-      .eq('locale_id', localeId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .order('created_at', { ascending: true })
-      .range(from, from + PAGE_SIZE - 1);
-
-    if (error) {
-      throw new Error(`Failed to fetch translations: ${error.message}`);
-    }
-
-    if (!data || data.length === 0) break;
-    results.push(...(data as Translation[]));
-    if (data.length < PAGE_SIZE) break;
-  }
-
-  return results;
 }
 
-/**
- * Content keys that influence URL generation (page/folder/CMS slugs). Kept in
- * the per-locale "scaffold" so routing, hreflang and locale-switcher URLs work
- * without loading the full (CMS-content-heavy) translation catalogue.
- */
-const SLUG_CONTENT_KEYS = ['slug', 'field:key:slug'];
-
-/** Source types whose translations are small and always needed per render. */
-const NON_CMS_SOURCE_TYPES = ['page', 'folder', 'component'];
-
-/** Supabase caps `.in()` lists; chunk large id arrays to stay under it. */
-const IN_CHUNK_SIZE = 300;
-
-function chunkIds(ids: string[], size: number): string[][] {
-  const out: string[][] = [];
-  for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
-  return out;
-}
-
-/**
- * Load the per-locale translation "scaffold": every non-CMS translation
- * (page / folder / component) plus only the CMS *slug* rows.
- *
- * This is everything needed for routing, page/component rendering, SEO and
- * URL generation — but excludes the bulk CMS *content* translations (text /
- * rich text), which dominate large catalogues and are loaded on demand per
- * rendered item via {@link getCmsTranslationsForItems}.
- */
 export async function getLocaleScaffoldTranslations(
   localeId: string,
   isPublished: boolean,
-  tenantId?: string,
+  tenantId?: string
 ): Promise<Translation[]> {
-  const client = await getSupabaseAdmin(tenantId);
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const PAGE_SIZE = 1000;
+  const knex = await getDb();
   const results: Translation[] = [];
 
-  const pageThrough = async (
-    build: (from: number, to: number) => PromiseLike<{ data: Translation[] | null; error: { message: string } | null }>,
-  ) => {
-    for (let from = 0; ; from += PAGE_SIZE) {
-      const { data, error } = await build(from, from + PAGE_SIZE - 1);
-      if (error) throw new Error(`Failed to fetch translations: ${error.message}`);
-      if (!data || data.length === 0) break;
-      results.push(...(data as Translation[]));
-      if (data.length < PAGE_SIZE) break;
-    }
-  };
-
-  // Non-CMS rows (page / folder / component).
-  await pageThrough((from, to) =>
-    client
-      .from('translations')
+  try {
+    let nonCmsQuery = knex('translations')
       .select('*')
-      .eq('locale_id', localeId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .in('source_type', NON_CMS_SOURCE_TYPES)
-      .order('created_at', { ascending: true })
-      .range(from, to) as unknown as PromiseLike<{ data: Translation[] | null; error: { message: string } | null }>,
-  );
+      .where('locale_id', localeId)
+      .where('is_published', isPublished)
+      .whereNull('deleted_at')
+      .whereIn('source_type', NON_CMS_SOURCE_TYPES)
+      .orderBy('created_at', 'asc');
+    nonCmsQuery = await applyTenantFilter(knex, nonCmsQuery, 'translations', tenantId);
+    results.push(...normalizeRows(await nonCmsQuery) as Translation[]);
 
-  // CMS slug rows (needed to match/build localized dynamic-page URLs).
-  await pageThrough((from, to) =>
-    client
-      .from('translations')
+    let cmsSlugQuery = knex('translations')
       .select('*')
-      .eq('locale_id', localeId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .eq('source_type', 'cms')
-      .in('content_key', SLUG_CONTENT_KEYS)
-      .order('created_at', { ascending: true })
-      .range(from, to) as unknown as PromiseLike<{ data: Translation[] | null; error: { message: string } | null }>,
-  );
+      .where('locale_id', localeId)
+      .where('is_published', isPublished)
+      .whereNull('deleted_at')
+      .where('source_type', 'cms')
+      .whereIn('content_key', SLUG_CONTENT_KEYS)
+      .orderBy('created_at', 'asc');
+    cmsSlugQuery = await applyTenantFilter(knex, cmsSlugQuery, 'translations', tenantId);
+    results.push(...normalizeRows(await cmsSlugQuery) as Translation[]);
 
-  return results;
+    return results;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch translations: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
 }
 
-/**
- * Load CMS *content* translations for a specific set of collection items in a
- * locale. Used to augment the scaffold on demand for exactly the items a given
- * render path materialises, instead of loading the whole locale catalogue.
- */
 export async function getCmsTranslationsForItems(
   localeId: string,
   isPublished: boolean,
   itemIds: string[],
-  tenantId?: string,
+  tenantId?: string
 ): Promise<Translation[]> {
   if (itemIds.length === 0) return [];
 
-  const client = await getSupabaseAdmin(tenantId);
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const results: Translation[] = [];
 
-  for (const chunk of chunkIds(itemIds, IN_CHUNK_SIZE)) {
-    const { data, error } = await client
-      .from('translations')
-      .select('*')
-      .eq('locale_id', localeId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .eq('source_type', 'cms')
-      .in('source_id', chunk);
-
-    if (error) {
-      throw new Error(`Failed to fetch CMS translations: ${error.message}`);
+  try {
+    for (const itemIdChunk of chunkArray(itemIds, IN_CHUNK_SIZE)) {
+      let query = knex('translations')
+        .select('*')
+        .where('locale_id', localeId)
+        .where('is_published', isPublished)
+        .whereNull('deleted_at')
+        .where('source_type', 'cms')
+        .whereIn('source_id', itemIdChunk);
+      query = await applyTenantFilter(knex, query, 'translations', tenantId);
+      results.push(...normalizeRows(await query) as Translation[]);
     }
-    if (data) results.push(...(data as Translation[]));
-  }
 
-  return results;
+    return results;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch CMS translations: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
 }
 
-/**
- * Load only slug translations (page / folder / CMS) for a locale. Used by URL
- * builders (hreflang, sitemap, locale switcher) that never read CMS content —
- * avoids pulling the full catalogue just to construct localized URLs.
- */
 export async function getSlugTranslationsByLocale(
   localeId: string,
   isPublished: boolean,
-  tenantId?: string,
+  tenantId?: string
 ): Promise<Translation[]> {
-  const client = await getSupabaseAdmin(tenantId);
+  const knex = await getDb();
+  let query = knex('translations')
+    .select('*')
+    .where('locale_id', localeId)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at')
+    .whereIn('content_key', SLUG_CONTENT_KEYS)
+    .orderBy('created_at', 'asc');
+  query = await applyTenantFilter(knex, query, 'translations', tenantId);
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    return normalizeRows(await query) as Translation[];
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch slug translations: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const PAGE_SIZE = 1000;
-  const results: Translation[] = [];
-
-  for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await client
-      .from('translations')
-      .select('*')
-      .eq('locale_id', localeId)
-      .eq('is_published', isPublished)
-      .is('deleted_at', null)
-      .in('content_key', SLUG_CONTENT_KEYS)
-      .order('created_at', { ascending: true })
-      .range(from, from + PAGE_SIZE - 1);
-
-    if (error) {
-      throw new Error(`Failed to fetch slug translations: ${error.message}`);
-    }
-    if (!data || data.length === 0) break;
-    results.push(...(data as Translation[]));
-    if (data.length < PAGE_SIZE) break;
-  }
-
-  return results;
 }
 
-/**
- * Get translations by source (draft by default)
- */
 export async function getTranslationsBySource(
   sourceType: string,
   sourceId: string,
   isPublished: boolean = false
 ): Promise<Translation[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('translations')
+  const knex = await getDb();
+  let query = knex('translations')
     .select('*')
-    .eq('source_type', sourceType)
-    .eq('source_id', sourceId)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .order('created_at', { ascending: true });
+    .where('source_type', sourceType)
+    .where('source_id', sourceId)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at')
+    .orderBy('created_at', 'asc');
+  query = await applyTenantFilter(knex, query, 'translations');
 
-  if (error) {
-    throw new Error(`Failed to fetch translations: ${error.message}`);
+  try {
+    return normalizeRows(await query) as Translation[];
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch translations: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data || [];
 }
 
-/**
- * Get a single translation by ID (draft by default)
- */
 export async function getTranslationById(
   id: string,
   isPublished: boolean = false
 ): Promise<Translation | null> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('translations')
+  const knex = await getDb();
+  let query = knex('translations')
     .select('*')
-    .eq('id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .where('id', id)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at');
+  query = await applyTenantFilter(knex, query, 'translations');
 
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return null; // Not found
-    }
-    throw new Error(`Failed to fetch translation: ${error.message}`);
+  try {
+    const row = await query.first();
+    return row ? normalizeRow(row) as Translation : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch translation: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
-/**
- * Get a translation by locale and key parts (draft by default)
- */
 export async function getTranslationByKey(
   localeId: string,
   sourceType: string,
@@ -322,265 +203,211 @@ export async function getTranslationByKey(
   contentKey: string,
   isPublished: boolean = false
 ): Promise<Translation | null> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('translations')
+  const knex = await getDb();
+  let query = knex('translations')
     .select('*')
-    .eq('locale_id', localeId)
-    .eq('source_type', sourceType)
-    .eq('source_id', sourceId)
-    .eq('content_key', contentKey)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
+    .where('locale_id', localeId)
+    .where('source_type', sourceType)
+    .where('source_id', sourceId)
+    .where('content_key', contentKey)
+    .where('is_published', isPublished)
+    .whereNull('deleted_at');
+  query = await applyTenantFilter(knex, query, 'translations');
 
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return null; // Not found
-    }
-    throw new Error(`Failed to fetch translation: ${error.message}`);
+  try {
+    const row = await query.first();
+    return row ? normalizeRow(row) as Translation : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch translation: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
-/**
- * Create a new translation (draft by default)
- * Uses upsert to handle existing translations
- */
 export async function createTranslation(
   translationData: CreateTranslationData
 ): Promise<Translation> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  const row = await buildTranslationRow(knex, translationData);
+  const conflictColumns = await getConflictColumns(
+    knex,
+    'translations',
+    ['locale_id', 'source_type', 'source_id', 'content_key', 'is_published'],
+    (row as Record<string, unknown>).tenant_id as string | undefined
+  );
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    const [data] = await knex('translations')
+      .insert(row)
+      .onConflict(conflictColumns)
+      .merge([
+        'content_type',
+        'content_value',
+        'is_completed',
+        'deleted_at',
+        'updated_at',
+      ])
+      .returning('*');
+
+    return normalizeRow(data) as Translation;
+  } catch (error) {
+    throw new Error(
+      `Failed to create translation: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('translations')
-    .upsert(
-      {
-        locale_id: translationData.locale_id,
-        source_type: translationData.source_type,
-        source_id: translationData.source_id,
-        content_key: translationData.content_key,
-        content_type: translationData.content_type,
-        content_value: translationData.content_value,
-        is_completed: translationData.is_completed ?? false,
-        is_published: false,
-        deleted_at: null, // Restore if previously deleted
-      },
-      {
-        onConflict: 'locale_id,source_type,source_id,content_key,is_published',
-      }
-    )
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to create translation: ${error.message}`);
-  }
-
-  return data;
 }
 
-/**
- * Update a translation (draft only)
- */
 export async function updateTranslation(
   id: string,
   updates: UpdateTranslationData
 ): Promise<Translation> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('translations')
+  const knex = await getDb();
+  let query = knex('translations')
+    .where('id', id)
+    .where('is_published', false)
     .update({
       ...updates,
-      deleted_at: null, // Restore if previously deleted
+      deleted_at: null,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', id)
-    .eq('is_published', false)
-    .select()
-    .single();
+    .returning('*');
+  query = await applyTenantFilter(knex, query, 'translations');
 
-  if (error) {
-    throw new Error(`Failed to update translation: ${error.message}`);
+  try {
+    const [data] = await query;
+    if (!data) {
+      throw new Error('Translation not found');
+    }
+    return normalizeRow(data) as Translation;
+  } catch (error) {
+    throw new Error(
+      `Failed to update translation: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
-/**
- * Delete a translation (soft delete - sets deleted_at timestamp)
- */
 export async function deleteTranslation(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('translations')
+    .where('id', id)
+    .where('is_published', false)
+    .update({ deleted_at: new Date().toISOString() });
+  query = await applyTenantFilter(knex, query, 'translations');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { error } = await client
-    .from('translations')
-    .update({ deleted_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('is_published', false);
-
-  if (error) {
-    throw new Error(`Failed to delete translation: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete translation: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Delete translations in bulk (soft delete - sets deleted_at timestamp)
- * Only deletes draft versions
- *
- * @param sourceType - Type of source (page, folder, component, cms)
- * @param sourceIds - Single source ID or array of source IDs
- * @param contentKeys - Optional. Specific content keys to delete. If not provided, deletes all translations for the source(s).
- */
 export async function deleteTranslationsInBulk(
   sourceType: string,
   sourceIds: string | string[],
   contentKeys?: string[]
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  // Normalize sourceIds to array
   const sourceIdArray = Array.isArray(sourceIds) ? sourceIds : [sourceIds];
+  if (sourceIdArray.length === 0) return;
+  if (contentKeys !== undefined && contentKeys.length === 0) return;
 
-  // If no source IDs, nothing to delete
-  if (sourceIdArray.length === 0) {
-    return;
-  }
+  const knex = await getDb();
+  let query = knex('translations')
+    .where('source_type', sourceType)
+    .whereIn('source_id', sourceIdArray)
+    .where('is_published', false)
+    .update({ deleted_at: new Date().toISOString() });
 
-  // If contentKeys provided but empty, nothing to delete
-  if (contentKeys !== undefined && contentKeys.length === 0) {
-    return;
-  }
-
-  // Build the base query
-  let query = client
-    .from('translations')
-    .update({ deleted_at: new Date().toISOString() })
-    .eq('source_type', sourceType)
-    .in('source_id', sourceIdArray)
-    .eq('is_published', false);
-
-  // Add content_key filter if specific keys provided
   if (contentKeys !== undefined) {
-    query = query.in('content_key', contentKeys);
+    query = query.whereIn('content_key', contentKeys);
   }
 
-  const { error } = await query;
+  query = await applyTenantFilter(knex, query, 'translations');
 
-  if (error) {
-    throw new Error(`Failed to delete translations: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete translations: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Mark translations as incomplete when source content changes
- */
 export async function markTranslationsIncomplete(
   sourceType: string,
   sourceId: string,
   contentKeys: string[]
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
   if (contentKeys.length === 0) {
-    return; // Nothing to update
+    return;
   }
 
-  const { error } = await client
-    .from('translations')
+  const knex = await getDb();
+  let query = knex('translations')
+    .where('source_type', sourceType)
+    .where('source_id', sourceId)
+    .whereIn('content_key', contentKeys)
+    .where('is_published', false)
+    .whereNull('deleted_at')
     .update({
       is_completed: false,
       updated_at: new Date().toISOString(),
-    })
-    .eq('source_type', sourceType)
-    .eq('source_id', sourceId)
-    .in('content_key', contentKeys)
-    .eq('is_published', false)
-    .is('deleted_at', null);
+    });
+  query = await applyTenantFilter(knex, query, 'translations');
 
-  if (error) {
-    throw new Error(`Failed to mark translations as incomplete: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to mark translations as incomplete: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Upsert multiple translations (draft by default)
- * Uses batch upsert for efficiency
- */
 export async function upsertTranslations(
   translations: CreateTranslationData[]
 ): Promise<Translation[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
+  if (translations.length === 0) {
+    return [];
   }
 
-  const translationsToUpsert = translations.map((t) => ({
-    locale_id: t.locale_id,
-    source_type: t.source_type,
-    source_id: t.source_id,
-    content_key: t.content_key,
-    content_type: t.content_type,
-    content_value: t.content_value,
-    // Without this, the DB default (false) keeps batch translations hidden on
-    // the live site, which only renders completed translations.
-    is_completed: t.is_completed ?? false,
-    is_published: false,
-    deleted_at: null, // Restore if previously deleted
-  }));
+  const knex = await getDb();
+  const rows = await Promise.all(translations.map((translation) => buildTranslationRow(knex, translation)));
+  const conflictColumns = await getConflictColumns(
+    knex,
+    'translations',
+    ['locale_id', 'source_type', 'source_id', 'content_key', 'is_published'],
+    (rows[0] as Record<string, unknown>).tenant_id as string | undefined
+  );
 
-  const { data, error } = await client
-    .from('translations')
-    .upsert(translationsToUpsert, {
-      onConflict: 'locale_id,source_type,source_id,content_key,is_published',
-    })
-    .select();
+  try {
+    const result: Translation[] = [];
+    for (const rowChunk of chunkArray(rows, PAGE_SIZE)) {
+      const data = await knex('translations')
+        .insert(rowChunk)
+        .onConflict(conflictColumns)
+        .merge([
+          'content_type',
+          'content_value',
+          'is_completed',
+          'deleted_at',
+          'updated_at',
+        ])
+        .returning('*');
+      result.push(...normalizeRows(data) as Translation[]);
+    }
 
-  if (error) {
-    throw new Error(`Failed to upsert translations: ${error.message}`);
+    return result;
+  } catch (error) {
+    throw new Error(
+      `Failed to upsert translations: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data || [];
 }
 
-/**
- * Count translations needing publish: drafts with no published counterpart,
- * pending soft-deletes, or rows whose content_value/is_completed differs from
- * published. Mirrors the diff logic in `publishLocalisation` so the preview
- * matches what will actually publish. Paginates both sides to avoid the
- * 1000-row PostgREST default silently truncating the count.
- */
 export async function getUnpublishedTranslationsCount(): Promise<number> {
   const cols = ['id', 'content_value', 'is_completed', 'deleted_at'];
-
   const [draftRows, publishedRows] = await Promise.all([
     getAllTranslationRows<TranslationDiffRow>(false, cols),
     getAllTranslationRows<TranslationDiffRow>(true, cols),
@@ -591,31 +418,49 @@ export async function getUnpublishedTranslationsCount(): Promise<number> {
   }
 
   const publishedById = new Map<string, TranslationDiffRow>();
-  for (const t of publishedRows) {
-    publishedById.set(t.id, t);
+  for (const translation of publishedRows) {
+    publishedById.set(translation.id, translation);
   }
 
   let count = 0;
   for (const draft of draftRows) {
-    const pub = publishedById.get(draft.id);
+    const published = publishedById.get(draft.id);
 
-    if (!pub || pub.deleted_at) {
-      if (!draft.deleted_at) count++;
+    if (!published || published.deleted_at) {
+      if (!draft.deleted_at) count += 1;
       continue;
     }
 
     if (draft.deleted_at) {
-      count++;
+      count += 1;
       continue;
     }
 
     if (
-      draft.content_value !== pub.content_value ||
-      draft.is_completed !== pub.is_completed
+      draft.content_value !== published.content_value ||
+      draft.is_completed !== published.is_completed
     ) {
-      count++;
+      count += 1;
     }
   }
 
   return count;
+}
+
+async function buildTranslationRow(
+  knex: Awaited<ReturnType<typeof getDb>>,
+  translationData: CreateTranslationData
+): Promise<Record<string, unknown>> {
+  return addTenantIdToRow(knex, 'translations', {
+    locale_id: translationData.locale_id,
+    source_type: translationData.source_type,
+    source_id: translationData.source_id,
+    content_key: translationData.content_key,
+    content_type: translationData.content_type,
+    content_value: translationData.content_value,
+    is_completed: translationData.is_completed ?? false,
+    is_published: false,
+    deleted_at: null,
+    updated_at: new Date().toISOString(),
+  });
 }

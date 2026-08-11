@@ -1,6 +1,13 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { createHash, randomBytes } from 'crypto';
+
 import { invalidateToken } from '@/lib/mcp/token-cache';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  normalizeRow,
+  normalizeRows,
+} from './knex-repository-utils';
 
 export interface McpToken {
   id: string;
@@ -34,8 +41,20 @@ export interface CreateOAuthTokenData {
   refresh_token_ttl_seconds?: number;
 }
 
-const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 60 * 60; // 1 hour
-const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
+const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const TOKEN_COLUMNS = [
+  'id',
+  'name',
+  'token_prefix',
+  'is_active',
+  'last_used_at',
+  'created_at',
+  'updated_at',
+  'oauth_client_id',
+  'expires_at',
+  'user_id',
+];
 
 function generateToken(): string {
   return 'ymc_' + randomBytes(24).toString('hex');
@@ -45,240 +64,217 @@ function generateRefreshToken(): string {
   return 'ymr_' + randomBytes(32).toString('hex');
 }
 
-/**
- * Hash a refresh token with SHA-256 before storing. We only ever hand the
- * plaintext value back to the OAuth client once at issue time; the database
- * keeps the hash so a DB leak can't be replayed against `/oauth/token`.
- */
 function hashRefreshToken(refreshToken: string): string {
   return createHash('sha256').update(refreshToken).digest('hex');
 }
 
 export async function getAllTokens(): Promise<McpToken[]> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('mcp_tokens')
+    .select(TOKEN_COLUMNS)
+    .orderBy('created_at', 'desc');
+  query = await applyTenantFilter(knex, query, 'mcp_tokens');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    return normalizeRows(await query) as McpToken[];
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch MCP tokens: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('mcp_tokens')
-    .select('id, name, token_prefix, is_active, last_used_at, created_at, updated_at, oauth_client_id, expires_at, user_id')
-    .order('created_at', { ascending: false });
-
-  if (error) {
-    throw new Error(`Failed to fetch MCP tokens: ${error.message}`);
-  }
-
-  return data || [];
 }
 
 export async function createToken(name: string): Promise<McpTokenWithPlainToken> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const token = generateToken();
-  const tokenPrefix = token.substring(0, 12);
+  const now = new Date().toISOString();
+  const row = await addTenantIdToRow(knex, 'mcp_tokens', {
+    name,
+    token,
+    token_prefix: token.substring(0, 12),
+    created_at: now,
+    updated_at: now,
+  });
 
-  const { data, error } = await client
-    .from('mcp_tokens')
-    .insert({
-      name,
-      token,
-      token_prefix: tokenPrefix,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .select('id, name, token, token_prefix, is_active, last_used_at, created_at, updated_at, oauth_client_id, expires_at, user_id')
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to create MCP token: ${error.message}`);
+  try {
+    const [data] = await knex('mcp_tokens')
+      .insert(row)
+      .returning([...TOKEN_COLUMNS, 'token']);
+    return normalizeRow(data) as McpTokenWithPlainToken;
+  } catch (error) {
+    throw new Error(
+      `Failed to create MCP token: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
-/**
- * Validate a token and return the record if active and not expired.
- * Updates last_used_at in the background.
- */
 export async function validateToken(token: string): Promise<McpToken | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('mcp_tokens')
+    .select(TOKEN_COLUMNS)
+    .where('token', token)
+    .where('is_active', true);
+  query = await applyTenantFilter(knex, query, 'mcp_tokens');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  try {
+    const data = await query.first();
+    if (!data) {
+      return null;
+    }
 
-  const { data, error } = await client
-    .from('mcp_tokens')
-    .select('id, name, token_prefix, is_active, last_used_at, created_at, updated_at, oauth_client_id, expires_at, user_id')
-    .eq('token', token)
-    .eq('is_active', true)
-    .single();
+    const record = normalizeRow(data) as McpToken;
+    if (record.expires_at && new Date(record.expires_at).getTime() < Date.now()) {
+      return null;
+    }
 
-  if (error || !data) {
+    let updateQuery = knex('mcp_tokens')
+      .where('id', record.id)
+      .update({ last_used_at: new Date().toISOString() });
+    updateQuery = await applyTenantFilter(knex, updateQuery, 'mcp_tokens');
+    await updateQuery;
+
+    return record;
+  } catch {
     return null;
   }
-
-  if (data.expires_at && new Date(data.expires_at).getTime() < Date.now()) {
-    return null;
-  }
-
-  await client
-    .from('mcp_tokens')
-    .update({ last_used_at: new Date().toISOString() })
-    .eq('id', data.id);
-
-  return data;
 }
 
 export async function deleteToken(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data: existing } = await client
-    .from('mcp_tokens')
+  const knex = await getDb();
+  let existingQuery = knex('mcp_tokens')
     .select('token')
-    .eq('id', id)
-    .single();
+    .where('id', id);
+  existingQuery = await applyTenantFilter(knex, existingQuery, 'mcp_tokens');
+  const existing = await existingQuery.first() as { token?: string } | undefined;
 
-  const { error } = await client
-    .from('mcp_tokens')
-    .delete()
-    .eq('id', id);
+  let deleteQuery = knex('mcp_tokens')
+    .where('id', id)
+    .del();
+  deleteQuery = await applyTenantFilter(knex, deleteQuery, 'mcp_tokens');
 
-  if (error) {
-    throw new Error(`Failed to delete MCP token: ${error.message}`);
-  }
-
-  if (existing?.token) {
-    invalidateToken(existing.token);
+  try {
+    await deleteQuery;
+    if (existing?.token) {
+      invalidateToken(existing.token);
+    }
+  } catch (error) {
+    throw new Error(
+      `Failed to delete MCP token: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
 export async function getTokenById(id: string): Promise<McpToken | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('mcp_tokens')
+    .select(TOKEN_COLUMNS)
+    .where('id', id);
+  query = await applyTenantFilter(knex, query, 'mcp_tokens');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    const data = await query.first();
+    return data ? normalizeRow(data) as McpToken : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch MCP token: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('mcp_tokens')
-    .select('id, name, token_prefix, is_active, last_used_at, created_at, updated_at, oauth_client_id, expires_at, user_id')
-    .eq('id', id)
-    .single();
-
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch MCP token: ${error.message}`);
-  }
-
-  return data;
 }
 
-/**
- * Issue an OAuth-bound MCP token pair (access + refresh).
- * Both tokens are random opaque strings stored alongside their TTLs.
- */
 export async function createOAuthToken(
-  data: CreateOAuthTokenData,
+  data: CreateOAuthTokenData
 ): Promise<OAuthTokenPair> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const accessTtl = data.access_token_ttl_seconds ?? DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
   const refreshTtl = data.refresh_token_ttl_seconds ?? DEFAULT_REFRESH_TOKEN_TTL_SECONDS;
-
   const token = generateToken();
   const refreshToken = generateRefreshToken();
   const now = Date.now();
-  const expiresAt = new Date(now + accessTtl * 1000).toISOString();
-  const refreshExpiresAt = new Date(now + refreshTtl * 1000).toISOString();
-  const tokenPrefix = token.substring(0, 12);
+  const createdAt = new Date(now).toISOString();
+  const row = await addTenantIdToRow(knex, 'mcp_tokens', {
+    name: data.name,
+    token,
+    token_prefix: token.substring(0, 12),
+    oauth_client_id: data.oauth_client_id,
+    user_id: data.user_id,
+    expires_at: new Date(now + accessTtl * 1000).toISOString(),
+    refresh_token_hash: hashRefreshToken(refreshToken),
+    refresh_expires_at: new Date(now + refreshTtl * 1000).toISOString(),
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
 
-  const { error } = await client
-    .from('mcp_tokens')
-    .insert({
-      name: data.name,
-      token,
-      token_prefix: tokenPrefix,
-      oauth_client_id: data.oauth_client_id,
-      user_id: data.user_id,
-      expires_at: expiresAt,
-      refresh_token_hash: hashRefreshToken(refreshToken),
-      refresh_expires_at: refreshExpiresAt,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-
-  if (error) {
-    throw new Error(`Failed to create OAuth MCP token: ${error.message}`);
+  try {
+    await knex('mcp_tokens').insert(row);
+    return {
+      access_token: token,
+      refresh_token: refreshToken,
+      expires_in: accessTtl,
+      refresh_expires_in: refreshTtl,
+    };
+  } catch (error) {
+    throw new Error(
+      `Failed to create OAuth MCP token: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return {
-    access_token: token,
-    refresh_token: refreshToken,
-    expires_in: accessTtl,
-    refresh_expires_in: refreshTtl,
-  };
 }
 
-/**
- * Rotate a refresh token: validate the old one, issue a fresh access+refresh
- * pair, and revoke the old token row. Returns null if the refresh token is
- * unknown, revoked, or expired.
- */
 export async function rotateRefreshToken(
   refreshToken: string,
-  options?: { access_token_ttl_seconds?: number; refresh_token_ttl_seconds?: number },
+  options?: { access_token_ttl_seconds?: number; refresh_token_ttl_seconds?: number }
 ): Promise<OAuthTokenPair | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('mcp_tokens')
+    .select('id', 'name', 'token', 'oauth_client_id', 'user_id', 'refresh_expires_at', 'is_active')
+    .where('refresh_token_hash', hashRefreshToken(refreshToken))
+    .where('is_active', true);
+  query = await applyTenantFilter(knex, query, 'mcp_tokens');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  try {
+    const existing = await query.first() as {
+      id: string;
+      name: string;
+      token: string | null;
+      oauth_client_id: string | null;
+      user_id: string | null;
+      refresh_expires_at: string | Date | null;
+      is_active: boolean;
+    } | undefined;
 
-  const { data: existing, error: fetchError } = await client
-    .from('mcp_tokens')
-    .select('id, name, token, oauth_client_id, user_id, refresh_expires_at, is_active')
-    .eq('refresh_token_hash', hashRefreshToken(refreshToken))
-    .eq('is_active', true)
-    .single();
+    if (!existing) {
+      return null;
+    }
 
-  if (fetchError || !existing) {
+    const refreshExpiresAt = existing.refresh_expires_at instanceof Date
+      ? existing.refresh_expires_at.toISOString()
+      : existing.refresh_expires_at;
+
+    if (!refreshExpiresAt || new Date(refreshExpiresAt).getTime() < Date.now()) {
+      return null;
+    }
+
+    if (!existing.oauth_client_id || !existing.user_id) {
+      return null;
+    }
+
+    let deleteQuery = knex('mcp_tokens')
+      .where('id', existing.id)
+      .del();
+    deleteQuery = await applyTenantFilter(knex, deleteQuery, 'mcp_tokens');
+    await deleteQuery;
+
+    if (existing.token) {
+      invalidateToken(existing.token);
+    }
+
+    return createOAuthToken({
+      user_id: existing.user_id,
+      oauth_client_id: existing.oauth_client_id,
+      name: existing.name,
+      access_token_ttl_seconds: options?.access_token_ttl_seconds,
+      refresh_token_ttl_seconds: options?.refresh_token_ttl_seconds,
+    });
+  } catch {
     return null;
   }
-
-  if (!existing.refresh_expires_at
-      || new Date(existing.refresh_expires_at).getTime() < Date.now()) {
-    return null;
-  }
-
-  if (!existing.oauth_client_id || !existing.user_id) {
-    return null;
-  }
-
-  // Revoke the old token first so a leaked refresh token can't be reused.
-  await client.from('mcp_tokens').delete().eq('id', existing.id);
-  if (existing.token) {
-    invalidateToken(existing.token);
-  }
-
-  return createOAuthToken({
-    user_id: existing.user_id,
-    oauth_client_id: existing.oauth_client_id,
-    name: existing.name,
-    access_token_ttl_seconds: options?.access_token_ttl_seconds,
-    refresh_token_ttl_seconds: options?.refresh_token_ttl_seconds,
-  });
 }

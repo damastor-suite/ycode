@@ -1,14 +1,18 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  normalizeRow,
+  normalizeRows,
+  parseCount,
+  stripUndefined,
+} from './knex-repository-utils';
 
 /**
  * Webhook Repository
  *
  * Handles CRUD operations for webhooks and webhook delivery logs.
  */
-
-// =============================================================================
-// Types
-// =============================================================================
 
 export type WebhookEventType =
   | 'form.submitted'
@@ -24,9 +28,7 @@ export type WebhookEventType =
   | 'asset.deleted';
 
 export interface WebhookFilters {
-  /** Filter form.submitted events to a specific form */
   form_id?: string | null;
-  /** Filter collection_item.* events to a specific collection */
   collection_id?: string | null;
 }
 
@@ -90,372 +92,286 @@ export interface UpdateWebhookDeliveryData {
   duration_ms?: number;
 }
 
-// =============================================================================
-// Webhook CRUD Operations
-// =============================================================================
-
-/**
- * Get all webhooks
- */
 export async function getAllWebhooks(): Promise<Webhook[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { data, error } = await client
-    .from('webhooks')
+  const knex = await getDb();
+  let query = knex('webhooks')
     .select('*')
-    .order('created_at', { ascending: false });
+    .orderBy('created_at', 'desc');
+  query = await applyTenantFilter(knex, query, 'webhooks');
 
-  if (error) {
-    throw new Error(`Failed to fetch webhooks: ${error.message}`);
+  try {
+    return (normalizeRows(await query) as Record<string, unknown>[]).map(mapWebhookFromDb);
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch webhooks: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return (data || []).map(mapWebhookFromDb);
 }
 
-/**
- * Get webhook by ID
- */
 export async function getWebhookById(id: string): Promise<Webhook | null> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { data, error } = await client
-    .from('webhooks')
+  const knex = await getDb();
+  let query = knex('webhooks')
     .select('*')
-    .eq('id', id)
-    .single();
+    .where('id', id);
+  query = await applyTenantFilter(knex, query, 'webhooks');
 
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch webhook: ${error.message}`);
+  try {
+    const data = await query.first();
+    return data ? mapWebhookFromDb(normalizeRow(data) as Record<string, unknown>) : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch webhook: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data ? mapWebhookFromDb(data) : null;
 }
 
-/**
- * Get all enabled webhooks for a specific event type
- */
 export async function getWebhooksForEvent(eventType: WebhookEventType): Promise<Webhook[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { data, error } = await client
-    .from('webhooks')
+  const knex = await getDb();
+  let query = knex('webhooks')
     .select('*')
-    .eq('enabled', true);
+    .where('enabled', true);
+  query = await applyTenantFilter(knex, query, 'webhooks');
 
-  if (error) {
-    throw new Error(`Failed to fetch webhooks for event: ${error.message}`);
+  try {
+    return (normalizeRows(await query) as Record<string, unknown>[])
+      .map(mapWebhookFromDb)
+      .filter((webhook) => webhook.events.includes(eventType));
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch webhooks for event: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  // Filter by event type in JS to avoid PostgREST JSONB contains serialization issues
-  return (data || [])
-    .map(mapWebhookFromDb)
-    .filter((w) => w.events.includes(eventType));
 }
 
-/**
- * Create a new webhook
- */
 export async function createWebhook(webhookData: CreateWebhookData): Promise<Webhook> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  const now = new Date().toISOString();
+  const row = await addTenantIdToRow(knex, 'webhooks', {
+    name: webhookData.name,
+    url: webhookData.url,
+    secret: webhookData.secret || null,
+    events: webhookData.events,
+    filters: webhookData.filters || null,
+    enabled: true,
+    failure_count: 0,
+    created_at: now,
+    updated_at: now,
+  });
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    const [data] = await knex('webhooks')
+      .insert(row)
+      .returning('*');
+    return mapWebhookFromDb(normalizeRow(data) as Record<string, unknown>);
+  } catch (error) {
+    throw new Error(
+      `Failed to create webhook: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('webhooks')
-    .insert({
-      name: webhookData.name,
-      url: webhookData.url,
-      secret: webhookData.secret || null,
-      events: webhookData.events,
-      filters: webhookData.filters || null,
-      enabled: true,
-      failure_count: 0,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to create webhook: ${error.message}`);
-  }
-
-  return mapWebhookFromDb(data);
 }
 
-/**
- * Update a webhook
- */
 export async function updateWebhook(id: string, updates: UpdateWebhookData): Promise<Webhook> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const updateData: Record<string, unknown> = {
+  const knex = await getDb();
+  const updateData = stripUndefined({
+    name: updates.name,
+    url: updates.url,
+    secret: updates.secret,
+    events: updates.events,
+    filters: updates.filters,
+    enabled: updates.enabled,
     updated_at: new Date().toISOString(),
-  };
-
-  if (updates.name !== undefined) updateData.name = updates.name;
-  if (updates.url !== undefined) updateData.url = updates.url;
-  if (updates.secret !== undefined) updateData.secret = updates.secret;
-  if (updates.events !== undefined) updateData.events = updates.events;
-  if (updates.filters !== undefined) updateData.filters = updates.filters;
-  if (updates.enabled !== undefined) updateData.enabled = updates.enabled;
-
-  const { data, error } = await client
-    .from('webhooks')
+  });
+  let query = knex('webhooks')
+    .where('id', id)
     .update(updateData)
-    .eq('id', id)
-    .select()
-    .single();
+    .returning('*');
+  query = await applyTenantFilter(knex, query, 'webhooks');
 
-  if (error) {
-    throw new Error(`Failed to update webhook: ${error.message}`);
-  }
-
-  return mapWebhookFromDb(data);
-}
-
-/**
- * Delete a webhook
- */
-export async function deleteWebhook(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('webhooks')
-    .delete()
-    .eq('id', id);
-
-  if (error) {
-    throw new Error(`Failed to delete webhook: ${error.message}`);
-  }
-}
-
-/**
- * Update webhook trigger timestamp and reset failure count on success
- */
-export async function markWebhookTriggered(id: string, success: boolean): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  if (success) {
-    await client
-      .from('webhooks')
-      .update({
-        last_triggered_at: new Date().toISOString(),
-        failure_count: 0,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id);
-  } else {
-    // Increment failure count
-    await client.rpc('increment_webhook_failure_count', { webhook_id: id });
-  }
-}
-
-/**
- * Increment webhook failure count (called when delivery fails)
- */
-export async function incrementWebhookFailureCount(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Use raw SQL to increment
-  const { error } = await client
-    .from('webhooks')
-    .update({
-      failure_count: client.rpc('increment', { x: 1 }) as unknown as number,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', id);
-
-  // Fallback: fetch and update if rpc fails
-  if (error) {
-    const webhook = await getWebhookById(id);
-    if (webhook) {
-      await client
-        .from('webhooks')
-        .update({
-          failure_count: webhook.failure_count + 1,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', id);
+  try {
+    const [data] = await query;
+    if (!data) {
+      throw new Error('Webhook not found');
     }
+    return mapWebhookFromDb(normalizeRow(data) as Record<string, unknown>);
+  } catch (error) {
+    throw new Error(
+      `Failed to update webhook: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-// =============================================================================
-// Webhook Delivery Operations
-// =============================================================================
+export async function deleteWebhook(id: string): Promise<void> {
+  const knex = await getDb();
+  let query = knex('webhooks')
+    .where('id', id)
+    .del();
+  query = await applyTenantFilter(knex, query, 'webhooks');
 
-/**
- * Create a webhook delivery log entry
- */
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete webhook: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
+}
+
+export async function markWebhookTriggered(id: string, success: boolean): Promise<void> {
+  if (!success) {
+    await incrementWebhookFailureCount(id);
+    return;
+  }
+
+  const knex = await getDb();
+  let query = knex('webhooks')
+    .where('id', id)
+    .update({
+      last_triggered_at: new Date().toISOString(),
+      failure_count: 0,
+      updated_at: new Date().toISOString(),
+    });
+  query = await applyTenantFilter(knex, query, 'webhooks');
+  await query;
+}
+
+export async function incrementWebhookFailureCount(id: string): Promise<void> {
+  const knex = await getDb();
+  let query = knex('webhooks')
+    .where('id', id)
+    .update({
+      failure_count: knex.raw('COALESCE(failure_count, 0) + 1'),
+      updated_at: new Date().toISOString(),
+    });
+  query = await applyTenantFilter(knex, query, 'webhooks');
+
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to increment webhook failure count: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
+}
+
 export async function createWebhookDelivery(
   deliveryData: CreateWebhookDeliveryData
 ): Promise<WebhookDelivery> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  const row = await addTenantIdToRow(knex, 'webhook_deliveries', {
+    webhook_id: deliveryData.webhook_id,
+    event_type: deliveryData.event_type,
+    payload: deliveryData.payload,
+    status: deliveryData.status || 'pending',
+    attempts: deliveryData.attempts || 1,
+    created_at: new Date().toISOString(),
+  });
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    const [data] = await knex('webhook_deliveries')
+      .insert(row)
+      .returning('*');
+    return normalizeRow(data) as WebhookDelivery;
+  } catch (error) {
+    throw new Error(
+      `Failed to create webhook delivery: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('webhook_deliveries')
-    .insert({
-      webhook_id: deliveryData.webhook_id,
-      event_type: deliveryData.event_type,
-      payload: deliveryData.payload,
-      status: deliveryData.status || 'pending',
-      attempts: deliveryData.attempts || 1,
-      created_at: new Date().toISOString(),
-    })
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to create webhook delivery: ${error.message}`);
-  }
-
-  return data as WebhookDelivery;
 }
 
-/**
- * Update a webhook delivery
- */
 export async function updateWebhookDelivery(
   id: string,
   updates: UpdateWebhookDeliveryData
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('webhook_deliveries')
+    .where('id', id)
+    .update(updates);
+  query = await applyTenantFilter(knex, query, 'webhook_deliveries');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('webhook_deliveries')
-    .update(updates)
-    .eq('id', id);
-
-  if (error) {
-    throw new Error(`Failed to update webhook delivery: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to update webhook delivery: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Get deliveries for a specific webhook
- */
 export async function getWebhookDeliveries(
   webhookId: string,
   options: { limit?: number; offset?: number } = {}
 ): Promise<{ deliveries: WebhookDelivery[]; total: number }> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
+  const knex = await getDb();
   const limit = options.limit || 50;
   const offset = options.offset || 0;
 
-  // Get total count
-  const { count, error: countError } = await client
-    .from('webhook_deliveries')
-    .select('*', { count: 'exact', head: true })
-    .eq('webhook_id', webhookId);
+  let countQuery = knex('webhook_deliveries')
+    .where('webhook_id', webhookId)
+    .count<{ count: string | number }[]>({ count: '*' });
+  countQuery = await applyTenantFilter(knex, countQuery, 'webhook_deliveries');
 
-  if (countError) {
-    throw new Error(`Failed to count webhook deliveries: ${countError.message}`);
-  }
-
-  // Get paginated results
-  const { data, error } = await client
-    .from('webhook_deliveries')
+  let dataQuery = knex('webhook_deliveries')
     .select('*')
-    .eq('webhook_id', webhookId)
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
+    .where('webhook_id', webhookId)
+    .orderBy('created_at', 'desc')
+    .limit(limit)
+    .offset(offset);
+  dataQuery = await applyTenantFilter(knex, dataQuery, 'webhook_deliveries');
 
-  if (error) {
-    throw new Error(`Failed to fetch webhook deliveries: ${error.message}`);
+  try {
+    const [countRow, rows] = await Promise.all([
+      countQuery.first() as Promise<{ count?: string | number } | undefined>,
+      dataQuery,
+    ]);
+
+    return {
+      deliveries: normalizeRows(rows) as WebhookDelivery[],
+      total: parseCount(countRow),
+    };
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch webhook deliveries: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return {
-    deliveries: (data || []) as WebhookDelivery[],
-    total: count || 0,
-  };
 }
 
-/**
- * Delete old webhook deliveries (cleanup)
- */
 export async function deleteOldWebhookDeliveries(olderThanDays: number = 30): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
+  const knex = await getDb();
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
 
-  const { data, error } = await client
-    .from('webhook_deliveries')
-    .delete()
-    .lt('created_at', cutoffDate.toISOString())
-    .select('id');
+  let query = knex('webhook_deliveries')
+    .where('created_at', '<', cutoffDate.toISOString())
+    .del()
+    .returning('id');
+  query = await applyTenantFilter(knex, query, 'webhook_deliveries');
 
-  if (error) {
-    throw new Error(`Failed to delete old webhook deliveries: ${error.message}`);
+  try {
+    const rows = await query as Array<{ id: string }>;
+    return rows.length;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete old webhook deliveries: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data?.length || 0;
 }
 
-// =============================================================================
-// Helpers
-// =============================================================================
- 
-function mapWebhookFromDb(data: any): Webhook {
+function mapWebhookFromDb(data: Record<string, unknown>): Webhook {
+  const events = Array.isArray(data.events)
+    ? data.events as WebhookEventType[]
+    : [];
+
   return {
-    id: data.id,
-    name: data.name,
-    url: data.url,
-    secret: data.secret,
-    events: Array.isArray(data.events) ? data.events : [],
-    filters: data.filters || null,
-    enabled: data.enabled,
-    last_triggered_at: data.last_triggered_at,
-    failure_count: data.failure_count || 0,
-    created_at: data.created_at,
-    updated_at: data.updated_at,
+    id: data.id as string,
+    name: data.name as string,
+    url: data.url as string,
+    secret: data.secret as string | null,
+    events,
+    filters: (data.filters as WebhookFilters | null) || null,
+    enabled: Boolean(data.enabled),
+    last_triggered_at: data.last_triggered_at as string | null,
+    failure_count: Number(data.failure_count || 0),
+    created_at: data.created_at as string,
+    updated_at: data.updated_at as string,
   };
 }

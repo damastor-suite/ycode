@@ -1,13 +1,16 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { randomBytes } from 'crypto';
+
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  normalizeRow,
+} from './knex-repository-utils';
 
 /**
  * MCP OAuth Client Repository
  *
- * Stores RFC 7591 Dynamic Client Registration entries. The `client_id` itself
- * is not a secret (PKCE is the actual security mechanism) but we persist the
- * client name so the consent screen can display "Allow [Client Name]…" and
- * the registered redirect URIs so we can validate them at /authorize time.
+ * Stores RFC 7591 Dynamic Client Registration entries.
  */
 
 export interface McpOAuthClient {
@@ -23,53 +26,47 @@ export interface RegisterClientData {
   redirect_uris: string[];
 }
 
+const CLIENT_COLUMNS = ['id', 'client_id', 'client_name', 'redirect_uris', 'created_at'];
+
 function generateClientId(): string {
   return 'mcp_client_' + randomBytes(24).toString('hex');
 }
 
 export async function registerClient(data: RegisterClientData): Promise<McpOAuthClient> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  const row = await addTenantIdToRow(knex, 'mcp_oauth_clients', {
+    client_id: generateClientId(),
+    client_name: data.client_name,
+    redirect_uris: data.redirect_uris,
+    created_at: new Date().toISOString(),
+  });
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    const [client] = await knex('mcp_oauth_clients')
+      .insert(row)
+      .returning(CLIENT_COLUMNS);
+
+    return normalizeRow(client) as McpOAuthClient;
+  } catch (error) {
+    throw new Error(
+      `Failed to register OAuth client: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const clientId = generateClientId();
-
-  const { data: row, error } = await client
-    .from('mcp_oauth_clients')
-    .insert({
-      client_id: clientId,
-      client_name: data.client_name,
-      redirect_uris: data.redirect_uris,
-      created_at: new Date().toISOString(),
-    })
-    .select('id, client_id, client_name, redirect_uris, created_at')
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to register OAuth client: ${error.message}`);
-  }
-
-  return row;
 }
 
 export async function getClient(clientId: string): Promise<McpOAuthClient | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('mcp_oauth_clients')
+    .select(CLIENT_COLUMNS)
+    .where('client_id', clientId);
+  query = await applyTenantFilter(knex, query, 'mcp_oauth_clients');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    const client = await query.first();
+    return client ? normalizeRow(client) as McpOAuthClient : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch OAuth client: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('mcp_oauth_clients')
-    .select('id, client_id, client_name, redirect_uris, created_at')
-    .eq('client_id', clientId)
-    .single();
-
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch OAuth client: ${error.message}`);
-  }
-
-  return data;
 }

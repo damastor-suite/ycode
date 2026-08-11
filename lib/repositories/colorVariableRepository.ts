@@ -1,13 +1,19 @@
+import { batchUpdateColumn } from '@/lib/knex-helpers';
+import { generateContentHash } from '@/lib/hash-utils';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  normalizeRow,
+  normalizeRows,
+} from './knex-repository-utils';
+import type { ColorVariable } from '@/types';
+
 /**
  * Color Variable Repository
  *
- * Data access layer for color variable operations with Supabase.
- * Color variables are site-wide design tokens stored as CSS custom properties.
+ * Data access layer for site-wide color design tokens.
  */
-
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { generateContentHash } from '@/lib/hash-utils';
-import type { ColorVariable } from '@/types';
 
 export interface CreateColorVariableData {
   name: string;
@@ -19,9 +25,6 @@ export interface UpdateColorVariableData {
   value?: string;
 }
 
-/**
- * Convert a stored color value (#hex or #hex/opacity) to a CSS-ready value.
- */
 function toCssValue(val: string): string {
   const parts = val.split('/');
   if (parts.length < 2) return val;
@@ -33,10 +36,6 @@ function toCssValue(val: string): string {
   return `rgba(${r},${g},${b},${opacity})`;
 }
 
-/**
- * Generate a `:root { ... }` CSS string with all color variable declarations.
- * Returns null if no variables exist.
- */
 export async function generateColorVariablesCss(): Promise<string | null> {
   try {
     const colorVars = await getAllColorVariables();
@@ -49,165 +48,131 @@ export async function generateColorVariablesCss(): Promise<string | null> {
 }
 
 export async function getAllColorVariables(): Promise<ColorVariable[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('color_variables')
+  const knex = await getDb();
+  let query = knex('color_variables')
     .select('*')
-    .order('sort_order', { ascending: true })
-    .order('created_at', { ascending: true });
+    .orderBy('sort_order', 'asc')
+    .orderBy('created_at', 'asc');
+  query = await applyTenantFilter(knex, query, 'color_variables');
 
-  if (error) {
-    throw new Error(`Failed to fetch color variables: ${error.message}`);
+  try {
+    return normalizeRows(await query) as ColorVariable[];
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch color variables: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data || [];
 }
 
 export async function getColorVariableById(id: string): Promise<ColorVariable | null> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('color_variables')
+  const knex = await getDb();
+  let query = knex('color_variables')
     .select('*')
-    .eq('id', id)
-    .single();
+    .where('id', id);
+  query = await applyTenantFilter(knex, query, 'color_variables');
 
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return null;
-    }
-    throw new Error(`Failed to fetch color variable: ${error.message}`);
+  try {
+    const row = await query.first();
+    return row ? normalizeRow(row) as ColorVariable : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch color variable: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
 export async function createColorVariable(
   variableData: CreateColorVariableData
 ): Promise<ColorVariable> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let maxQuery = knex('color_variables')
+    .max<{ max: number | string | null }>('sort_order as max');
+  maxQuery = await applyTenantFilter(knex, maxQuery, 'color_variables');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    const [maxRow] = await maxQuery;
+    const nextOrder = Number(maxRow?.max ?? -1) + 1;
+    const row = await addTenantIdToRow(knex, 'color_variables', {
+      ...variableData,
+      sort_order: nextOrder,
+    });
+
+    const [data] = await knex('color_variables')
+      .insert(row)
+      .returning('*');
+
+    return normalizeRow(data) as ColorVariable;
+  } catch (error) {
+    throw new Error(
+      `Failed to create color variable: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  // Get max sort_order to append at end
-  const { data: maxRow } = await client
-    .from('color_variables')
-    .select('sort_order')
-    .order('sort_order', { ascending: false })
-    .limit(1)
-    .single();
-  const nextOrder = (maxRow?.sort_order ?? -1) + 1;
-
-  const { data, error } = await client
-    .from('color_variables')
-    .insert({ ...variableData, sort_order: nextOrder })
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to create color variable: ${error.message}`);
-  }
-
-  return data;
 }
 
 export async function updateColorVariable(
   id: string,
   updates: UpdateColorVariableData
 ): Promise<ColorVariable> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('color_variables')
+  const knex = await getDb();
+  let query = knex('color_variables')
+    .where('id', id)
     .update({ ...updates, updated_at: new Date().toISOString() })
-    .eq('id', id)
-    .select()
-    .single();
+    .returning('*');
+  query = await applyTenantFilter(knex, query, 'color_variables');
 
-  if (error) {
-    throw new Error(`Failed to update color variable: ${error.message}`);
+  try {
+    const [data] = await query;
+    if (!data) {
+      throw new Error('Color variable not found');
+    }
+    return normalizeRow(data) as ColorVariable;
+  } catch (error) {
+    throw new Error(
+      `Failed to update color variable: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
 export async function deleteColorVariable(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('color_variables')
+    .where('id', id)
+    .del();
+  query = await applyTenantFilter(knex, query, 'color_variables');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { error } = await client
-    .from('color_variables')
-    .delete()
-    .eq('id', id);
-
-  if (error) {
-    throw new Error(`Failed to delete color variable: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete color variable: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
 export async function reorderColorVariables(
   orderedIds: string[]
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
+  if (orderedIds.length === 0) {
+    return;
   }
 
-  // Fetch full rows so upsert includes all NOT NULL columns
-  const { data: existing, error: fetchError } = await client
-    .from('color_variables')
-    .select('*')
-    .in('id', orderedIds);
+  const knex = await getDb();
 
-  if (fetchError) {
-    throw new Error(`Failed to fetch color variables for reorder: ${fetchError.message}`);
-  }
-
-  const existingMap = new Map((existing || []).map((v) => [v.id, v]));
-  const now = new Date().toISOString();
-
-  const updates = orderedIds
-    .map((id, index) => {
-      const row = existingMap.get(id);
-      if (!row) return null;
-      return { ...row, sort_order: index, updated_at: now };
-    })
-    .filter(Boolean);
-
-  const { error } = await client
-    .from('color_variables')
-    .upsert(updates, { onConflict: 'id' });
-
-  if (error) {
-    throw new Error(`Failed to reorder color variables: ${error.message}`);
+  try {
+    await batchUpdateColumn(
+      knex,
+      'color_variables',
+      'sort_order',
+      orderedIds.map((id, index) => ({ id, value: index })),
+      { castType: 'integer' }
+    );
+  } catch (error) {
+    throw new Error(
+      `Failed to reorder color variables: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Compute a deterministic hash of all color variables.
- * Used to detect changes between publishes — color variables have no
- * draft/published model so we compare the current state against a
- * stored snapshot hash.
- */
 export async function getColorVariablesHash(): Promise<string> {
   const variables = await getAllColorVariables();
   return generateContentHash(

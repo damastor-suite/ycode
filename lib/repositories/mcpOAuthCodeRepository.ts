@@ -1,12 +1,17 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { randomBytes } from 'crypto';
+
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  normalizeRow,
+} from './knex-repository-utils';
 
 /**
  * MCP OAuth Code Repository
  *
- * Stores short-lived (10 minute) authorization codes issued at the consent
- * step. Codes are single-use: `consumeCode` deletes the row atomically so a
- * replayed code is rejected even on concurrent requests.
+ * Stores short-lived authorization codes. Codes are single-use: consumeCode
+ * deletes the row atomically so a replayed code is rejected.
  */
 
 export interface McpOAuthCode {
@@ -30,84 +35,81 @@ export interface CreateCodeData {
   user_id: string;
 }
 
+const CODE_COLUMNS = [
+  'code',
+  'client_id',
+  'redirect_uri',
+  'code_challenge',
+  'code_challenge_method',
+  'scope',
+  'user_id',
+  'expires_at',
+  'created_at',
+];
+
 function generateCode(): string {
   return 'mcp_code_' + randomBytes(32).toString('hex');
 }
 
 export async function createCode(data: CreateCodeData): Promise<string> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const code = generateCode();
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const row = await addTenantIdToRow(knex, 'mcp_oauth_codes', {
+    code,
+    client_id: data.client_id,
+    redirect_uri: data.redirect_uri,
+    code_challenge: data.code_challenge,
+    code_challenge_method: data.code_challenge_method,
+    scope: data.scope ?? null,
+    user_id: data.user_id,
+    expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    created_at: new Date().toISOString(),
+  });
 
-  const { error } = await client
-    .from('mcp_oauth_codes')
-    .insert({
-      code,
-      client_id: data.client_id,
-      redirect_uri: data.redirect_uri,
-      code_challenge: data.code_challenge,
-      code_challenge_method: data.code_challenge_method,
-      scope: data.scope ?? null,
-      user_id: data.user_id,
-      expires_at: expiresAt,
-      created_at: new Date().toISOString(),
-    });
-
-  if (error) {
-    throw new Error(`Failed to create OAuth code: ${error.message}`);
+  try {
+    await knex('mcp_oauth_codes').insert(row);
+    return code;
+  } catch (error) {
+    throw new Error(
+      `Failed to create OAuth code: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return code;
 }
 
-/**
- * Atomically consume an authorization code: fetch it and delete it in the
- * same operation. Returns null if the code was already consumed, expired,
- * or never existed.
- */
 export async function consumeCode(code: string): Promise<McpOAuthCode | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('mcp_oauth_codes')
+    .where('code', code)
+    .del()
+    .returning(CODE_COLUMNS);
+  query = await applyTenantFilter(knex, query, 'mcp_oauth_codes');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
+  try {
+    const [data] = await query;
+    if (!data) {
+      return null;
+    }
 
-  const { data, error } = await client
-    .from('mcp_oauth_codes')
-    .delete()
-    .eq('code', code)
-    .select('code, client_id, redirect_uri, code_challenge, code_challenge_method, scope, user_id, expires_at, created_at')
-    .single();
+    const row = normalizeRow(data) as McpOAuthCode;
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return null;
+    }
 
-  if (error || !data) {
+    return row;
+  } catch {
     return null;
   }
-
-  if (new Date(data.expires_at).getTime() < Date.now()) {
-    return null;
-  }
-
-  return data;
 }
 
-/**
- * Best-effort cleanup of expired codes. Safe to call from any request path;
- * we only schedule it occasionally to avoid load.
- */
 export async function cleanupExpired(): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    return;
+  try {
+    const knex = await getDb();
+    let query = knex('mcp_oauth_codes')
+      .where('expires_at', '<', new Date().toISOString())
+      .del();
+    query = await applyTenantFilter(knex, query, 'mcp_oauth_codes');
+    await query;
+  } catch {
+    // Best-effort cleanup.
   }
-
-  await client
-    .from('mcp_oauth_codes')
-    .delete()
-    .lt('expires_at', new Date().toISOString());
 }

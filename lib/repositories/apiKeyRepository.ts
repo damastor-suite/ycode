@@ -1,5 +1,12 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { createHash, randomBytes } from 'crypto';
+
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  normalizeRow,
+  normalizeRows,
+} from './knex-repository-utils';
 
 /**
  * API Key Repository
@@ -18,163 +25,122 @@ export interface ApiKey {
 }
 
 export interface ApiKeyWithPlainKey extends ApiKey {
-  api_key: string; // Only returned once during creation
+  api_key: string;
 }
 
-/**
- * Hash an API key using SHA-256
- */
+const API_KEY_COLUMNS = 'id, name, key_prefix, last_used_at, created_at, updated_at';
+
 export function hashApiKey(apiKey: string): string {
   return createHash('sha256').update(apiKey).digest('hex');
 }
 
-/**
- * Generate a new API key
- * Format: 64 random hex chars
- */
 function generateApiKey(): string {
   return randomBytes(32).toString('hex');
 }
 
-/**
- * Get all API keys (without hashes)
- */
 export async function getAllApiKeys(): Promise<ApiKey[]> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('api_keys')
+    .select(knex.raw(API_KEY_COLUMNS))
+    .orderBy('created_at', 'desc');
+  query = await applyTenantFilter(knex, query, 'api_keys');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    return normalizeRows(await query) as ApiKey[];
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch API keys: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('api_keys')
-    .select('id, name, key_prefix, last_used_at, created_at, updated_at')
-    .order('created_at', { ascending: false });
-
-  if (error) {
-    throw new Error(`Failed to fetch API keys: ${error.message}`);
-  }
-
-  return data || [];
 }
 
-/**
- * Create a new API key
- * Returns the key info including the plain key (shown only once)
- */
 export async function createApiKey(name: string): Promise<ApiKeyWithPlainKey> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Generate the key
+  const knex = await getDb();
   const apiKey = generateApiKey();
-  const keyHash = hashApiKey(apiKey);
-  const keyPrefix = apiKey.substring(0, 8); // First 8 chars for identification
+  const now = new Date().toISOString();
+  const row = await addTenantIdToRow(knex, 'api_keys', {
+    name,
+    key_hash: hashApiKey(apiKey),
+    key_prefix: apiKey.substring(0, 8),
+    created_at: now,
+    updated_at: now,
+  });
 
-  const { data, error } = await client
-    .from('api_keys')
-    .insert({
-      name,
-      key_hash: keyHash,
-      key_prefix: keyPrefix,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .select('id, name, key_prefix, last_used_at, created_at, updated_at')
-    .single();
+  try {
+    const [data] = await knex('api_keys')
+      .insert(row)
+      .returning(['id', 'name', 'key_prefix', 'last_used_at', 'created_at', 'updated_at']);
 
-  if (error) {
-    throw new Error(`Failed to create API key: ${error.message}`);
+    return {
+      ...normalizeRow(data) as ApiKey,
+      api_key: apiKey,
+    };
+  } catch (error) {
+    throw new Error(
+      `Failed to create API key: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return {
-    ...data,
-    api_key: apiKey, // Return plain key only on creation
-  };
 }
 
-/**
- * Delete an API key
- */
 export async function deleteApiKey(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('api_keys').where('id', id).del();
+  query = await applyTenantFilter(knex, query, 'api_keys');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('api_keys')
-    .delete()
-    .eq('id', id);
-
-  if (error) {
-    throw new Error(`Failed to delete API key: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete API key: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Validate an API key
- * Returns the key record if valid, null otherwise
- * Also updates last_used_at timestamp
- */
 export async function validateApiKey(apiKey: string): Promise<ApiKey | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('api_keys')
+    .select(['id', 'name', 'key_prefix', 'last_used_at', 'created_at', 'updated_at'])
+    .where('key_hash', hashApiKey(apiKey));
+  query = await applyTenantFilter(knex, query, 'api_keys');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
+  try {
+    const data = await query.first();
+    if (!data) {
+      return null;
+    }
 
-  const keyHash = hashApiKey(apiKey);
+    const key = normalizeRow(data) as ApiKey;
+    void (async () => {
+      try {
+        let update = knex('api_keys')
+          .where('id', key.id)
+          .update({ last_used_at: new Date().toISOString() });
+        update = await applyTenantFilter(knex, update, 'api_keys');
+        await update;
+      } catch (error) {
+        console.error('Failed to update last_used_at:', error);
+      }
+    })();
 
-  // Find the key by hash
-  const { data, error } = await client
-    .from('api_keys')
-    .select('id, name, key_prefix, last_used_at, created_at, updated_at')
-    .eq('key_hash', keyHash)
-    .single();
-
-  if (error || !data) {
+    return key;
+  } catch {
     return null;
   }
-
-  // Update last_used_at (fire and forget - don't wait for it)
-  (async () => {
-    try {
-      await client
-        .from('api_keys')
-        .update({ last_used_at: new Date().toISOString() })
-        .eq('id', data.id);
-    } catch (err) {
-      console.error('Failed to update last_used_at:', err);
-    }
-  })();
-
-  return data;
 }
 
-/**
- * Get an API key by ID (without hash)
- */
 export async function getApiKeyById(id: string): Promise<ApiKey | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('api_keys')
+    .select(['id', 'name', 'key_prefix', 'last_used_at', 'created_at', 'updated_at'])
+    .where('id', id);
+  query = await applyTenantFilter(knex, query, 'api_keys');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    const data = await query.first();
+    return data ? normalizeRow(data) as ApiKey : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch API key: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('api_keys')
-    .select('id, name, key_prefix, last_used_at, created_at, updated_at')
-    .eq('id', id)
-    .single();
-
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch API key: ${error.message}`);
-  }
-
-  return data;
 }

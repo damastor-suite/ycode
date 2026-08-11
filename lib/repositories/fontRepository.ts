@@ -1,127 +1,78 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { SUPABASE_QUERY_LIMIT, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
-import { cleanupOrphanedStorageFiles } from '@/lib/storage-utils';
 import { generateFontContentHash } from '@/lib/hash-utils';
+import { getDb } from '@/lib/platform/db';
+import { getStorage } from '@/lib/platform/storage';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  getConflictColumns,
+  normalizeRow,
+  normalizeRows,
+} from './knex-repository-utils';
 import type { Font, CreateFontData, UpdateFontData } from '@/types';
 
-/**
- * Get all fonts (drafts only)
- */
+const WRITE_BATCH_SIZE = 100;
+
 export async function getAllFonts(): Promise<Font[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('fonts')
-    .select('*')
-    .eq('is_published', false)
-    .is('deleted_at', null)
-    .order('created_at', { ascending: true })
-    .limit(SUPABASE_QUERY_LIMIT);
-
-  if (error) throw new Error(`Failed to fetch fonts: ${error.message}`);
-
-  return data || [];
+  return getFontsByPublishState(false, 'Failed to fetch fonts');
 }
 
-/**
- * Get all published fonts
- */
 export async function getPublishedFonts(): Promise<Font[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('fonts')
-    .select('*')
-    .eq('is_published', true)
-    .is('deleted_at', null)
-    .order('created_at', { ascending: true })
-    .limit(SUPABASE_QUERY_LIMIT);
-
-  if (error) throw new Error(`Failed to fetch published fonts: ${error.message}`);
-
-  return data || [];
+  return getFontsByPublishState(true, 'Failed to fetch published fonts');
 }
 
-/**
- * Get a font by ID (draft)
- */
 export async function getFontById(id: string): Promise<Font | null> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  const { data, error } = await client
-    .from('fonts')
+  const knex = await getDb();
+  let query = knex('fonts')
     .select('*')
-    .eq('id', id)
-    .eq('is_published', false)
-    .is('deleted_at', null)
-    .single();
+    .where('id', id)
+    .where('is_published', false)
+    .whereNull('deleted_at');
+  query = await applyTenantFilter(knex, query, 'fonts');
 
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch font: ${error.message}`);
+  try {
+    const row = await query.first();
+    return row ? normalizeRow(row) as Font : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch font: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
-/**
- * Create a new font
- */
 export async function createFont(fontData: CreateFontData): Promise<Font> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const contentHash = generateFontContentHash(fontData);
+  const row = await addTenantIdToRow(knex, 'fonts', {
+    name: fontData.name,
+    family: fontData.family,
+    type: fontData.type,
+    variants: fontData.variants,
+    weights: fontData.weights,
+    category: fontData.category,
+    axes: fontData.axes ?? null,
+    kind: fontData.kind ?? null,
+    url: fontData.url ?? null,
+    storage_path: fontData.storage_path ?? null,
+    file_hash: fontData.file_hash ?? null,
+    content_hash: contentHash,
+    is_published: false,
+  });
 
-  const { data, error } = await client
-    .from('fonts')
-    .insert({
-      name: fontData.name,
-      family: fontData.family,
-      type: fontData.type,
-      variants: fontData.variants,
-      weights: fontData.weights,
-      category: fontData.category,
-      axes: fontData.axes ?? null,
-      kind: fontData.kind ?? null,
-      url: fontData.url ?? null,
-      storage_path: fontData.storage_path ?? null,
-      file_hash: fontData.file_hash ?? null,
-      content_hash: contentHash,
-      is_published: false,
-    })
-    .select()
-    .single();
-
-  if (error) throw new Error(`Failed to create font: ${error.message}`);
-
-  return data;
+  try {
+    const [data] = await knex('fonts')
+      .insert(row)
+      .returning('*');
+    return normalizeRow(data) as Font;
+  } catch (error) {
+    throw new Error(
+      `Failed to create font: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
 }
 
-/**
- * Update an existing font
- */
 export async function updateFont(id: string, fontData: UpdateFontData): Promise<Font> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
+  const existing = await getFontById(id);
   const updatePayload: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
   };
@@ -132,147 +83,100 @@ export async function updateFont(id: string, fontData: UpdateFontData): Promise<
   if (fontData.weights !== undefined) updatePayload.weights = fontData.weights;
   if (fontData.category !== undefined) updatePayload.category = fontData.category;
 
-  // Recalculate content hash
-  const existing = await getFontById(id);
   if (existing) {
-    const merged = {
+    updatePayload.content_hash = generateFontContentHash({
       name: fontData.name ?? existing.name,
       family: fontData.family ?? existing.family,
       type: existing.type,
       variants: fontData.variants ?? existing.variants,
       weights: fontData.weights ?? existing.weights,
       category: fontData.category ?? existing.category,
-    };
-    updatePayload.content_hash = generateFontContentHash(merged);
+    });
   }
 
-  const { data, error } = await client
-    .from('fonts')
+  let query = knex('fonts')
+    .where('id', id)
+    .where('is_published', false)
+    .whereNull('deleted_at')
     .update(updatePayload)
-    .eq('id', id)
-    .eq('is_published', false)
-    .is('deleted_at', null)
-    .select()
-    .single();
+    .returning('*');
+  query = await applyTenantFilter(knex, query, 'fonts');
 
-  if (error) throw new Error(`Failed to update font: ${error.message}`);
-
-  return data;
+  try {
+    const [data] = await query;
+    if (!data) {
+      throw new Error('Font not found');
+    }
+    return normalizeRow(data) as Font;
+  } catch (error) {
+    throw new Error(
+      `Failed to update font: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
 }
 
-/**
- * Soft-delete a font
- */
 export async function deleteFont(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('fonts')
+    .where('id', id)
+    .where('is_published', false)
+    .update({ deleted_at: new Date().toISOString() });
+  query = await applyTenantFilter(knex, query, 'fonts');
 
-  if (!client) {
-    throw new Error('Supabase not configured');
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete font: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { error } = await client
-    .from('fonts')
-    .update({ deleted_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('is_published', false);
-
-  if (error) throw new Error(`Failed to delete font: ${error.message}`);
 }
 
-/**
- * Get all unpublished fonts (fonts that have changes since last publish)
- */
 export async function getUnpublishedFonts(): Promise<Font[]> {
-  const client = await getSupabaseAdmin();
+  const [draftFonts, publishedFonts] = await Promise.all([
+    getFontsByPublishState(false, 'Failed to fetch draft fonts', true),
+    getFontsByPublishState(true, 'Failed to fetch published fonts', true),
+  ]);
 
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
-  // Get all draft fonts (including soft-deleted ones for cleanup)
-  const { data: draftFonts, error: draftError } = await client
-    .from('fonts')
-    .select('*')
-    .eq('is_published', false)
-    .limit(SUPABASE_QUERY_LIMIT);
-
-  if (draftError) throw new Error(`Failed to fetch draft fonts: ${draftError.message}`);
-
-  // Get all published fonts
-  const { data: publishedFonts, error: publishedError } = await client
-    .from('fonts')
-    .select('*')
-    .eq('is_published', true)
-    .limit(SUPABASE_QUERY_LIMIT);
-
-  if (publishedError) throw new Error(`Failed to fetch published fonts: ${publishedError.message}`);
-
-  const publishedMap = new Map(publishedFonts?.map(f => [f.id, f]) || []);
-
-  // Find fonts that need publishing (new, changed, or deleted)
-  return (draftFonts || []).filter(draft => {
+  const publishedMap = new Map(publishedFonts.map(font => [font.id, font]));
+  return draftFonts.filter((draft) => {
     const published = publishedMap.get(draft.id);
-    if (!published) return true; // New font
-    if (draft.deleted_at) return true; // Deleted font
-    return draft.content_hash !== published.content_hash; // Changed font
+    if (!published) return true;
+    if (draft.deleted_at) return true;
+    return draft.content_hash !== published.content_hash;
   });
 }
 
-/**
- * Publish all draft fonts to production
- */
 export async function publishFonts(): Promise<{ added: number; updated: number; deleted: number }> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase not configured');
-  }
-
+  const knex = await getDb();
   const stats = { added: 0, updated: 0, deleted: 0 };
+  const [draftFonts, publishedFonts] = await Promise.all([
+    getFontsByPublishState(false, 'Failed to fetch draft fonts', true),
+    getFontsByPublishState(true, 'Failed to fetch published fonts', true),
+  ]);
 
-  // Get all draft fonts
-  const { data: draftFonts, error: draftError } = await client
-    .from('fonts')
-    .select('*')
-    .eq('is_published', false)
-    .limit(SUPABASE_QUERY_LIMIT);
-
-  if (draftError) throw new Error(`Failed to fetch draft fonts: ${draftError.message}`);
-
-  // Get all published fonts
-  const { data: publishedFonts, error: publishedError } = await client
-    .from('fonts')
-    .select('*')
-    .eq('is_published', true)
-    .limit(SUPABASE_QUERY_LIMIT);
-
-  if (publishedError) throw new Error(`Failed to fetch published fonts: ${publishedError.message}`);
-
-  const publishedMap = new Map(publishedFonts?.map(f => [f.id, f]) || []);
-
-  // Fonts to upsert (new or changed)
+  const publishedMap = new Map(publishedFonts.map(font => [font.id, font]));
+  const now = new Date().toISOString();
   const toUpsert: Record<string, unknown>[] = [];
 
-  for (const draft of draftFonts || []) {
+  for (const draft of draftFonts) {
     if (draft.deleted_at) {
-      // Soft-deleted in draft - remove from published
       if (publishedMap.has(draft.id)) {
-        stats.deleted++;
+        stats.deleted += 1;
       }
       continue;
     }
 
     const published = publishedMap.get(draft.id);
-
     if (!published) {
-      stats.added++;
+      stats.added += 1;
     } else if (draft.content_hash !== published.content_hash) {
-      stats.updated++;
+      stats.updated += 1;
     } else {
-      continue; // No changes
+      continue;
     }
 
-    toUpsert.push({
+    const record: Record<string, unknown> = {
       id: draft.id,
       name: draft.name,
       family: draft.family,
@@ -288,75 +192,134 @@ export async function publishFonts(): Promise<{ added: number; updated: number; 
       content_hash: draft.content_hash,
       is_published: true,
       created_at: draft.created_at,
-      updated_at: new Date().toISOString(),
+      updated_at: now,
       deleted_at: null,
-    });
+    };
+    const tenantId = (draft as unknown as Record<string, unknown>).tenant_id;
+    if (tenantId) record.tenant_id = tenantId;
+    toUpsert.push(record);
   }
 
-  // Upsert changed fonts in batches
-  for (let i = 0; i < toUpsert.length; i += SUPABASE_WRITE_BATCH_SIZE) {
-    const batch = toUpsert.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-    const { error } = await client
-      .from('fonts')
-      .upsert(batch, { onConflict: 'id,is_published' });
+  if (toUpsert.length > 0) {
+    const conflictColumns = await getConflictColumns(
+      knex,
+      'fonts',
+      ['id', 'is_published'],
+      toUpsert[0].tenant_id as string | undefined
+    );
 
-    if (error) throw new Error(`Failed to publish fonts batch: ${error.message}`);
+    for (let i = 0; i < toUpsert.length; i += WRITE_BATCH_SIZE) {
+      await knex('fonts')
+        .insert(toUpsert.slice(i, i + WRITE_BATCH_SIZE))
+        .onConflict(conflictColumns)
+        .merge([
+          'name',
+          'family',
+          'type',
+          'variants',
+          'weights',
+          'category',
+          'axes',
+          'kind',
+          'url',
+          'storage_path',
+          'file_hash',
+          'content_hash',
+          'updated_at',
+          'deleted_at',
+        ]);
+    }
   }
 
-  // Delete published fonts that were soft-deleted in draft
-  const deletedDrafts = (draftFonts || []).filter(f => f.deleted_at !== null);
-  const deletedDraftIds = deletedDrafts.map(f => f.id);
-
+  const deletedDrafts = draftFonts.filter(font => font.deleted_at !== null);
+  const deletedDraftIds = deletedDrafts.map(font => font.id);
   if (deletedDraftIds.length > 0) {
-    // Delete from published
-    const { error: deletePublishedError } = await client
-      .from('fonts')
-      .delete()
-      .in('id', deletedDraftIds)
-      .eq('is_published', true);
+    let deletePublished = knex('fonts')
+      .whereIn('id', deletedDraftIds)
+      .where('is_published', true)
+      .del();
+    deletePublished = await applyTenantFilter(knex, deletePublished, 'fonts');
+    await deletePublished;
 
-    if (deletePublishedError) {
-      throw new Error(`Failed to delete published fonts: ${deletePublishedError.message}`);
-    }
-
-    // Hard-delete from draft
-    const { error: deleteDraftError } = await client
-      .from('fonts')
-      .delete()
-      .in('id', deletedDraftIds)
-      .eq('is_published', false);
-
-    if (deleteDraftError) {
-      throw new Error(`Failed to hard-delete draft fonts: ${deleteDraftError.message}`);
-    }
+    let deleteDraft = knex('fonts')
+      .whereIn('id', deletedDraftIds)
+      .where('is_published', false)
+      .del();
+    deleteDraft = await applyTenantFilter(knex, deleteDraft, 'fonts');
+    await deleteDraft;
   }
 
-  // Also delete published fonts whose drafts no longer exist (orphans)
-  const activeDraftIds = new Set(
-    (draftFonts || []).filter(f => !f.deleted_at).map(f => f.id)
+  const activeDraftIds = new Set(draftFonts.filter(font => !font.deleted_at).map(font => font.id));
+  const orphanedPublished = publishedFonts.filter(
+    font => !activeDraftIds.has(font.id) && !deletedDraftIds.includes(font.id)
   );
 
-  const orphanedPublished = (publishedFonts || []).filter(f => !activeDraftIds.has(f.id) && !deletedDraftIds.includes(f.id));
-
   if (orphanedPublished.length > 0) {
-    const orphanIds = orphanedPublished.map(f => f.id);
-    const { error } = await client
-      .from('fonts')
-      .delete()
-      .in('id', orphanIds)
-      .eq('is_published', true);
-
-    if (error) throw new Error(`Failed to delete orphaned published fonts: ${error.message}`);
+    let deleteOrphans = knex('fonts')
+      .whereIn('id', orphanedPublished.map(font => font.id))
+      .where('is_published', true)
+      .del();
+    deleteOrphans = await applyTenantFilter(knex, deleteOrphans, 'fonts');
+    await deleteOrphans;
     stats.deleted += orphanedPublished.length;
   }
 
-  // Delete physical files for all hard-deleted fonts
-  const allDeletedFonts = [...deletedDrafts, ...orphanedPublished];
-  const storagePaths = allDeletedFonts
-    .filter(f => f.storage_path)
-    .map(f => f.storage_path as string);
-
-  await cleanupOrphanedStorageFiles('fonts', storagePaths);
+  await cleanupOrphanedStorageFiles(
+    [...deletedDrafts, ...orphanedPublished]
+      .filter(font => font.storage_path)
+      .map(font => font.storage_path as string)
+  );
 
   return stats;
+}
+
+async function getFontsByPublishState(
+  isPublished: boolean,
+  errorMessage: string,
+  includeDeleted = false
+): Promise<Font[]> {
+  const knex = await getDb();
+  let query = knex('fonts')
+    .select('*')
+    .where('is_published', isPublished)
+    .orderBy('created_at', 'asc');
+
+  if (!includeDeleted) {
+    query = query.whereNull('deleted_at');
+  }
+
+  query = await applyTenantFilter(knex, query, 'fonts');
+
+  try {
+    return normalizeRows(await query) as Font[];
+  } catch (error) {
+    throw new Error(
+      `${errorMessage}: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
+}
+
+async function cleanupOrphanedStorageFiles(storagePaths: string[]): Promise<void> {
+  if (storagePaths.length === 0) return;
+
+  const knex = await getDb();
+  let query = knex('fonts')
+    .select('storage_path')
+    .whereIn('storage_path', storagePaths);
+  query = await applyTenantFilter(knex, query, 'fonts');
+
+  const existingRows = await query as Array<{ storage_path: string | null }>;
+  const stillReferenced = new Set(existingRows.map(row => row.storage_path).filter(Boolean));
+  const orphanedPaths = storagePaths.filter(path => !stillReferenced.has(path));
+
+  if (orphanedPaths.length === 0) return;
+
+  try {
+    const storage = await getStorage();
+    for (let i = 0; i < orphanedPaths.length; i += WRITE_BATCH_SIZE) {
+      await storage.remove(orphanedPaths.slice(i, i + WRITE_BATCH_SIZE));
+    }
+  } catch (error) {
+    console.error('Failed to delete orphaned font files:', error);
+  }
 }

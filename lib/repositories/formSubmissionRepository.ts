@@ -1,4 +1,10 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { getDb } from '@/lib/platform/db';
+import {
+  addTenantIdToRow,
+  applyTenantFilter,
+  normalizeRow,
+  normalizeRows,
+} from './knex-repository-utils';
 import type {
   FormSubmission,
   FormSummary,
@@ -11,103 +17,74 @@ import type {
  * Form Submission Repository
  *
  * Handles CRUD operations for form submissions.
- * Uses Supabase/PostgreSQL via admin client.
  */
 
-/**
- * Get all form submissions, optionally filtered by form_id
- */
 export async function getAllFormSubmissions(
   formId?: string,
   status?: FormSubmissionStatus
 ): Promise<FormSubmission[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  let query = client
-    .from('form_submissions')
+  const knex = await getDb();
+  let query = knex('form_submissions')
     .select('*')
-    .order('created_at', { ascending: false });
+    .orderBy('created_at', 'desc');
 
   if (formId) {
-    query = query.eq('form_id', formId);
+    query = query.where('form_id', formId);
   }
 
   if (status) {
-    query = query.eq('status', status);
+    query = query.where('status', status);
   }
 
-  const { data, error } = await query;
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (error) {
-    throw new Error(`Failed to fetch form submissions: ${error.message}`);
+  try {
+    return normalizeRows(await query) as FormSubmission[];
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch form submissions: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data || [];
 }
 
-/**
- * Get form submission by ID
- */
 export async function getFormSubmissionById(id: string): Promise<FormSubmission | null> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { data, error } = await client
-    .from('form_submissions')
+  const knex = await getDb();
+  let query = knex('form_submissions')
     .select('*')
-    .eq('id', id)
-    .single();
+    .where('id', id);
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch form submission: ${error.message}`);
+  try {
+    const row = await query.first();
+    return row ? normalizeRow(row) as FormSubmission : null;
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch form submission: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
-/**
- * Get all unique forms with submission counts
- */
 export async function getFormSummaries(): Promise<FormSummary[]> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('form_submissions')
+    .select('form_id', 'status', 'created_at')
+    .orderBy('created_at', 'desc');
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
+  try {
+    const submissions = normalizeRows(await query) as FormSubmission[];
+    const formMap = new Map<string, FormSummary>();
 
-  // Get all submissions grouped by form_id
-  const { data, error } = await client
-    .from('form_submissions')
-    .select('form_id, status, created_at')
-    .order('created_at', { ascending: false });
-
-  if (error) {
-    throw new Error(`Failed to fetch form summaries: ${error.message}`);
-  }
-
-  if (!data || data.length === 0) {
-    return [];
-  }
-
-  // Group by form_id and calculate counts
-  const formMap = new Map<string, FormSummary>();
-
-  for (const submission of data) {
-    const existing = formMap.get(submission.form_id);
-
-    if (existing) {
-      existing.submission_count++;
-      if (submission.status === 'new') {
-        existing.new_count++;
+    for (const submission of submissions) {
+      const existing = formMap.get(submission.form_id);
+      if (existing) {
+        existing.submission_count += 1;
+        if (submission.status === 'new') {
+          existing.new_count += 1;
+        }
+        continue;
       }
-    } else {
+
       formMap.set(submission.form_id, {
         form_id: submission.form_id,
         submission_count: 1,
@@ -115,148 +92,120 @@ export async function getFormSummaries(): Promise<FormSummary[]> {
         latest_submission: submission.created_at,
       });
     }
-  }
 
-  return Array.from(formMap.values());
+    return Array.from(formMap.values());
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch form summaries: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
+  }
 }
 
-/**
- * Create a new form submission
- */
 export async function createFormSubmission(
   submissionData: CreateFormSubmissionData
 ): Promise<FormSubmission> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  const row = await addTenantIdToRow(knex, 'form_submissions', {
+    form_id: submissionData.form_id,
+    payload: submissionData.payload,
+    metadata: submissionData.metadata ?? null,
+    status: 'new',
+    created_at: new Date().toISOString(),
+  });
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    const [data] = await knex('form_submissions')
+      .insert(row)
+      .returning('*');
+    return normalizeRow(data) as FormSubmission;
+  } catch (error) {
+    throw new Error(
+      `Failed to create form submission: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  const { data, error } = await client
-    .from('form_submissions')
-    .insert({
-      form_id: submissionData.form_id,
-      payload: submissionData.payload,
-      metadata: submissionData.metadata || null,
-      status: 'new',
-      created_at: new Date().toISOString(),
-    })
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to create form submission: ${error.message}`);
-  }
-
-  return data;
 }
 
-/**
- * Update a form submission (e.g., change status)
- */
 export async function updateFormSubmission(
   id: string,
   submissionData: UpdateFormSubmissionData
 ): Promise<FormSubmission> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { data, error } = await client
-    .from('form_submissions')
+  const knex = await getDb();
+  let query = knex('form_submissions')
+    .where('id', id)
     .update(submissionData)
-    .eq('id', id)
-    .select()
-    .single();
+    .returning('*');
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (error) {
-    throw new Error(`Failed to update form submission: ${error.message}`);
+  try {
+    const [data] = await query;
+    if (!data) {
+      throw new Error('Form submission not found');
+    }
+    return normalizeRow(data) as FormSubmission;
+  } catch (error) {
+    throw new Error(
+      `Failed to update form submission: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
-
-  return data;
 }
 
-/**
- * Delete a form submission
- */
 export async function deleteFormSubmission(id: string): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('form_submissions').where('id', id).del();
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('form_submissions')
-    .delete()
-    .eq('id', id);
-
-  if (error) {
-    throw new Error(`Failed to delete form submission: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete form submission: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Bulk delete form submissions by IDs
- */
 export async function bulkDeleteFormSubmissions(ids: string[]): Promise<void> {
   if (ids.length === 0) return;
 
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('form_submissions').whereIn('id', ids).del();
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('form_submissions')
-    .delete()
-    .in('id', ids);
-
-  if (error) {
-    throw new Error(`Failed to bulk delete form submissions: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to bulk delete form submissions: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Delete all submissions for a form
- */
 export async function deleteFormSubmissionsByFormId(formId: string): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('form_submissions').where('form_id', formId).del();
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('form_submissions')
-    .delete()
-    .eq('form_id', formId);
-
-  if (error) {
-    throw new Error(`Failed to delete form submissions: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to delete form submissions: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
 
-/**
- * Mark all submissions for a form as read
- */
 export async function markAllAsRead(formId: string): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
+  let query = knex('form_submissions')
+    .where('form_id', formId)
+    .where('status', 'new')
+    .update({ status: 'read' });
+  query = await applyTenantFilter(knex, query, 'form_submissions');
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('form_submissions')
-    .update({ status: 'read' })
-    .eq('form_id', formId)
-    .eq('status', 'new');
-
-  if (error) {
-    throw new Error(`Failed to mark submissions as read: ${error.message}`);
+  try {
+    await query;
+  } catch (error) {
+    throw new Error(
+      `Failed to mark submissions as read: ${error instanceof Error ? error.message : 'Unknown error'}`
+    );
   }
 }
