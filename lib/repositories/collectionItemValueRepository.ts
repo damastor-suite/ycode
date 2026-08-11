@@ -1,37 +1,66 @@
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
-import { SUPABASE_QUERY_LIMIT } from '@/lib/supabase-constants';
-import { getKnexClient } from '@/lib/knex-client';
-import type { CollectionItemValue, CollectionFieldType } from '@/types';
-import { isValidUUID } from '@/lib/utils';
-import { castValue, valueToString, slugify } from '../collection-utils';
-import { generateCollectionItemContentHash } from '../hash-utils';
 import { randomUUID } from 'crypto';
+
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { castValue, slugify, valueToString } from '@/lib/collection-utils';
+import { generateCollectionItemContentHash } from '@/lib/hash-utils';
+import { getDb, isMissingTableError } from '@/lib/platform/db';
+import { getTenantIdFromHeaders } from '@/lib/platform/tenant';
 import { deleteTranslationsInBulk, markTranslationsIncomplete } from '@/lib/repositories/translationRepository';
+import { isValidUUID } from '@/lib/utils';
+import type { CollectionFieldType, CollectionItemValue } from '@/types';
 
 /**
  * Collection Item Value Repository
  *
  * Handles CRUD operations for collection item values (EAV values).
  * Each value represents one field value for one item.
- * Uses Supabase/PostgreSQL via admin client.
+ * Uses Knex/PostgreSQL via the platform database port.
  *
  * NOTE: Uses composite primary key (id, is_published) architecture.
  * References items using FK (item_id).
  * References fields using FK (field_id).
  */
 
+interface FieldTypeRow {
+  id: string;
+  type: CollectionFieldType;
+}
+
+interface FieldKeyRow extends FieldTypeRow {
+  key: string | null;
+}
+
+type CollectionItemValueWithTenant = CollectionItemValue & { tenant_id?: string | null };
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown error';
+}
+
+async function addTenantIdToRow(row: Record<string, unknown>, tenantId?: string | null): Promise<Record<string, unknown>> {
+  const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+  if (resolvedTenantId) {
+    row.tenant_id = resolvedTenantId;
+  }
+  return row;
+}
+
 /** Update the content_hash on a collection_items row */
 async function updateContentHash(itemId: string, isPublished: boolean, hash: string): Promise<void> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase client not configured');
+  const knex = await getDb();
 
-  const { error } = await client
-    .from('collection_items')
-    .update({ content_hash: hash, updated_at: new Date().toISOString() })
-    .eq('id', itemId)
-    .eq('is_published', isPublished);
+  try {
+    let query = knex('collection_items')
+      .where('id', itemId)
+      .andWhere('is_published', isPublished);
+    query = await addTenantFilter(knex, query, 'collection_items');
 
-  if (error) throw new Error(`Failed to update content_hash: ${error.message}`);
+    await query.update({
+      content_hash: hash,
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    throw new Error(`Failed to update content_hash: ${getErrorMessage(error)}`);
+  }
 }
 
 export interface CreateCollectionItemValueData {
@@ -48,31 +77,29 @@ export interface CreateCollectionItemValueData {
 export async function insertValuesBulk(
   values: Array<{ item_id: string; field_id: string; value: string | null; is_published?: boolean }>
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
   if (values.length === 0) return;
 
+  const knex = await getDb();
+  const tenantId = await getTenantIdFromHeaders();
   const now = new Date().toISOString();
-  const valuesToInsert = values.map(v => ({
-    id: randomUUID(),
-    item_id: v.item_id,
-    field_id: v.field_id,
-    value: v.value,
-    is_published: v.is_published ?? false,
-    created_at: now,
-    updated_at: now,
-  }));
+  const valuesToInsert = values.map((value) => {
+    const row: Record<string, unknown> = {
+      id: randomUUID(),
+      item_id: value.item_id,
+      field_id: value.field_id,
+      value: value.value,
+      is_published: value.is_published ?? false,
+      created_at: now,
+      updated_at: now,
+    };
+    if (tenantId) row.tenant_id = tenantId;
+    return row;
+  });
 
-  const { error } = await client
-    .from('collection_item_values')
-    .insert(valuesToInsert);
-
-  if (error) {
-    throw new Error(`Failed to bulk insert values: ${error.message}`);
+  try {
+    await knex('collection_item_values').insert(valuesToInsert);
+  } catch (error) {
+    throw new Error(`Failed to bulk insert values: ${getErrorMessage(error)}`);
   }
 }
 
@@ -86,18 +113,22 @@ export async function insertValuesDirectPg(
 ): Promise<void> {
   if (values.length === 0) return;
 
-  const knex = await getKnexClient();
+  const knex = await getDb();
   const tenantId = await getTenantIdFromHeaders();
   const now = new Date().toISOString();
-  const rows = values.map(v => ({
-    id: randomUUID(),
-    item_id: v.item_id,
-    field_id: v.field_id,
-    value: v.value,
-    is_published: v.is_published ?? false,
-    created_at: now,
-    updated_at: now,
-  }));
+  const rows = values.map((value) => {
+    const row: Record<string, unknown> = {
+      id: randomUUID(),
+      item_id: value.item_id,
+      field_id: value.field_id,
+      value: value.value,
+      is_published: value.is_published ?? false,
+      created_at: now,
+      updated_at: now,
+    };
+    if (tenantId) row.tenant_id = tenantId;
+    return row;
+  });
 
   await knex.transaction(async (trx) => {
     await trx.raw("SET LOCAL statement_timeout = '60s'");
@@ -125,15 +156,6 @@ export async function getValuesByItemIds(
   knownFieldTypes?: Record<string, string>,
   fieldIds?: string[],
 ): Promise<Record<string, Record<string, any>>> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Guard against non-UUID ids (e.g. dangling legacy bindings from imported
-  // content). Passing them to a uuid column throws and would otherwise take
-  // down the whole page render.
   const safeItemIds = item_ids.filter(isValidUUID);
   const safeFieldIds = fieldIds?.filter(isValidUUID);
 
@@ -141,88 +163,61 @@ export async function getValuesByItemIds(
     return {};
   }
 
+  const knex = await getDb();
   const valuesByItem: Record<string, Record<string, any>> = {};
-  let allRows: Array<{ item_id: string; field_id: string; value: string }> = [];
 
-  // Fresh path: prefer direct DB query (Knex) for large EAV reads.
-  // This avoids PostgREST overhead and URL-size chunking behavior.
   try {
-    const knex = await getKnexClient();
     let query = knex('collection_item_values')
       .select('item_id', 'field_id', 'value')
       .whereIn('item_id', safeItemIds)
       .andWhere('is_published', is_published)
       .whereNull('deleted_at');
+
     if (safeFieldIds) {
       query = query.whereIn('field_id', safeFieldIds);
     }
-    allRows = await query;
-  } catch {
-    // Fallback: Supabase chunked reads
-    const CHUNK_SIZE = 50;
-    const chunks: string[][] = [];
-    for (let i = 0; i < safeItemIds.length; i += CHUNK_SIZE) {
-      chunks.push(safeItemIds.slice(i, i + CHUNK_SIZE));
-    }
 
-    const chunkResults = await Promise.all(
-      chunks.map(async (chunk) => {
-        let q = client
-          .from('collection_item_values')
-          .select('item_id, field_id, value')
-          .in('item_id', chunk)
-          .eq('is_published', is_published)
-          .is('deleted_at', null);
-        if (safeFieldIds) {
-          q = q.in('field_id', safeFieldIds);
-        }
-        const { data, error } = await q.limit(5000);
+    query = await addTenantFilter(knex, query, 'collection_item_values');
+    const allRows = await query as Array<{ item_id: string; field_id: string; value: string | null }>;
 
-        if (error) {
-          throw new Error(`Failed to fetch item values: ${error.message}`);
-        }
-
-        return data || [];
-      })
-    );
-
-    for (const rows of chunkResults) {
-      for (const row of rows) {
-        allRows.push(row);
+    const discoveredFieldIds = new Set<string>();
+    if (!knownFieldTypes) {
+      for (const row of allRows) {
+        discoveredFieldIds.add(row.field_id);
       }
     }
-  }
 
-  // Collect unique field IDs (only needed if caller didn't provide types)
-  const discoveredFieldIds = new Set<string>();
-  if (!knownFieldTypes) {
+    let fieldTypeMap = knownFieldTypes;
+    if (!fieldTypeMap) {
+      fieldTypeMap = {};
+      if (discoveredFieldIds.size > 0) {
+        let fieldsQuery = knex('collection_fields')
+          .select('id', 'type')
+          .whereIn('id', Array.from(discoveredFieldIds));
+        fieldsQuery = await addTenantFilter(knex, fieldsQuery, 'collection_fields');
+
+        const fields = await fieldsQuery as FieldTypeRow[];
+        fields.forEach((field) => {
+          fieldTypeMap![field.id] = field.type;
+        });
+      }
+    }
+
     for (const row of allRows) {
-      discoveredFieldIds.add(row.field_id);
+      if (!valuesByItem[row.item_id]) {
+        valuesByItem[row.item_id] = {};
+      }
+      valuesByItem[row.item_id][row.field_id] = castValue(
+        row.value,
+        (fieldTypeMap[row.field_id] || 'text') as CollectionFieldType
+      );
     }
+
+    return valuesByItem;
+  } catch (error) {
+    if (isMissingTableError(error)) return {};
+    throw new Error(`Failed to fetch item values: ${getErrorMessage(error)}`);
   }
-
-  // Use caller-provided field types, or fetch them in a single query
-  let fieldTypeMap = knownFieldTypes;
-  if (!fieldTypeMap) {
-    fieldTypeMap = {};
-    if (discoveredFieldIds.size > 0) {
-      const { data: fields } = await client
-        .from('collection_fields')
-        .select('id, type')
-        .in('id', Array.from(discoveredFieldIds));
-
-      fields?.forEach((f: any) => { fieldTypeMap![f.id] = f.type; });
-    }
-  }
-
-  for (const row of allRows) {
-    if (!valuesByItem[row.item_id]) {
-      valuesByItem[row.item_id] = {};
-    }
-    valuesByItem[row.item_id][row.field_id] = castValue(row.value, (fieldTypeMap[row.field_id] || 'text') as any);
-  }
-
-  return valuesByItem;
 }
 
 /** Raw value row needed when publishing/diffing item values. */
@@ -237,7 +232,7 @@ export interface PublishValueRow {
 /**
  * Bulk-fetch full value rows for many items in a single direct-DB (Knex) query.
  * Avoids PostgREST's row cap and URL-size chunking, which forced per-batch
- * paginated reads during publish. Falls back to chunked PostgREST on error.
+ * paginated reads during publish.
  */
 export async function getValueRowsForItems(
   itemIds: string[],
@@ -246,50 +241,25 @@ export async function getValueRowsForItems(
 ): Promise<PublishValueRow[]> {
   if (itemIds.length === 0) return [];
 
+  const knex = await getDb();
+
   try {
-    const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
     let query = knex('collection_item_values')
       .select('id', 'item_id', 'field_id', 'value', 'created_at')
       .whereIn('item_id', itemIds)
       .andWhere('is_published', isPublished)
       .whereNull('deleted_at');
-    if (resolvedTenantId) {
-      query = query.where('tenant_id', resolvedTenantId);
-    }
-    return await query;
-  } catch {
-    // Fallback: paginated PostgREST reads (chunk item IDs to stay within URL limits)
-    const client = await getSupabaseAdmin(tenantId);
-    if (!client) throw new Error('Supabase client not configured');
 
-    const ITEM_CHUNK = 50;
-    const PAGE_SIZE = 1000;
-    const rows: PublishValueRow[] = [];
-
-    for (let i = 0; i < itemIds.length; i += ITEM_CHUNK) {
-      const chunkIds = itemIds.slice(i, i + ITEM_CHUNK);
-      let offset = 0;
-      while (true) {
-        const { data, error } = await client
-          .from('collection_item_values')
-          .select('id, item_id, field_id, value, created_at')
-          .in('item_id', chunkIds)
-          .eq('is_published', isPublished)
-          .is('deleted_at', null)
-          .order('id', { ascending: true })
-          .range(offset, offset + PAGE_SIZE - 1);
-
-        if (error) throw new Error(`Failed to fetch item values: ${error.message}`);
-
-        const batch = (data || []) as PublishValueRow[];
-        rows.push(...batch);
-        if (batch.length < PAGE_SIZE) break;
-        offset += PAGE_SIZE;
-      }
+    if (tenantId) {
+      query = query.where('tenant_id', tenantId);
+    } else {
+      query = await addTenantFilter(knex, query, 'collection_item_values');
     }
 
-    return rows;
+    return await query as PublishValueRow[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch item values: ${getErrorMessage(error)}`);
   }
 }
 
@@ -301,12 +271,6 @@ export async function getValueRowsForItems(
 export async function getValueMapByFieldIds(
   fieldIds: string[]
 ): Promise<Map<string, Map<string, string>>> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
   const result = new Map<string, Map<string, string>>();
   if (fieldIds.length === 0) return result;
 
@@ -314,36 +278,28 @@ export async function getValueMapByFieldIds(
     result.set(fid, new Map());
   }
 
-  let offset = 0;
-  let hasMore = true;
+  const knex = await getDb();
 
-  while (hasMore) {
-    const { data, error } = await client
-      .from('collection_item_values')
-      .select('item_id, field_id, value')
-      .in('field_id', fieldIds)
-      .eq('is_published', false)
-      .is('deleted_at', null)
-      .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
+  try {
+    let query = knex('collection_item_values')
+      .select('item_id', 'field_id', 'value')
+      .whereIn('field_id', fieldIds)
+      .andWhere('is_published', false)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_item_values');
 
-    if (error) {
-      throw new Error(`Failed to fetch field values: ${error.message}`);
-    }
+    const data = await query as Array<{ item_id: string; field_id: string; value: string | null }>;
+    data.forEach((row) => {
+      if (row.value) {
+        result.get(row.field_id)?.set(row.item_id, row.value);
+      }
+    });
 
-    if (data && data.length > 0) {
-      data.forEach((row: { item_id: string; field_id: string; value: string | null }) => {
-        if (row.value) {
-          result.get(row.field_id)!.set(row.item_id, row.value);
-        }
-      });
-      offset += data.length;
-      hasMore = data.length === SUPABASE_QUERY_LIMIT;
-    } else {
-      hasMore = false;
-    }
+    return result;
+  } catch (error) {
+    if (isMissingTableError(error)) return result;
+    throw new Error(`Failed to fetch field values: ${getErrorMessage(error)}`);
   }
-
-  return result;
 }
 
 /**
@@ -355,24 +311,21 @@ export async function getValuesByItemId(
   item_id: string,
   is_published: boolean = false
 ): Promise<CollectionItemValue[]> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_item_values')
+      .select('*')
+      .where('item_id', item_id)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_item_values');
+
+    return await query as CollectionItemValue[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch item values: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_item_values')
-    .select('*')
-    .eq('item_id', item_id)
-    .eq('is_published', is_published)
-    .is('deleted_at', null);
-
-  if (error) {
-    throw new Error(`Failed to fetch item values: ${error.message}`);
-  }
-
-  return data || [];
 }
 
 /**
@@ -384,24 +337,21 @@ export async function getValuesByFieldId(
   field_id: string,
   is_published: boolean = false
 ): Promise<CollectionItemValue[]> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_item_values')
+      .select('*')
+      .where('field_id', field_id)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_item_values');
+
+    return await query as CollectionItemValue[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch field values: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_item_values')
-    .select('*')
-    .eq('field_id', field_id)
-    .eq('is_published', is_published)
-    .is('deleted_at', null);
-
-  if (error) {
-    throw new Error(`Failed to fetch field values: ${error.message}`);
-  }
-
-  return data || [];
 }
 
 /**
@@ -415,26 +365,23 @@ export async function getValue(
   field_id: string,
   is_published: boolean = false
 ): Promise<CollectionItemValue | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_item_values')
+      .select('*')
+      .where('item_id', item_id)
+      .andWhere('field_id', field_id)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_item_values');
+
+    const data = await query.first();
+    return data ? data as CollectionItemValue : null;
+  } catch (error) {
+    if (isMissingTableError(error)) return null;
+    throw new Error(`Failed to fetch value: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_item_values')
-    .select('*')
-    .eq('item_id', item_id)
-    .eq('field_id', field_id)
-    .eq('is_published', is_published)
-    .is('deleted_at', null)
-    .single();
-
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch value: ${error.message}`);
-  }
-
-  return data;
 }
 
 /**
@@ -450,54 +397,11 @@ export async function setValue(
   value: string | null,
   is_published: boolean = false
 ): Promise<CollectionItemValue> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  const [result] = await setValues(item_id, { [field_id]: value }, is_published);
+  if (!result) {
+    throw new Error('Failed to set value');
   }
-
-  // Check if value already exists for this specific version (draft or published)
-  const existing = await getValue(item_id, field_id, is_published);
-  if (existing) {
-    // Update existing value
-    const { data, error } = await client
-      .from('collection_item_values')
-      .update({
-        value,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', existing.id)
-      .eq('is_published', is_published)
-      .select()
-      .single();
-
-    if (error) {
-      throw new Error(`Failed to update value: ${error.message}`);
-    }
-
-    return data;
-  } else {
-    // Create new value
-    const { data, error } = await client
-      .from('collection_item_values')
-      .insert({
-        id: randomUUID(),
-        item_id,
-        field_id,
-        value,
-        is_published,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .select()
-      .single();
-
-    if (error) {
-      throw new Error(`Failed to create value: ${error.message}`);
-    }
-
-    return data;
-  }
+  return result;
 }
 
 /**
@@ -511,15 +415,37 @@ export async function setValues(
   values: Record<string, string | null>,
   is_published: boolean = false
 ): Promise<CollectionItemValue[]> {
-  const results: CollectionItemValue[] = [];
+  const entries = Object.entries(values);
+  if (entries.length === 0) return [];
 
-  // Process each value
-  for (const [field_id, value] of Object.entries(values)) {
-    const result = await setValue(item_id, field_id, value, is_published);
-    results.push(result);
+  const knex = await getDb();
+  const tenantId = await getTenantIdFromHeaders();
+  const now = new Date().toISOString();
+  const rows = entries.map(([field_id, value]) => {
+    const row: Record<string, unknown> = {
+      id: randomUUID(),
+      item_id,
+      field_id,
+      value,
+      is_published,
+      created_at: now,
+      updated_at: now,
+    };
+    if (tenantId) row.tenant_id = tenantId;
+    return row;
+  });
+
+  try {
+    const data = await knex('collection_item_values')
+      .insert(rows)
+      .onConflict(knex.raw('(item_id, field_id, is_published) WHERE deleted_at IS NULL'))
+      .merge(['value', 'updated_at'])
+      .returning('*');
+
+    return data as CollectionItemValue[];
+  } catch (error) {
+    throw new Error(`Failed to set item values: ${getErrorMessage(error)}`);
   }
-
-  return results;
 }
 
 /**
@@ -539,13 +465,8 @@ export async function setValuesByFieldName(
   fieldType: Record<string, CollectionFieldType>,
   is_published: boolean = false
 ): Promise<CollectionItemValue[]> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get current values to detect changes (only for draft updates)
   let currentValuesMap: Record<string, string | null> = {};
   if (!is_published) {
     const currentValues = await getValuesByItemId(item_id, false);
@@ -555,67 +476,55 @@ export async function setValuesByFieldName(
     }, {} as Record<string, string | null>);
   }
 
-  // Get field mappings to validate field IDs and get types
-  // Fields are fetched with the same is_published status as the values
-  const { data: fields, error } = await client
-    .from('collection_fields')
-    .select('id, type, key')
-    .eq('collection_id', collection_id)
-    .eq('is_published', is_published)
-    .is('deleted_at', null);
+  let fieldsQuery = knex('collection_fields')
+    .select('id', 'type', 'key')
+    .where('collection_id', collection_id)
+    .andWhere('is_published', is_published)
+    .whereNull('deleted_at');
+  fieldsQuery = await addTenantFilter(knex, fieldsQuery, 'collection_fields');
 
-  if (error) {
-    throw new Error(`Failed to fetch fields: ${error.message}`);
+  let fields: FieldKeyRow[];
+  try {
+    fields = await fieldsQuery as FieldKeyRow[];
+  } catch (error) {
+    if (isMissingTableError(error)) fields = [];
+    else throw new Error(`Failed to fetch fields: ${getErrorMessage(error)}`);
   }
 
-  // Create mapping of field_id -> type and field_id -> key
   const fieldMap: Record<string, CollectionFieldType> = {};
   const fieldKeyMap: Record<string, string> = {};
-  fields?.forEach((field: any) => {
+  fields.forEach((field) => {
     fieldMap[field.id] = field.type;
     if (field.key) {
       fieldKeyMap[field.id] = field.key;
     }
   });
 
-  // Convert values to strings based on type and set
   const valuesToSet: Record<string, string | null> = {};
 
   for (const [fieldId, value] of Object.entries(values)) {
     const type = fieldMap[fieldId] || fieldType[fieldId] || 'text';
     let stringValue = valueToString(value, type);
-    // Normalize slug values to a valid URL segment so a stray leading slash,
-    // spaces or invalid chars can't break dynamic page routing.
     if (stringValue && fieldKeyMap[fieldId] === 'slug') {
       stringValue = slugify(stringValue);
     }
     valuesToSet[fieldId] = stringValue;
   }
 
-  // Auto-bump the virtual `updated_at` field whenever values are being set,
-  // unless the caller explicitly provided one. The DB column on
-  // `collection_items` is bumped via updateContentHash below, but the
-  // user-facing "Updated Date" column in the CMS table reads this virtual
-  // field — without this, edits would never appear to refresh.
-  const updatedAtFieldId = Object.keys(fieldKeyMap).find(id => fieldKeyMap[id] === 'updated_at');
+  const updatedAtFieldId = Object.keys(fieldKeyMap).find((id) => fieldKeyMap[id] === 'updated_at');
   const autoBumpedUpdatedAt = updatedAtFieldId && !(updatedAtFieldId in valuesToSet);
   if (autoBumpedUpdatedAt) {
-    valuesToSet[updatedAtFieldId!] = new Date().toISOString();
+    valuesToSet[updatedAtFieldId] = new Date().toISOString();
   }
 
-  // Detect changes and removals for translation management (only for draft)
   if (!is_published) {
     const changedKeys: string[] = [];
     const removedKeys: string[] = [];
 
-    // Check for changed values
     for (const [fieldId, newValue] of Object.entries(valuesToSet)) {
-      // An auto-bumped `updated_at` shouldn't mark translations as incomplete
       if (autoBumpedUpdatedAt && fieldId === updatedAtFieldId) continue;
 
       const oldValue = currentValuesMap[fieldId];
-
-      // Generate content key based on field key (if exists) or field id
       const contentKey = fieldId in fieldKeyMap
         ? `field:key:${fieldKeyMap[fieldId]}`
         : `field:id:${fieldId}`;
@@ -623,14 +532,12 @@ export async function setValuesByFieldName(
       if (newValue !== oldValue && newValue !== null && newValue !== '') {
         changedKeys.push(contentKey);
       } else if (newValue === null || newValue === '') {
-        // Value was removed/cleared
         if (oldValue !== null && oldValue !== undefined && oldValue !== '') {
           removedKeys.push(contentKey);
         }
       }
     }
 
-    // Update translations
     if (removedKeys.length > 0) {
       await deleteTranslationsInBulk('cms', item_id, removedKeys);
     }
@@ -642,9 +549,8 @@ export async function setValuesByFieldName(
 
   const results = await setValues(item_id, valuesToSet, is_published);
 
-  // Recompute content_hash from all current values
   const allValues = await getValuesByItemId(item_id, is_published);
-  const hash = generateCollectionItemContentHash(allValues.map(v => ({ field_id: v.field_id, value: v.value })));
+  const hash = generateCollectionItemContentHash(allValues.map((v) => ({ field_id: v.field_id, value: v.value })));
   await updateContentHash(item_id, is_published, hash);
 
   return results;
@@ -661,25 +567,22 @@ export async function deleteValue(
   field_id: string,
   is_published: boolean = false
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
+  try {
+    let query = knex('collection_item_values')
+      .where('item_id', item_id)
+      .andWhere('field_id', field_id)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_item_values');
 
-  const { error } = await client
-    .from('collection_item_values')
-    .update({
+    await query.update({
       deleted_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    })
-    .eq('item_id', item_id)
-    .eq('field_id', field_id)
-    .eq('is_published', is_published)
-    .is('deleted_at', null);
-
-  if (error) {
-    throw new Error(`Failed to delete value: ${error.message}`);
+    });
+  } catch (error) {
+    throw new Error(`Failed to delete value: ${getErrorMessage(error)}`);
   }
 }
 
@@ -694,26 +597,24 @@ export async function clearValuesForField(
   field_id: string,
   value: string
 ): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
+  const knex = await getDb();
   const now = new Date().toISOString();
-  const { data, error } = await client
-    .from('collection_item_values')
-    .update({ deleted_at: now, updated_at: now })
-    .eq('field_id', field_id)
-    .eq('value', value)
-    .is('deleted_at', null)
-    .select('id');
 
-  if (error) {
-    throw new Error(`Failed to clear values: ${error.message}`);
+  try {
+    let query = knex('collection_item_values')
+      .where('field_id', field_id)
+      .andWhere('value', value)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_item_values');
+
+    const data = await query
+      .update({ deleted_at: now, updated_at: now })
+      .returning('id') as Array<{ id: string }>;
+
+    return data.length;
+  } catch (error) {
+    throw new Error(`Failed to clear values: ${getErrorMessage(error)}`);
   }
-
-  return data?.length || 0;
 }
 
 /**
@@ -729,28 +630,26 @@ export async function renameValuesForField(
 ): Promise<number> {
   if (old_value === new_value) return 0;
 
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_item_values')
+      .where('field_id', field_id)
+      .andWhere('value', old_value)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_item_values');
+
+    const data = await query
+      .update({
+        value: new_value,
+        updated_at: new Date().toISOString(),
+      })
+      .returning('id') as Array<{ id: string }>;
+
+    return data.length;
+  } catch (error) {
+    throw new Error(`Failed to rename values: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_item_values')
-    .update({
-      value: new_value,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('field_id', field_id)
-    .eq('value', old_value)
-    .is('deleted_at', null)
-    .select('id');
-
-  if (error) {
-    throw new Error(`Failed to rename values: ${error.message}`);
-  }
-
-  return data?.length || 0;
 }
 
 /**
@@ -761,53 +660,49 @@ export async function renameValuesForField(
  * @returns Number of values published
  */
 export async function publishValues(item_id: string): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get all draft values for this item
+  const knex = await getDb();
   const draftValues = await getValuesByItemId(item_id, false);
 
   if (draftValues.length === 0) {
     return 0;
   }
 
-  // Prepare values for batch upsert
   const now = new Date().toISOString();
-  const valuesToUpsert = draftValues.map(value => ({
-    id: value.id,
-    item_id: value.item_id,
-    field_id: value.field_id,
-    value: value.value,
-    is_published: true,
-    created_at: value.created_at,
-    updated_at: now,
-  }));
+  const tenantId = await getTenantIdFromHeaders();
+  const valuesToUpsert = draftValues.map((value) => {
+    const row: Record<string, unknown> = {
+      id: value.id,
+      item_id: value.item_id,
+      field_id: value.field_id,
+      value: value.value,
+      is_published: true,
+      created_at: value.created_at,
+      updated_at: now,
+    };
 
-  // Batch upsert all values
-  const { error } = await client
-    .from('collection_item_values')
-    .upsert(valuesToUpsert, {
-      onConflict: 'id,is_published', // Composite primary key
-    });
+    const valueTenantId = (value as CollectionItemValueWithTenant).tenant_id ?? tenantId;
+    if (valueTenantId) row.tenant_id = valueTenantId;
+    return row;
+  });
 
-  if (error) {
-    throw new Error(`Failed to publish values: ${error.message}`);
+  try {
+    await knex('collection_item_values')
+      .insert(valuesToUpsert)
+      .onConflict(['id', 'is_published'])
+      .merge(['item_id', 'field_id', 'value', 'updated_at']);
+  } catch (error) {
+    throw new Error(`Failed to publish values: ${getErrorMessage(error)}`);
   }
 
-  // Copy the draft content_hash to the published item
-  const hash = generateCollectionItemContentHash(draftValues.map(v => ({ field_id: v.field_id, value: v.value })));
+  const hash = generateCollectionItemContentHash(draftValues.map((v) => ({ field_id: v.field_id, value: v.value })));
   await updateContentHash(item_id, true, hash);
 
-  // Publish assets referenced by this item (e.g. CMS thumbnails or rich-text
-  // images) so they get a published row in the same operation. Without this, a
-  // single-item publish (Set as published / staged item) leaves images as drafts
-  // and the live page renders the default placeholder until a later full publish.
   try {
     const { collectItemValueAssetIds } = await import('@/lib/collection-asset-utils');
-    const { publishAssets } = await import('@/lib/repositories/assetRepository');
+    const assetRepositoryPath = '@/lib/repositories/assetRepository';
+    const { publishAssets } = await import(assetRepositoryPath) as {
+      publishAssets: (assetIds: string[]) => Promise<unknown>;
+    };
     const assetIds = collectItemValueAssetIds(draftValues);
     if (assetIds.length > 0) {
       await publishAssets(assetIds);

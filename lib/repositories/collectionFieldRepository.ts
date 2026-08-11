@@ -1,14 +1,15 @@
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
-import { SUPABASE_QUERY_LIMIT } from '@/lib/supabase-constants';
-import { getKnexClient } from '@/lib/knex-client';
-import type { CollectionField, CreateCollectionFieldData, UpdateCollectionFieldData } from '@/types';
 import { randomUUID } from 'crypto';
+
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb, isMissingTableError } from '@/lib/platform/db';
+import { getTenantIdFromHeaders } from '@/lib/platform/tenant';
+import type { CollectionField, CreateCollectionFieldData, UpdateCollectionFieldData } from '@/types';
 
 /**
  * Collection Field Repository
  *
  * Handles CRUD operations for collection fields (schema definitions).
- * Uses Supabase/PostgreSQL via admin client.
+ * Uses Knex/PostgreSQL via the platform database port.
  *
  * NOTE: Uses composite primary key (id, is_published) architecture.
  * References parent collections using FK (collection_id).
@@ -19,6 +20,20 @@ export interface FieldFilters {
   excludeComputed?: boolean;
 }
 
+type CollectionFieldWithTenant = CollectionField & { tenant_id?: string | null };
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown error';
+}
+
+async function addTenantIdToRow(row: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const tenantId = await getTenantIdFromHeaders();
+  if (tenantId) {
+    row.tenant_id = tenantId;
+  }
+  return row;
+}
+
 /**
  * Get all fields for all collections
  * @param is_published - Filter for draft (false) or published (true) fields. Defaults to false (draft).
@@ -27,59 +42,27 @@ export async function getAllFields(
   is_published: boolean = false,
   tenantId?: string
 ): Promise<CollectionField[]> {
-  // Fast path: single direct-DB (Knex) read instead of paginated PostgREST.
+  const knex = await getDb();
+
   try {
-    const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
     let query = knex('collection_fields')
       .select('*')
       .where('is_published', is_published)
       .whereNull('deleted_at')
       .orderBy('collection_id', 'asc')
       .orderBy('order', 'asc');
-    if (resolvedTenantId) {
-      query = query.where('tenant_id', resolvedTenantId);
-    }
-    return await query;
-  } catch {
-    // Fallback to paginated PostgREST reads below.
-  }
 
-  const client = await getSupabaseAdmin(tenantId);
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Use pagination to handle >1000 fields (Supabase default limit)
-  const allFields: CollectionField[] = [];
-  let offset = 0;
-  let hasMore = true;
-
-  while (hasMore) {
-    const { data, error } = await client
-      .from('collection_fields')
-      .select('*')
-      .eq('is_published', is_published)
-      .is('deleted_at', null)
-      .order('collection_id', { ascending: true })
-      .order('order', { ascending: true })
-      .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
-
-    if (error) {
-      throw new Error(`Failed to fetch all collection fields: ${error.message}`);
-    }
-
-    if (data && data.length > 0) {
-      allFields.push(...data);
-      offset += data.length;
-      hasMore = data.length === SUPABASE_QUERY_LIMIT;
+    if (tenantId) {
+      query = query.where('tenant_id', tenantId);
     } else {
-      hasMore = false;
+      query = await addTenantFilter(knex, query, 'collection_fields');
     }
-  }
 
-  return allFields;
+    return await query as CollectionField[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch all collection fields: ${getErrorMessage(error)}`);
+  }
 }
 
 /**
@@ -95,36 +78,35 @@ export async function getFieldsByCollectionId(
   filters?: FieldFilters,
   tenantId?: string
 ): Promise<CollectionField[]> {
-  const client = await getSupabaseAdmin(tenantId);
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_fields')
+      .select('*')
+      .where('collection_id', collection_id)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at')
+      .orderBy('order', 'asc');
+
+    if (filters?.excludeComputed) {
+      query = query.andWhere('is_computed', false);
+    }
+
+    if (filters?.search?.trim()) {
+      query = query.andWhereILike('name', `%${filters.search.trim()}%`);
+    }
+
+    if (tenantId) {
+      query = query.where('tenant_id', tenantId);
+    } else {
+      query = await addTenantFilter(knex, query, 'collection_fields');
+    }
+
+    return await query as CollectionField[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch collection fields: ${getErrorMessage(error)}`);
   }
-
-  let query = client
-    .from('collection_fields')
-    .select('*')
-    .eq('collection_id', collection_id)
-    .eq('is_published', is_published)
-    .is('deleted_at', null)
-    .order('order', { ascending: true });
-
-  if (filters?.excludeComputed) {
-    query = query.eq('is_computed', false);
-  }
-
-  if (filters?.search && filters.search.trim()) {
-    const searchTerm = `%${filters.search.trim()}%`;
-    query = query.ilike('name', searchTerm);
-  }
-
-  const { data, error } = await query;
-
-  if (error) {
-    throw new Error(`Failed to fetch collection fields: ${error.message}`);
-  }
-
-  return data || [];
 }
 
 /**
@@ -135,32 +117,30 @@ export async function getFieldsByKeyAcrossCollections(
   key: string,
   collectionIds: string[]
 ): Promise<Map<string, CollectionField>> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
   const result = new Map<string, CollectionField>();
   if (collectionIds.length === 0) return result;
 
-  const { data, error } = await client
-    .from('collection_fields')
-    .select('*')
-    .eq('key', key)
-    .in('collection_id', collectionIds)
-    .eq('is_published', false)
-    .is('deleted_at', null);
+  const knex = await getDb();
 
-  if (error) {
-    throw new Error(`Failed to fetch fields by key: ${error.message}`);
+  try {
+    let query = knex('collection_fields')
+      .select('*')
+      .where('key', key)
+      .whereIn('collection_id', collectionIds)
+      .andWhere('is_published', false)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_fields');
+
+    const data = await query as CollectionField[];
+    data.forEach((field) => {
+      result.set(field.collection_id, field);
+    });
+
+    return result;
+  } catch (error) {
+    if (isMissingTableError(error)) return result;
+    throw new Error(`Failed to fetch fields by key: ${getErrorMessage(error)}`);
   }
-
-  data?.forEach((field: CollectionField) => {
-    result.set(field.collection_id, field);
-  });
-
-  return result;
 }
 
 /**
@@ -169,62 +149,51 @@ export async function getFieldsByKeyAcrossCollections(
  * @param isPublished - Get draft (false) or published (true) version. Defaults to false (draft).
  */
 export async function getFieldById(id: string, isPublished: boolean = false): Promise<CollectionField | null> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_fields')
+      .select('*')
+      .where('id', id)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_fields');
+
+    const data = await query.first();
+    return data ? data as CollectionField : null;
+  } catch (error) {
+    if (isMissingTableError(error)) return null;
+    throw new Error(`Failed to fetch collection field: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_fields')
-    .select('*')
-    .eq('id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .single();
-
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch collection field: ${error.message}`);
-  }
-
-  return data;
 }
 
 /**
  * Create a new field
  */
 export async function createField(fieldData: CreateCollectionFieldData): Promise<CollectionField> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const id = randomUUID();
+  const knex = await getDb();
+  const now = new Date().toISOString();
   const isPublished = fieldData.is_published ?? false;
 
-  const { data, error } = await client
-    .from('collection_fields')
-    .insert({
-      id,
-      ...fieldData,
-      fillable: fieldData.fillable ?? true,
-      key: fieldData.key ?? null,
-      hidden: fieldData.hidden ?? false,
-      is_computed: fieldData.is_computed ?? false,
-      data: fieldData.data ?? {},
-      is_published: isPublished,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .select()
-    .single();
+  const row = await addTenantIdToRow({
+    id: randomUUID(),
+    ...fieldData,
+    fillable: fieldData.fillable ?? true,
+    key: fieldData.key ?? null,
+    hidden: fieldData.hidden ?? false,
+    is_computed: fieldData.is_computed ?? false,
+    data: fieldData.data ?? {},
+    is_published: isPublished,
+    created_at: now,
+    updated_at: now,
+  });
 
-  if (error) {
-    throw new Error(`Failed to create collection field: ${error.message}`);
+  try {
+    const [data] = await knex('collection_fields').insert(row).returning('*');
+    return data as CollectionField;
+  } catch (error) {
+    throw new Error(`Failed to create collection field: ${getErrorMessage(error)}`);
   }
-
-  return data;
 }
 
 /**
@@ -238,29 +207,30 @@ export async function updateField(
   fieldData: UpdateCollectionFieldData,
   isPublished: boolean = false
 ): Promise<CollectionField> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_fields')
+      .where('id', id)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_fields');
+
+    const [data] = await query
+      .update({
+        ...fieldData,
+        updated_at: new Date().toISOString(),
+      })
+      .returning('*');
+
+    if (!data) {
+      throw new Error('Collection field not found');
+    }
+
+    return data as CollectionField;
+  } catch (error) {
+    throw new Error(`Failed to update collection field: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_fields')
-    .update({
-      ...fieldData,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to update collection field: ${error.message}`);
-  }
-
-  return data;
 }
 
 /**
@@ -271,42 +241,25 @@ export async function updateField(
  * @param isPublished - Which version to delete: draft (false) or published (true). Defaults to false (draft).
  */
 export async function deleteField(id: string, isPublished: boolean = false): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
+  const knex = await getDb();
   const now = new Date().toISOString();
 
-  // Soft delete the field
-  const { error: fieldError } = await client
-    .from('collection_fields')
-    .update({
-      deleted_at: now,
-      updated_at: now,
-    })
-    .eq('id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null);
+  try {
+    let fieldQuery = knex('collection_fields')
+      .where('id', id)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at');
+    fieldQuery = await addTenantFilter(knex, fieldQuery, 'collection_fields');
+    await fieldQuery.update({ deleted_at: now, updated_at: now });
 
-  if (fieldError) {
-    throw new Error(`Failed to delete collection field: ${fieldError.message}`);
-  }
-
-  // Soft delete all collection_item_values for this field (same published state)
-  const { error: valuesError } = await client
-    .from('collection_item_values')
-    .update({
-      deleted_at: now,
-      updated_at: now,
-    })
-    .eq('field_id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null);
-
-  if (valuesError) {
-    throw new Error(`Failed to delete field values: ${valuesError.message}`);
+    let valuesQuery = knex('collection_item_values')
+      .where('field_id', id)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at');
+    valuesQuery = await addTenantFilter(knex, valuesQuery, 'collection_item_values');
+    await valuesQuery.update({ deleted_at: now, updated_at: now });
+  } catch (error) {
+    throw new Error(`Failed to delete collection field: ${getErrorMessage(error)}`);
   }
 }
 
@@ -321,32 +274,30 @@ export async function reorderFields(
   is_published: boolean = false,
   field_ids: string[]
 ): Promise<void> {
-  const client = await getSupabaseAdmin();
+  if (field_ids.length === 0) return;
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Update order for each field
-  const updates = field_ids.map((field_id, index) =>
-    client
-      .from('collection_fields')
-      .update({
-        order: index,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', field_id)
-      .eq('collection_id', collection_id)
-      .eq('is_published', is_published)
-      .is('deleted_at', null)
+  const knex = await getDb();
+  const now = new Date().toISOString();
+  const caseBindings = field_ids.flatMap((id, index) => [id, index]);
+  const caseExpression = knex.raw(
+    `CASE ${field_ids.map(() => 'WHEN id = ? THEN ?').join(' ')} ELSE "order" END`,
+    caseBindings
   );
 
-  const results = await Promise.all(updates);
+  try {
+    let query = knex('collection_fields')
+      .whereIn('id', field_ids)
+      .andWhere('collection_id', collection_id)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_fields');
 
-  // Check for errors
-  const errors = results.filter(r => r.error);
-  if (errors.length > 0) {
-    throw new Error(`Failed to reorder fields: ${errors[0].error?.message}`);
+    await query.update({
+      order: caseExpression,
+      updated_at: now,
+    });
+  } catch (error) {
+    throw new Error(`Failed to reorder fields: ${getErrorMessage(error)}`);
   }
 }
 
@@ -358,21 +309,16 @@ export async function reorderFields(
  * @param isPublished - Which version to delete: draft (false) or published (true). Defaults to false (draft).
  */
 export async function hardDeleteField(id: string, isPublished: boolean = false): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Hard delete the field (CASCADE will delete values)
-  const { error } = await client
-    .from('collection_fields')
-    .delete()
-    .eq('id', id)
-    .eq('is_published', isPublished);
-
-  if (error) {
-    throw new Error(`Failed to hard delete collection field: ${error.message}`);
+  try {
+    let query = knex('collection_fields')
+      .where('id', id)
+      .andWhere('is_published', isPublished);
+    query = await addTenantFilter(knex, query, 'collection_fields');
+    await query.del();
+  } catch (error) {
+    throw new Error(`Failed to hard delete collection field: ${getErrorMessage(error)}`);
   }
 }
 
@@ -383,45 +329,59 @@ export async function hardDeleteField(id: string, isPublished: boolean = false):
  * @param id - Field UUID
  */
 export async function publishField(id: string): Promise<CollectionField> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get the draft version
   const draft = await getFieldById(id, false);
   if (!draft) {
     throw new Error('Draft field not found');
   }
 
-  // Upsert published version (composite key handles insert/update automatically)
-  const { data, error } = await client
-    .from('collection_fields')
-    .upsert({
-      id: draft.id, // Same UUID
-      name: draft.name,
-      key: draft.key,
-      type: draft.type,
-      default: draft.default,
-      fillable: draft.fillable,
-      order: draft.order,
-      collection_id: draft.collection_id,
-      reference_collection_id: draft.reference_collection_id,
-      hidden: draft.hidden,
-      data: draft.data,
-      is_published: true,
-      created_at: draft.created_at,
-      updated_at: new Date().toISOString(),
-    }, {
-      onConflict: 'id,is_published', // Composite primary key
-    }).select()
-    .single();
+  const now = new Date().toISOString();
+  const row = await addTenantIdToRow({
+    id: draft.id,
+    name: draft.name,
+    key: draft.key,
+    type: draft.type,
+    default: draft.default,
+    fillable: draft.fillable,
+    order: draft.order,
+    collection_id: draft.collection_id,
+    reference_collection_id: draft.reference_collection_id,
+    hidden: draft.hidden,
+    is_computed: draft.is_computed,
+    data: draft.data,
+    is_published: true,
+    created_at: draft.created_at,
+    updated_at: now,
+  });
 
-  if (error) {
-    throw new Error(`Failed to publish field: ${error.message}`);
+  const tenantId = (draft as CollectionFieldWithTenant).tenant_id;
+  if (tenantId) {
+    row.tenant_id = tenantId;
   }
 
-  return data;
+  try {
+    const [data] = await knex('collection_fields')
+      .insert(row)
+      .onConflict(['id', 'is_published'])
+      .merge([
+        'name',
+        'key',
+        'type',
+        'default',
+        'fillable',
+        'order',
+        'collection_id',
+        'reference_collection_id',
+        'hidden',
+        'is_computed',
+        'data',
+        'updated_at',
+      ])
+      .returning('*');
 
+    return data as CollectionField;
+  } catch (error) {
+    throw new Error(`Failed to publish field: ${getErrorMessage(error)}`);
+  }
 }

@@ -1,21 +1,28 @@
-import { getSupabaseAdmin, getTenantIdFromHeaders } from '@/lib/supabase-server';
-import { getKnexClient } from '@/lib/knex-client';
-import { SUPABASE_IN_FILTER_CHUNK_SIZE, SUPABASE_QUERY_LIMIT, SUPABASE_WRITE_BATCH_SIZE } from '@/lib/supabase-constants';
-import type { CollectionField, CollectionItem, CollectionItemWithValues } from '@/types';
 import { randomUUID } from 'crypto';
-import { getFieldsByCollectionId } from '@/lib/repositories/collectionFieldRepository';
-import { getValuesByFieldId, getValuesByItemIds, getValuesByItemId, getValueRowsForItems } from '@/lib/repositories/collectionItemValueRepository';
+
+import type { Knex } from 'knex';
+
+import { buildStatusValue, findStatusFieldId } from '@/lib/collection-field-utils';
+import { castValue } from '@/lib/collection-utils';
 import { generateCollectionItemContentHash } from '@/lib/hash-utils';
-import { castValue } from '../collection-utils';
-import { findStatusFieldId, buildStatusValue } from '@/lib/collection-field-utils';
-import { chunk } from '@/lib/utils';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb, isMissingTableError } from '@/lib/platform/db';
+import { getTenantIdFromHeaders } from '@/lib/platform/tenant';
+import { getFieldsByCollectionId } from '@/lib/repositories/collectionFieldRepository';
+import {
+  getValueRowsForItems,
+  getValuesByFieldId,
+  getValuesByItemId,
+  getValuesByItemIds,
+} from '@/lib/repositories/collectionItemValueRepository';
+import type { CollectionField, CollectionItem, CollectionItemWithValues } from '@/types';
 
 /**
  * Collection Item Repository
  *
  * Handles CRUD operations for collection items (EAV entities).
  * Items are the actual content entries in a collection.
- * Uses Supabase/PostgreSQL via admin client.
+ * Uses Knex/PostgreSQL via the platform database port.
  *
  * NOTE: Uses composite primary key (id, is_published) architecture.
  * References parent collections using FK (collection_id).
@@ -27,72 +34,6 @@ export interface QueryFilters {
   limit?: number;
   offset?: number;
   itemIds?: string[]; // Filter to specific item IDs (for multi-reference pagination)
-}
-
-/**
- * Get top N items per collection for multiple collections in one query
- * Uses window function (ROW_NUMBER() OVER PARTITION BY) for efficient batch loading
- * @param collectionIds - Array of collection UUIDs
- * @param is_published - Filter for draft (false) or published (true) items. Defaults to false (draft).
- * @param limit - Number of items per collection. Defaults to 10.
- */
-export async function getTopItemsPerCollection(
-  collectionIds: string[],
-  is_published: boolean = false,
-  limit: number = 10
-): Promise<CollectionItem[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  if (collectionIds.length === 0) {
-    return [];
-  }
-
-  // Use raw SQL with window function to get top N items per collection
-  const { data, error } = await client.rpc('get_top_items_per_collection', {
-    p_collection_ids: collectionIds,
-    p_is_published: is_published,
-    p_limit: limit,
-  });
-
-  if (error) {
-    // RPC missing — fetch each collection's top N independently. A single
-    // shared query with `.limit(collectionIds.length * limit)` ordered by
-    // collection_id lets a large early-sorting collection consume the whole
-    // row budget and starve later collections to zero rows (breaking, e.g.,
-    // reference-field lookups). Per-collection limits guarantee fair coverage.
-    const perCollection = await Promise.all(
-      collectionIds.map(async (collectionId) => {
-        let query = client
-          .from('collection_items')
-          .select('*')
-          .eq('collection_id', collectionId)
-          .eq('is_published', is_published)
-          .is('deleted_at', null)
-          .order('manual_order', { ascending: true })
-          .order('created_at', { ascending: false })
-          .limit(limit);
-
-        // For published queries, only include publishable items
-        if (is_published) {
-          query = query.eq('is_publishable', true);
-        }
-
-        const { data: rows, error: rowsError } = await query;
-        if (rowsError) {
-          throw new Error(`Failed to fetch items: ${rowsError.message}`);
-        }
-        return rows || [];
-      })
-    );
-
-    return perCollection.flat();
-  }
-
-  return data || [];
 }
 
 export interface CreateCollectionItemData {
@@ -108,6 +49,159 @@ export interface UpdateCollectionItemData {
   is_publishable?: boolean;
 }
 
+type CollectionItemWithTenant = CollectionItem & { tenant_id?: string | null };
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown error';
+}
+
+async function addTenantIdToRow(row: Record<string, unknown>, tenantId?: string | null): Promise<Record<string, unknown>> {
+  const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
+  if (resolvedTenantId) {
+    row.tenant_id = resolvedTenantId;
+  }
+  return row;
+}
+
+async function addSearchFilter(
+  knex: Knex,
+  query: Knex.QueryBuilder,
+  isPublished: boolean,
+  search?: string
+): Promise<Knex.QueryBuilder> {
+  if (!search?.trim()) return query;
+
+  let valueSubquery = knex('collection_item_values')
+    .select(knex.raw('1'))
+    .whereRaw('collection_item_values.item_id = collection_items.id')
+    .andWhere('collection_item_values.is_published', isPublished)
+    .whereNull('collection_item_values.deleted_at')
+    .andWhereILike('collection_item_values.value', `%${search.trim()}%`);
+  valueSubquery = await addTenantFilter(knex, valueSubquery, 'collection_item_values');
+
+  return query.whereExists(valueSubquery);
+}
+
+async function baseItemsByCollectionQuery(
+  knex: Knex,
+  collectionId: string,
+  isPublished: boolean,
+  filters?: QueryFilters
+): Promise<Knex.QueryBuilder> {
+  let query = knex('collection_items')
+    .where('collection_id', collectionId)
+    .andWhere('is_published', isPublished);
+
+  if (isPublished) {
+    query = query.andWhere('is_publishable', true);
+  }
+
+  if (filters?.itemIds) {
+    query = query.whereIn('id', filters.itemIds);
+  }
+
+  if (filters && 'deleted' in filters) {
+    if (filters.deleted === false) {
+      query = query.whereNull('deleted_at');
+    } else if (filters.deleted === true) {
+      query = query.whereNotNull('deleted_at');
+    }
+  } else {
+    query = query.whereNull('deleted_at');
+  }
+
+  query = await addSearchFilter(knex, query, isPublished, filters?.search);
+  return addTenantFilter(knex, query, 'collection_items');
+}
+
+async function batchUpdateColumnById(
+  knex: Knex,
+  tableName: string,
+  columnName: string,
+  updates: Array<{ id: string; value: string | number }>,
+  extraWhere: (query: Knex.QueryBuilder) => Knex.QueryBuilder
+): Promise<void> {
+  if (updates.length === 0) return;
+
+  const caseBindings = updates.flatMap((update) => [update.id, update.value]);
+  const caseExpression = knex.raw(
+    `CASE ${updates.map(() => 'WHEN id = ? THEN ?').join(' ')} ELSE ?? END`,
+    [...caseBindings, columnName]
+  );
+
+  let query = extraWhere(knex(tableName).whereIn('id', updates.map((update) => update.id)));
+  query = await addTenantFilter(knex, query, tableName);
+  await query.update({
+    [columnName]: caseExpression,
+    updated_at: new Date().toISOString(),
+  });
+}
+
+async function batchUpdateContentHashes(
+  itemHashes: Array<{ id: string; hash: string }>,
+  isPublished: boolean
+): Promise<void> {
+  if (itemHashes.length === 0) return;
+
+  const knex = await getDb();
+  await batchUpdateColumnById(
+    knex,
+    'collection_items',
+    'content_hash',
+    itemHashes.map((item) => ({ id: item.id, value: item.hash })),
+    (query) => query.andWhere('is_published', isPublished)
+  );
+}
+
+/**
+ * Get top N items per collection for multiple collections in one query
+ * Uses window function (ROW_NUMBER() OVER PARTITION BY) for efficient batch loading
+ * @param collectionIds - Array of collection UUIDs
+ * @param is_published - Filter for draft (false) or published (true) items. Defaults to false (draft).
+ * @param limit - Number of items per collection. Defaults to 10.
+ */
+export async function getTopItemsPerCollection(
+  collectionIds: string[],
+  is_published: boolean = false,
+  limit: number = 10
+): Promise<CollectionItem[]> {
+  if (collectionIds.length === 0) {
+    return [];
+  }
+
+  const knex = await getDb();
+
+  try {
+    let rankedQuery = knex('collection_items')
+      .select(
+        '*',
+        knex.raw('ROW_NUMBER() OVER (PARTITION BY collection_id ORDER BY manual_order ASC, created_at DESC) as row_num')
+      )
+      .whereIn('collection_id', collectionIds)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at');
+
+    if (is_published) {
+      rankedQuery = rankedQuery.andWhere('is_publishable', true);
+    }
+
+    rankedQuery = await addTenantFilter(knex, rankedQuery, 'collection_items');
+
+    const rows = await knex
+      .from(rankedQuery.as('ranked_items'))
+      .select('*')
+      .where('row_num', '<=', limit)
+      .orderBy('collection_id', 'asc')
+      .orderBy('manual_order', 'asc')
+      .orderBy('created_at', 'desc') as Array<CollectionItem & { row_num?: number }>;
+
+    return rows.map(({ row_num: _rowNum, ...row }) => row);
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch items: ${getErrorMessage(error)}`);
+  }
+}
+
 /**
  * Get all items for a collection with pagination support
  * @param collection_id - Collection UUID
@@ -119,107 +213,41 @@ export async function getItemsByCollectionId(
   is_published: boolean = false,
   filters?: QueryFilters
 ): Promise<{ items: CollectionItem[], total: number }> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // If itemIds filter is provided, use those directly (for multi-reference fields)
-  // If no items are linked, return early
   if (filters?.itemIds && filters.itemIds.length === 0) {
     return { items: [], total: 0 };
   }
 
-  // Search term (matched against the item's values via an embedded inner join).
-  const searchTerm = filters?.search && filters.search.trim()
-    ? `%${filters.search.trim()}%`
-    : null;
+  const knex = await getDb();
 
-  // itemIds filter (bounded list, e.g. multi-reference fields).
-  const filterIds = filters?.itemIds ?? null;
+  try {
+    const baseQuery = await baseItemsByCollectionQuery(knex, collection_id, is_published, filters);
 
-  // When searching, filter through an embedded inner join on
-  // collection_item_values rather than collecting matching item ids and using
-  // `.in('id', ...)`. The values table has no collection_id, but the embed is
-  // naturally scoped to this collection via the parent FK, and there is no id
-  // list to overflow the request URL for broad terms on large collections.
-  const selectColumns = searchTerm
-    ? '*, collection_item_values!inner(item_id)'
-    : '*';
+    const countResult = await baseQuery
+      .clone()
+      .clearSelect()
+      .clearOrder()
+      .count({ count: '*' })
+      .first() as { count?: string | number } | undefined;
 
-  // Build count query
-  let countQuery = client
-    .from('collection_items')
-    .select(selectColumns, { count: 'exact', head: true })
-    .eq('collection_id', collection_id)
-    .eq('is_published', is_published);
+    let dataQuery = baseQuery
+      .clone()
+      .select('*')
+      .orderBy('manual_order', 'asc')
+      .orderBy('created_at', 'desc');
 
-  // Build data query
-  let query = client
-    .from('collection_items')
-    .select(selectColumns)
-    .eq('collection_id', collection_id)
-    .eq('is_published', is_published)
-    .order('manual_order', { ascending: true })
-    .order('created_at', { ascending: false });
-
-  // For published queries, only include publishable items
-  if (is_published) {
-    countQuery = countQuery.eq('is_publishable', true);
-    query = query.eq('is_publishable', true);
-  }
-  if (filterIds !== null) {
-    countQuery = countQuery.in('id', filterIds);
-    query = query.in('id', filterIds);
-  }
-  if (filters && 'deleted' in filters) {
-    if (filters.deleted === false) {
-      countQuery = countQuery.is('deleted_at', null);
-      query = query.is('deleted_at', null);
-    } else if (filters.deleted === true) {
-      countQuery = countQuery.not('deleted_at', 'is', null);
-      query = query.not('deleted_at', 'is', null);
+    if (filters?.limit !== undefined) {
+      dataQuery = dataQuery.limit(filters.limit);
     }
-  } else {
-    countQuery = countQuery.is('deleted_at', null);
-    query = query.is('deleted_at', null);
-  }
-  if (searchTerm) {
-    countQuery = countQuery
-      .eq('collection_item_values.is_published', is_published)
-      .is('collection_item_values.deleted_at', null)
-      .ilike('collection_item_values.value', searchTerm);
-    query = query
-      .eq('collection_item_values.is_published', is_published)
-      .is('collection_item_values.deleted_at', null)
-      .ilike('collection_item_values.value', searchTerm);
-  }
-  if (filters?.limit !== undefined) {
-    query = query.limit(filters.limit);
-  }
-  if (filters?.offset !== undefined) {
-    query = query.range(filters.offset, filters.offset + (filters.limit || 25) - 1);
-  }
+    if (filters?.offset !== undefined) {
+      dataQuery = dataQuery.offset(filters.offset);
+    }
 
-  // Run count and data queries in parallel
-  const [countResult, dataResult] = await Promise.all([countQuery, query]);
-
-  if (countResult.error) {
-    throw new Error(`Failed to count collection items: ${countResult.error.message}`);
+    const items = await dataQuery as CollectionItem[];
+    return { items, total: Number(countResult?.count) || 0 };
+  } catch (error) {
+    if (isMissingTableError(error)) return { items: [], total: 0 };
+    throw new Error(`Failed to fetch collection items: ${getErrorMessage(error)}`);
   }
-  if (dataResult.error) {
-    throw new Error(`Failed to fetch collection items: ${dataResult.error.message}`);
-  }
-
-  // Strip the embedded join helper column added for search filtering so the
-  // returned rows keep the plain CollectionItem shape.
-  const items = ((dataResult.data || []) as unknown as Record<string, unknown>[]).map((row) => {
-    const { collection_item_values: _ignored, ...item } = row;
-    return item as unknown as CollectionItem;
-  });
-
-  return { items, total: countResult.count || 0 };
 }
 
 /**
@@ -233,60 +261,45 @@ export async function fetchPublishedHashMap(
   const publishedHashMap = new Map<string, string | null>();
   if (itemIds.length === 0) return publishedHashMap;
 
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase client not configured');
+  const knex = await getDb();
 
-  let publishedRows: Array<{ id: string; content_hash: string | null }> | null = null;
   try {
-    // Chunk the ID list: a single large `.in()` overflows the request URL length
-    // limit and returns 400 Bad Request. Fetch chunks in parallel and merge.
-    const chunkResults = await Promise.all(
-      chunk(itemIds, SUPABASE_IN_FILTER_CHUNK_SIZE).map(async (idsChunk) => {
-        const { data, error } = await client
-          .from('collection_items')
-          .select('id, content_hash')
-          .in('id', idsChunk)
-          .eq('is_published', true)
-          .is('deleted_at', null);
+    let query = knex('collection_items')
+      .select('id', 'content_hash')
+      .whereIn('id', itemIds)
+      .andWhere('is_published', true)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_items');
 
-        if (error) {
-          console.error('Failed to fetch published items for status:', error.message);
-          return null;
-        }
-        return data;
-      }),
-    );
+    const publishedRows = await query as Array<{ id: string; content_hash: string | null }>;
+    for (const row of publishedRows) {
+      publishedHashMap.set(row.id, row.content_hash);
+    }
 
-    // If every chunk failed, keep publishedRows null; otherwise merge successful chunks
-    if (chunkResults.some((rows) => rows !== null)) {
-      publishedRows = chunkResults.flatMap((rows) => rows ?? []);
+    const itemsMissingHash = publishedRows.filter((row) => row.content_hash == null);
+    if (itemsMissingHash.length > 0) {
+      const valueRows = await getValueRowsForItems(itemsMissingHash.map((row) => row.id), true);
+      const valuesByItem = new Map<string, Array<{ field_id: string; value: string | null }>>();
+
+      for (const row of valueRows) {
+        if (!valuesByItem.has(row.item_id)) valuesByItem.set(row.item_id, []);
+        valuesByItem.get(row.item_id)!.push({ field_id: row.field_id, value: row.value });
+      }
+
+      const hashesToBackfill: Array<{ id: string; hash: string }> = [];
+      for (const item of itemsMissingHash) {
+        const values = valuesByItem.get(item.id) || [];
+        if (values.length === 0) continue;
+
+        const hash = generateCollectionItemContentHash(values);
+        publishedHashMap.set(item.id, hash);
+        hashesToBackfill.push({ id: item.id, hash });
+      }
+
+      await batchUpdateContentHashes(hashesToBackfill, true);
     }
   } catch (err) {
-    // Transient network errors should not break the items endpoint
-    console.error('Network error fetching published items for status:', err);
-  }
-
-  for (const row of publishedRows || []) {
-    publishedHashMap.set(row.id, row.content_hash);
-  }
-
-  // Backfill published items that have null content_hash
-  const itemsMissingHash = (publishedRows || []).filter(row => row.content_hash == null);
-  if (itemsMissingHash.length > 0) {
-    const backfillPromises = itemsMissingHash.map(async (row) => {
-      const pubValues = await getValuesByItemId(row.id, true);
-      if (pubValues.length === 0) return;
-      const hash = generateCollectionItemContentHash(
-        pubValues.map(v => ({ field_id: v.field_id, value: v.value }))
-      );
-      publishedHashMap.set(row.id, hash);
-      await client
-        .from('collection_items')
-        .update({ content_hash: hash })
-        .eq('id', row.id)
-        .eq('is_published', true);
-    });
-    await Promise.all(backfillPromises);
+    console.error('Failed to fetch published items for status:', err);
   }
 
   return publishedHashMap;
@@ -309,7 +322,7 @@ export async function enrichItemsWithStatus(
   if (!statusFieldId || items.length === 0) return;
 
   const hashMap = publishedHashMap
-    ?? await fetchPublishedHashMap(items.map(item => item.id));
+    ?? await fetchPublishedHashMap(items.map((item) => item.id));
 
   for (const item of items) {
     const publishedHash = hashMap.get(item.id);
@@ -336,54 +349,33 @@ export async function enrichSingleItemWithStatus(
 }
 
 /**
- * Get every non-deleted item across all collections in one direct-DB (Knex) read.
+ * Get every non-deleted item across all collections in one Knex read.
  * Intended for bulk publish flows that group items by collection in memory,
- * avoiding a per-collection round-trip. Falls back to paginated PostgREST.
+ * avoiding a per-collection round-trip.
  * @param tenantId - Optional explicit tenant scope (required inside unstable_cache)
  */
 export async function getAllItemsRaw(
   is_published: boolean,
   tenantId?: string
 ): Promise<CollectionItem[]> {
+  const knex = await getDb();
+
   try {
-    const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
     let query = knex('collection_items')
       .select('*')
       .where('is_published', is_published)
       .whereNull('deleted_at');
-    if (resolvedTenantId) {
-      query = query.where('tenant_id', resolvedTenantId);
-    }
-    return await query;
-  } catch {
-    const client = await getSupabaseAdmin(tenantId);
-    if (!client) {
-      throw new Error('Supabase client not configured');
+
+    if (tenantId) {
+      query = query.where('tenant_id', tenantId);
+    } else {
+      query = await addTenantFilter(knex, query, 'collection_items');
     }
 
-    const allItems: CollectionItem[] = [];
-    let offset = 0;
-    let hasMore = true;
-    while (hasMore) {
-      const { data, error } = await client
-        .from('collection_items')
-        .select('*')
-        .eq('is_published', is_published)
-        .is('deleted_at', null)
-        .order('id', { ascending: true })
-        .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
-
-      if (error) {
-        throw new Error(`Failed to fetch collection items: ${error.message}`);
-      }
-
-      const batch = data || [];
-      allItems.push(...batch);
-      hasMore = batch.length === SUPABASE_QUERY_LIMIT;
-      offset += batch.length;
-    }
-    return allItems;
+    return await query as CollectionItem[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch collection items: ${getErrorMessage(error)}`);
   }
 }
 
@@ -397,75 +389,29 @@ export async function getAllItemsByCollectionId(
   is_published: boolean = false,
   includeDeleted: boolean = false
 ): Promise<CollectionItem[]> {
-  // Fast path: one direct-DB (Knex) query instead of paginated PostgREST reads.
+  const knex = await getDb();
+
   try {
-    const knex = await getKnexClient();
-    const resolvedTenantId = await getTenantIdFromHeaders();
     let query = knex('collection_items')
       .select('*')
       .where('collection_id', collection_id)
       .andWhere('is_published', is_published)
       .orderBy('manual_order', 'asc')
       .orderBy('created_at', 'desc');
-    // For published queries, only include publishable items
+
     if (is_published) {
       query = query.where('is_publishable', true);
     }
-    if (resolvedTenantId) {
-      query = query.where('tenant_id', resolvedTenantId);
-    }
+
     query = includeDeleted
       ? query.whereNotNull('deleted_at')
       : query.whereNull('deleted_at');
-    return await query;
-  } catch {
-    // Fallback: paginated PostgREST reads
-    const client = await getSupabaseAdmin();
-    if (!client) {
-      throw new Error('Supabase client not configured');
-    }
 
-    const allItems: CollectionItem[] = [];
-    let offset = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-      let query = client
-        .from('collection_items')
-        .select('*')
-        .eq('collection_id', collection_id)
-        .eq('is_published', is_published)
-        .order('manual_order', { ascending: true })
-        .order('created_at', { ascending: false })
-        .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
-
-      // For published queries, only include publishable items
-      if (is_published) {
-        query = query.eq('is_publishable', true);
-      }
-
-      if (includeDeleted) {
-        query = query.not('deleted_at', 'is', null);
-      } else {
-        query = query.is('deleted_at', null);
-      }
-
-      const { data, error } = await query;
-
-      if (error) {
-        throw new Error(`Failed to fetch collection items: ${error.message}`);
-      }
-
-      if (data && data.length > 0) {
-        allItems.push(...data);
-        offset += data.length;
-        hasMore = data.length === SUPABASE_QUERY_LIMIT;
-      } else {
-        hasMore = false;
-      }
-    }
-
-    return allItems;
+    query = await addTenantFilter(knex, query, 'collection_items');
+    return await query as CollectionItem[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch collection items: ${getErrorMessage(error)}`);
   }
 }
 
@@ -474,25 +420,31 @@ export async function getAllItemsByCollectionId(
  * @param id - Item UUID
  * @param isPublished - Get draft (false) or published (true) version. Defaults to false (draft).
  */
-export async function getItemById(id: string, isPublished: boolean = false, tenantId?: string): Promise<CollectionItem | null> {
-  const client = await getSupabaseAdmin(tenantId);
+export async function getItemById(
+  id: string,
+  isPublished: boolean = false,
+  tenantId?: string
+): Promise<CollectionItem | null> {
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_items')
+      .select('*')
+      .where('id', id)
+      .andWhere('is_published', isPublished);
+
+    if (tenantId) {
+      query = query.where('tenant_id', tenantId);
+    } else {
+      query = await addTenantFilter(knex, query, 'collection_items');
+    }
+
+    const data = await query.first();
+    return data ? data as CollectionItem : null;
+  } catch (error) {
+    if (isMissingTableError(error)) return null;
+    throw new Error(`Failed to fetch collection item: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_items')
-    .select('*')
-    .eq('id', id)
-    .eq('is_published', isPublished)
-    .single();
-
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to fetch collection item: ${error.message}`);
-  }
-
-  return data;
 }
 
 /**
@@ -501,51 +453,34 @@ export async function getItemById(id: string, isPublished: boolean = false, tena
  * @param isPublished - Get draft (false) or published (true) items
  * @returns Array of items found
  */
-export async function getItemsByIds(ids: string[], isPublished: boolean = false, tenantId?: string): Promise<CollectionItem[]> {
+export async function getItemsByIds(
+  ids: string[],
+  isPublished: boolean = false,
+  tenantId?: string
+): Promise<CollectionItem[]> {
   if (ids.length === 0) {
     return [];
   }
 
-  // Fast path: one direct-DB (Knex) query instead of chunked PostgREST `.in()`
-  // reads (100 IDs/round-trip). On large collections this collapses ~16
-  // round-trips per call into one — the dominant cost of publishing.
+  const knex = await getDb();
+
   try {
-    const knex = await getKnexClient();
-    const resolvedTenantId = tenantId ?? await getTenantIdFromHeaders();
     let query = knex('collection_items')
       .select('*')
       .whereIn('id', ids)
       .andWhere('is_published', isPublished)
       .whereNull('deleted_at');
-    if (resolvedTenantId) {
-      query = query.where('tenant_id', resolvedTenantId);
-    }
-    return await query;
-  } catch {
-    // Fallback: chunked PostgREST reads
-    const client = await getSupabaseAdmin(tenantId);
-    if (!client) {
-      throw new Error('Supabase client not configured');
+
+    if (tenantId) {
+      query = query.where('tenant_id', tenantId);
+    } else {
+      query = await addTenantFilter(knex, query, 'collection_items');
     }
 
-    const allItems: CollectionItem[] = [];
-    for (let i = 0; i < ids.length; i += SUPABASE_WRITE_BATCH_SIZE) {
-      const batchIds = ids.slice(i, i + SUPABASE_WRITE_BATCH_SIZE);
-      const { data, error } = await client
-        .from('collection_items')
-        .select('*')
-        .in('id', batchIds)
-        .eq('is_published', isPublished)
-        .is('deleted_at', null);
-
-      if (error) {
-        throw new Error(`Failed to fetch collection items: ${error.message}`);
-      }
-      if (data) {
-        allItems.push(...data);
-      }
-    }
-    return allItems;
+    return await query as CollectionItem[];
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to fetch collection items: ${getErrorMessage(error)}`);
   }
 }
 
@@ -555,49 +490,65 @@ export async function getItemsByIds(ids: string[], isPublished: boolean = false,
  * @param id - Item UUID
  * @param is_published - Get draft (false) or published (true) values. Defaults to false (draft).
  */
-export async function getItemWithValues(id: string, is_published: boolean = false, tenantId?: string): Promise<CollectionItemWithValues | null> {
-  const client = await getSupabaseAdmin(tenantId);
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get the item
+export async function getItemWithValues(
+  id: string,
+  is_published: boolean = false,
+  tenantId?: string
+): Promise<CollectionItemWithValues | null> {
   const item = await getItemById(id, is_published, tenantId);
   if (!item) return null;
 
-  // Build query for values with field type info
-  let valuesQuery = client
-    .from('collection_item_values')
-    .select('value, field_id, collection_fields!inner(type)')
-    .eq('item_id', id)
-    .eq('is_published', is_published);
+  const knex = await getDb();
 
-  // If the item itself is deleted, include deleted values (to show name in UI)
-  // Otherwise, exclude deleted values
-  if (!item.deleted_at) {
-    valuesQuery = valuesQuery.is('deleted_at', null);
-  }
+  try {
+    let valuesQuery = knex('collection_item_values')
+      .select('value', 'field_id')
+      .where('item_id', id)
+      .andWhere('is_published', is_published);
 
-  const { data: valuesData, error: valuesError } = await valuesQuery;
-
-  if (valuesError) {
-    throw new Error(`Failed to fetch item values: ${valuesError.message}`);
-  }
-
-  // Transform to { field_id: value } object, casting values by type
-  const values: Record<string, any> = {};
-  valuesData?.forEach((row: any) => {
-    if (row.field_id) {
-      const fieldType = row.collection_fields?.type;
-      values[row.field_id] = castValue(row.value, fieldType || 'text');
+    if (!item.deleted_at) {
+      valuesQuery = valuesQuery.whereNull('deleted_at');
     }
-  });
 
-  return {
-    ...item,
-    values,
-  };
+    if (tenantId) {
+      valuesQuery = valuesQuery.where('tenant_id', tenantId);
+    } else {
+      valuesQuery = await addTenantFilter(knex, valuesQuery, 'collection_item_values');
+    }
+
+    const valuesData = await valuesQuery as Array<{ value: string | null; field_id: string }>;
+    const fieldIds = Array.from(new Set(valuesData.map((row) => row.field_id)));
+
+    let fieldTypeMap: Record<string, string> = {};
+    if (fieldIds.length > 0) {
+      let fieldsQuery = knex('collection_fields')
+        .select('id', 'type')
+        .whereIn('id', fieldIds);
+      if (tenantId) {
+        fieldsQuery = fieldsQuery.where('tenant_id', tenantId);
+      } else {
+        fieldsQuery = await addTenantFilter(knex, fieldsQuery, 'collection_fields');
+      }
+
+      const fields = await fieldsQuery as Array<{ id: string; type: string }>;
+      fieldTypeMap = Object.fromEntries(fields.map((field) => [field.id, field.type]));
+    }
+
+    const values: Record<string, any> = {};
+    valuesData.forEach((row) => {
+      if (row.field_id) {
+        values[row.field_id] = castValue(row.value, (fieldTypeMap[row.field_id] || 'text') as CollectionField['type']);
+      }
+    });
+
+    return {
+      ...item,
+      values,
+    };
+  } catch (error) {
+    if (isMissingTableError(error)) return { ...item, values: {} };
+    throw new Error(`Failed to fetch item values: ${getErrorMessage(error)}`);
+  }
 }
 
 /**
@@ -612,46 +563,39 @@ export async function getItemIdsByFieldValue(
   targetValue: string,
   isPublished: boolean = false
 ): Promise<string[]> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let valuesQuery = knex('collection_item_values')
+      .select('item_id')
+      .where('field_id', fieldId)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at')
+      .andWhere((builder) => {
+        builder
+          .where('value', targetValue)
+          .orWhere('value', 'like', `%"${targetValue}"%`);
+      });
+    valuesQuery = await addTenantFilter(knex, valuesQuery, 'collection_item_values');
+
+    const values = await valuesQuery as Array<{ item_id: string }>;
+    const candidateIds = Array.from(new Set(values.map((value) => value.item_id)));
+    if (candidateIds.length === 0) return [];
+
+    let itemsQuery = knex('collection_items')
+      .select('id')
+      .where('collection_id', collectionId)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at')
+      .whereIn('id', candidateIds);
+    itemsQuery = await addTenantFilter(knex, itemsQuery, 'collection_items');
+
+    const validItems = await itemsQuery as Array<{ id: string }>;
+    return validItems.map((item) => item.id);
+  } catch (error) {
+    if (isMissingTableError(error)) return [];
+    throw new Error(`Failed to query inverse references: ${getErrorMessage(error)}`);
   }
-
-  // Find item IDs where the field value matches (single reference = exact, multi_reference = contains)
-  // For single reference: value = targetValue (exact match)
-  // For multi_reference: value is a JSON string like '["uuid1","uuid2"]' containing targetValue
-  // We query for both patterns using OR with LIKE for JSON array containment
-  const { data, error } = await client
-    .from('collection_item_values')
-    .select('item_id')
-    .eq('field_id', fieldId)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .or(`value.eq.${targetValue},value.like.%"${targetValue}"%`);
-
-  if (error) {
-    throw new Error(`Failed to query inverse references: ${error.message}`);
-  }
-
-  if (!data || data.length === 0) return [];
-
-  // Get unique item IDs that also belong to the target collection and are not deleted
-  const candidateIds = [...new Set(data.map(v => v.item_id))];
-
-  const { data: validItems, error: itemError } = await client
-    .from('collection_items')
-    .select('id')
-    .eq('collection_id', collectionId)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .in('id', candidateIds);
-
-  if (itemError) {
-    throw new Error(`Failed to validate inverse reference items: ${itemError.message}`);
-  }
-
-  return validItems?.map(i => i.id) || [];
 }
 
 /**
@@ -674,67 +618,79 @@ export async function getItemsSortedByField(
   search?: string,
   knownFieldTypes?: Record<string, string>,
 ): Promise<{ items: CollectionItemWithValues[], total: number }> {
-  const knex = await getKnexClient();
-
+  const knex = await getDb();
   const safeSortOrder = sortOrder === 'desc' ? 'DESC' : 'ASC';
   const nullsPosition = safeSortOrder === 'ASC' ? 'NULLS LAST' : 'NULLS FIRST';
 
-  let searchItemIds: string[] | null = null;
-  if (search?.trim()) {
-    const searchTerm = `%${search.trim()}%`;
-    const matchRows = await knex('collection_item_values')
-      .distinct('item_id')
+  try {
+    let searchItemIds: string[] | null = null;
+    if (search?.trim()) {
+      let matchRowsQuery = knex('collection_item_values')
+        .distinct('item_id')
+        .where('is_published', is_published)
+        .whereNull('deleted_at')
+        .andWhereILike('value', `%${search.trim()}%`);
+      matchRowsQuery = await addTenantFilter(knex, matchRowsQuery, 'collection_item_values');
+
+      const matchRows = await matchRowsQuery as Array<{ item_id: string }>;
+      if (matchRows.length === 0) return { items: [], total: 0 };
+      searchItemIds = matchRows.map((row) => row.item_id);
+    }
+
+    let itemBase = knex('collection_items')
+      .select('*')
+      .where('collection_id', collection_id)
+      .andWhere('is_published', is_published)
+      .whereNull('deleted_at');
+
+    if (is_published) {
+      itemBase = itemBase.andWhere('is_publishable', true);
+    }
+    if (searchItemIds) {
+      itemBase = itemBase.whereIn('id', searchItemIds);
+    }
+    itemBase = await addTenantFilter(knex, itemBase, 'collection_items');
+
+    let sortValues = knex('collection_item_values')
+      .select('item_id', 'value')
       .where('is_published', is_published)
-      .whereNull('deleted_at')
-      .andWhereILike('value', searchTerm);
+      .andWhere('field_id', sortFieldId)
+      .whereNull('deleted_at');
+    sortValues = await addTenantFilter(knex, sortValues, 'collection_item_values');
 
-    if (matchRows.length === 0) return { items: [], total: 0 };
-    searchItemIds = matchRows.map((r: { item_id: string }) => r.item_id);
-  }
+    const baseQuery = knex
+      .from(itemBase.as('ci'))
+      .leftJoin(sortValues.as('civ'), 'civ.item_id', 'ci.id');
 
-  let baseQuery = knex('collection_items as ci')
-    .leftJoin('collection_item_values as civ', function () {
-      this.on('civ.item_id', 'ci.id')
-        .andOn('civ.is_published', knex.raw('?', [is_published]))
-        .andOn('civ.field_id', knex.raw('?', [sortFieldId]))
-        .andOn(knex.raw('civ.deleted_at IS NULL'));
-    })
-    .where('ci.collection_id', collection_id)
-    .andWhere('ci.is_published', is_published)
-    .whereNull('ci.deleted_at');
+    const countResult = await baseQuery
+      .clone()
+      .count<{ count: string | number }[]>({ count: 'ci.id' })
+      .first();
 
-  if (is_published) {
-    baseQuery = baseQuery.andWhere('ci.is_publishable', true);
-  }
-  if (searchItemIds) {
-    baseQuery = baseQuery.whereIn('ci.id', searchItemIds);
-  }
-
-  const [countResult, rows] = await Promise.all([
-    baseQuery.clone().count('ci.id as count').first(),
-    baseQuery.clone()
+    const rows = await baseQuery
+      .clone()
       .select('ci.*')
       .orderByRaw(`civ.value ${safeSortOrder} ${nullsPosition}`)
       .orderBy('ci.manual_order', 'asc')
       .limit(limit)
-      .offset(offset),
-  ]);
+      .offset(offset) as CollectionItem[];
 
-  const total = Number(countResult?.count) || 0;
+    const total = Number(countResult?.count) || 0;
+    if (rows.length === 0) {
+      return { items: [], total };
+    }
 
-  if (rows.length === 0) {
-    return { items: [], total };
+    const valuesByItem = await getValuesByItemIds(rows.map((row) => row.id), is_published, knownFieldTypes);
+    const items = rows.map((row) => ({
+      ...row,
+      values: valuesByItem[row.id] || {},
+    }));
+
+    return { items, total };
+  } catch (error) {
+    if (isMissingTableError(error)) return { items: [], total: 0 };
+    throw new Error(`Failed to fetch sorted collection items: ${getErrorMessage(error)}`);
   }
-
-  const itemIds = rows.map((r: CollectionItem) => r.id);
-  const valuesByItem = await getValuesByItemIds(itemIds, is_published, knownFieldTypes);
-
-  const items: CollectionItemWithValues[] = rows.map((row: CollectionItem) => ({
-    ...row,
-    values: valuesByItem[row.id] || {},
-  }));
-
-  return { items, total };
 }
 
 /**
@@ -751,7 +707,7 @@ export async function getItemsWithValuesByIds(
   const items = await getItemsByIds(ids, is_published);
   if (items.length === 0) return {};
 
-  const valuesByItem = await getValuesByItemIds(items.map(i => i.id), is_published);
+  const valuesByItem = await getValuesByItemIds(items.map((item) => item.id), is_published);
 
   const result: Record<string, CollectionItemWithValues> = {};
   for (const item of items) {
@@ -775,7 +731,7 @@ export async function getSlugsByItemIds(
   const itemList = Object.values(itemsByIds);
   if (itemList.length === 0) return {};
 
-  const refCollectionIds = Array.from(new Set(itemList.map(i => i.collection_id)));
+  const refCollectionIds = Array.from(new Set(itemList.map((item) => item.collection_id)));
   const fieldsByCollection = new Map<string, CollectionField[]>();
   await Promise.all(
     refCollectionIds.map(async (collId) => {
@@ -787,10 +743,10 @@ export async function getSlugsByItemIds(
   const slugs: Record<string, string> = {};
   for (const item of itemList) {
     const fields = fieldsByCollection.get(item.collection_id);
-    const slugField = fields?.find(f => f.key === 'slug');
+    const slugField = fields?.find((field) => field.key === 'slug');
     const slugValue = slugField ? item.values[slugField.id] : undefined;
     if (slugValue) {
-      slugs[item.id] = slugValue;
+      slugs[item.id] = String(slugValue);
     }
   }
   return slugs;
@@ -814,10 +770,13 @@ export async function getItemsWithValues(
     return { items: [], total };
   }
 
-  const itemIds = items.map(item => item.id);
-  const valuesByItem = await getValuesByItemIds(itemIds, is_published, knownFieldTypes);
+  const valuesByItem = await getValuesByItemIds(
+    items.map((item) => item.id),
+    is_published,
+    knownFieldTypes
+  );
 
-  const itemsWithValues: CollectionItemWithValues[] = items.map(item => ({
+  const itemsWithValues = items.map((item) => ({
     ...item,
     values: valuesByItem[item.id] || {},
   }));
@@ -843,35 +802,24 @@ export async function getTopItemsWithValuesPerCollection(
     return {};
   }
 
-  // Query 1: Get top N items per collection using window function
   const items = await getTopItemsPerCollection(collectionIds, is_published, limit);
 
+  const result: Record<string, { items: CollectionItemWithValues[] }> = {};
+  collectionIds.forEach((id) => {
+    result[id] = { items: [] };
+  });
+
   if (items.length === 0) {
-    const result: Record<string, { items: CollectionItemWithValues[] }> = {};
-    collectionIds.forEach(id => {
-      result[id] = { items: [] };
-    });
     return result;
   }
 
-  // Query 2: Get all values for these items in one query
-  const itemIds = items.map(item => item.id);
-  const valuesByItem = await getValuesByItemIds(itemIds, is_published);
-
-  // Combine items with their values
-  const itemsWithValues: CollectionItemWithValues[] = items.map(item => ({
+  const valuesByItem = await getValuesByItemIds(items.map((item) => item.id), is_published);
+  const itemsWithValues = items.map((item) => ({
     ...item,
     values: valuesByItem[item.id] || {},
   }));
 
-  // Group by collection_id
-  const result: Record<string, { items: CollectionItemWithValues[] }> = {};
-
-  collectionIds.forEach(id => {
-    result[id] = { items: [] };
-  });
-
-  itemsWithValues.forEach(item => {
+  itemsWithValues.forEach((item) => {
     if (!result[item.collection_id]) {
       result[item.collection_id] = { items: [] };
     }
@@ -888,24 +836,23 @@ export async function getMaxManualOrder(
   collectionId: string,
   isPublished: boolean = false
 ): Promise<number> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_items')
+      .select('manual_order')
+      .where('collection_id', collectionId)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at')
+      .orderBy('manual_order', 'desc')
+      .limit(1);
+    query = await addTenantFilter(knex, query, 'collection_items');
+
+    const data = await query.first() as { manual_order?: number } | undefined;
+    return data?.manual_order ?? -1;
+  } catch {
+    return -1;
   }
-
-  const { data, error } = await client
-    .from('collection_items')
-    .select('manual_order')
-    .eq('collection_id', collectionId)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .order('manual_order', { ascending: false })
-    .limit(1)
-    .single();
-
-  if (error || !data) return -1;
-  return data.manual_order ?? -1;
 }
 
 /**
@@ -918,31 +865,15 @@ export async function getMaxIdValue(
   collection_id: string,
   is_published: boolean = false
 ): Promise<number> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get all fields for the collection
   const fields = await getFieldsByCollectionId(collection_id, is_published);
-
-  // Find the field with key = 'id'
-  const idField = fields.find(field => field.key === 'id');
+  const idField = fields.find((field) => field.key === 'id');
 
   if (!idField) {
-    // No ID field exists, return 0
     return 0;
   }
 
-  // Get all values for the ID field
   const idValues = await getValuesByFieldId(idField.id, is_published);
 
-  if (idValues.length === 0) {
-    return 0;
-  }
-
-  // Parse all ID values as numbers and find the maximum
   let maxId = 0;
   for (const value of idValues) {
     if (value.value) {
@@ -963,70 +894,58 @@ export async function getMaxIdValue(
 export async function createItemsBulk(
   items: Array<CreateCollectionItemData & { id?: string }>
 ): Promise<CollectionItem[]> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
   if (items.length === 0) return [];
 
+  const knex = await getDb();
+  const tenantId = await getTenantIdFromHeaders();
   const now = new Date().toISOString();
-  const itemsToInsert = items.map(item => ({
-    id: item.id || randomUUID(),
-    collection_id: item.collection_id,
-    manual_order: item.manual_order ?? 0,
-    is_published: item.is_published ?? false,
-    is_publishable: item.is_publishable ?? true,
-    content_hash: item.content_hash ?? null,
-    created_at: now,
-    updated_at: now,
-  }));
+  const itemsToInsert = items.map((item) => {
+    const row: Record<string, unknown> = {
+      id: item.id || randomUUID(),
+      collection_id: item.collection_id,
+      manual_order: item.manual_order ?? 0,
+      is_published: item.is_published ?? false,
+      is_publishable: item.is_publishable ?? true,
+      content_hash: item.content_hash ?? null,
+      created_at: now,
+      updated_at: now,
+    };
+    if (tenantId) row.tenant_id = tenantId;
+    return row;
+  });
 
-  const { data, error } = await client
-    .from('collection_items')
-    .insert(itemsToInsert)
-    .select();
-
-  if (error) {
-    throw new Error(`Failed to bulk create items: ${error.message}`);
+  try {
+    const data = await knex('collection_items').insert(itemsToInsert).returning('*');
+    return data as CollectionItem[];
+  } catch (error) {
+    throw new Error(`Failed to bulk create items: ${getErrorMessage(error)}`);
   }
-
-  return data || [];
 }
 
 /**
  * Create a new item
  */
 export async function createItem(itemData: CreateCollectionItemData): Promise<CollectionItem> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const id = randomUUID();
+  const knex = await getDb();
+  const now = new Date().toISOString();
   const isPublished = itemData.is_published ?? false;
 
-  const { data, error } = await client
-    .from('collection_items')
-    .insert({
-      id,
-      ...itemData,
-      manual_order: itemData.manual_order ?? 0,
-      is_published: isPublished,
-      is_publishable: itemData.is_publishable ?? true,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .select()
-    .single();
+  const row = await addTenantIdToRow({
+    id: randomUUID(),
+    ...itemData,
+    manual_order: itemData.manual_order ?? 0,
+    is_published: isPublished,
+    is_publishable: itemData.is_publishable ?? true,
+    created_at: now,
+    updated_at: now,
+  });
 
-  if (error) {
-    throw new Error(`Failed to create collection item: ${error.message}`);
+  try {
+    const [data] = await knex('collection_items').insert(row).returning('*');
+    return data as CollectionItem;
+  } catch (error) {
+    throw new Error(`Failed to create collection item: ${getErrorMessage(error)}`);
   }
-
-  return data;
 }
 
 /**
@@ -1040,29 +959,30 @@ export async function updateItem(
   itemData: UpdateCollectionItemData,
   isPublished: boolean = false
 ): Promise<CollectionItem> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
+  try {
+    let query = knex('collection_items')
+      .where('id', id)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at');
+    query = await addTenantFilter(knex, query, 'collection_items');
+
+    const [data] = await query
+      .update({
+        ...itemData,
+        updated_at: new Date().toISOString(),
+      })
+      .returning('*');
+
+    if (!data) {
+      throw new Error('Collection item not found');
+    }
+
+    return data as CollectionItem;
+  } catch (error) {
+    throw new Error(`Failed to update collection item: ${getErrorMessage(error)}`);
   }
-
-  const { data, error } = await client
-    .from('collection_items')
-    .update({
-      ...itemData,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null)
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to update collection item: ${error.message}`);
-  }
-
-  return data;
 }
 
 /**
@@ -1074,42 +994,25 @@ export async function updateItem(
  * @param isPublished - Which version to delete: draft (false) or published (true). Defaults to false (draft).
  */
 export async function deleteItem(id: string, isPublished: boolean = false): Promise<void> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
+  const knex = await getDb();
   const now = new Date().toISOString();
 
-  // Soft delete the collection item
-  const { error: itemError } = await client
-    .from('collection_items')
-    .update({
-      deleted_at: now,
-      updated_at: now,
-    })
-    .eq('id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null);
+  try {
+    let itemQuery = knex('collection_items')
+      .where('id', id)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at');
+    itemQuery = await addTenantFilter(knex, itemQuery, 'collection_items');
+    await itemQuery.update({ deleted_at: now, updated_at: now });
 
-  if (itemError) {
-    throw new Error(`Failed to delete collection item: ${itemError.message}`);
-  }
-
-  // Soft delete all collection_item_values for this item (same published state)
-  const { error: valuesError } = await client
-    .from('collection_item_values')
-    .update({
-      deleted_at: now,
-      updated_at: now,
-    })
-    .eq('item_id', id)
-    .eq('is_published', isPublished)
-    .is('deleted_at', null);
-
-  if (valuesError) {
-    throw new Error(`Failed to delete collection item values: ${valuesError.message}`);
+    let valuesQuery = knex('collection_item_values')
+      .where('item_id', id)
+      .andWhere('is_published', isPublished)
+      .whereNull('deleted_at');
+    valuesQuery = await addTenantFilter(knex, valuesQuery, 'collection_item_values');
+    await valuesQuery.update({ deleted_at: now, updated_at: now });
+  } catch (error) {
+    throw new Error(`Failed to delete collection item: ${getErrorMessage(error)}`);
   }
 }
 
@@ -1121,20 +1024,16 @@ export async function deleteItem(id: string, isPublished: boolean = false): Prom
  * @param isPublished - Which version to delete: draft (false) or published (true). Defaults to false (draft).
  */
 export async function hardDeleteItem(id: string, isPublished: boolean = false): Promise<void> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  const { error } = await client
-    .from('collection_items')
-    .delete()
-    .eq('id', id)
-    .eq('is_published', isPublished);
-
-  if (error) {
-    throw new Error(`Failed to hard delete collection item: ${error.message}`);
+  try {
+    let query = knex('collection_items')
+      .where('id', id)
+      .andWhere('is_published', isPublished);
+    query = await addTenantFilter(knex, query, 'collection_items');
+    await query.del();
+  } catch (error) {
+    throw new Error(`Failed to hard delete collection item: ${getErrorMessage(error)}`);
   }
 }
 
@@ -1144,41 +1043,33 @@ export async function hardDeleteItem(id: string, isPublished: boolean = false): 
  * @param itemId - UUID of the item to duplicate
  * @param isPublished - Whether to duplicate draft (false) or published (true) version. Defaults to false (draft).
  */
-export async function duplicateItem(itemId: string, isPublished: boolean = false): Promise<CollectionItemWithValues> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get the original item with its values
+export async function duplicateItem(
+  itemId: string,
+  isPublished: boolean = false
+): Promise<CollectionItemWithValues> {
   const originalItem = await getItemWithValues(itemId, isPublished);
   if (!originalItem) {
     throw new Error('Item not found');
   }
 
-  // Get collection fields to find field IDs by key
   const fields = await getFieldsByCollectionId(originalItem.collection_id, isPublished);
-  const idField = fields.find(f => f.key === 'id');
-  const nameField = fields.find(f => f.key === 'name');
-  const slugField = fields.find(f => f.key === 'slug');
-  const createdAtField = fields.find(f => f.key === 'created_at');
-  const updatedAtField = fields.find(f => f.key === 'updated_at');
+  const idField = fields.find((field) => field.key === 'id');
+  const nameField = fields.find((field) => field.key === 'name');
+  const slugField = fields.find((field) => field.key === 'slug');
+  const createdAtField = fields.find((field) => field.key === 'created_at');
+  const updatedAtField = fields.find((field) => field.key === 'updated_at');
 
-  // Get all items in the collection to find existing slugs
   const { items: allItems } = await getItemsWithValues(
     originalItem.collection_id,
     isPublished,
     undefined
   );
 
-  // Prepare the new values (keyed by field_id)
   const newValues = { ...originalItem.values };
 
-  // Auto-increment the ID field
   if (idField && newValues[idField.id]) {
     let highestId = 0;
-    allItems.forEach(item => {
+    allItems.forEach((item) => {
       const val = item.values[idField.id];
       if (val) {
         const num = parseInt(String(val), 10);
@@ -1188,17 +1079,14 @@ export async function duplicateItem(itemId: string, isPublished: boolean = false
     newValues[idField.id] = String(highestId + 1);
   }
 
-  // Update auto-generated timestamp fields
   const now = new Date().toISOString();
   if (createdAtField) newValues[createdAtField.id] = now;
   if (updatedAtField) newValues[updatedAtField.id] = now;
 
-  // Add " (Copy)" to the name field
   if (nameField && newValues[nameField.id]) {
     newValues[nameField.id] = `${newValues[nameField.id]} (Copy)`;
   }
 
-  // Generate unique slug (required for uniqueness)
   if (slugField) {
     const originalSlug = newValues[slugField.id] ? String(newValues[slugField.id]).trim() : '';
     const baseSlug = originalSlug || 'copy';
@@ -1206,8 +1094,8 @@ export async function duplicateItem(itemId: string, isPublished: boolean = false
 
     const existingSlugs = new Set(
       allItems
-        .map(item => item.values[slugField.id])
-        .filter((s): s is string => !!s && typeof s === 'string')
+        .map((item) => item.values[slugField.id])
+        .filter((slug): slug is string => !!slug && typeof slug === 'string')
     );
 
     let newSlug = `${baseSlugClean}-copy`;
@@ -1219,59 +1107,56 @@ export async function duplicateItem(itemId: string, isPublished: boolean = false
     newValues[slugField.id] = newSlug;
   }
 
-  // Create the new item with a new UUID
+  const knex = await getDb();
+  const tenantId = await getTenantIdFromHeaders();
   const newId = randomUUID();
-  const { data: newItem, error: itemError } = await client
-    .from('collection_items')
-    .insert({
-      id: newId,
-      collection_id: originalItem.collection_id,
-      manual_order: originalItem.manual_order,
-      is_published: isPublished,
-      is_publishable: originalItem.is_publishable,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .select()
-    .single();
-
-  if (itemError) {
-    throw new Error(`Failed to create duplicate item: ${itemError.message}`);
-  }
-
-  // Create set of valid field IDs (fields already fetched above)
-  const validFieldIds = new Set(fields.map(f => f.id));
-
-  // Create new values for the duplicated item
-  const valuesToInsert = Object.entries(newValues)
-    .filter(([fieldId]) => validFieldIds.has(fieldId)) // Only include fields that exist
-    .map(([fieldId, value]) => ({
-      id: randomUUID(),
-      item_id: newItem.id,
-      field_id: fieldId,
-      value: value,
-      is_published: isPublished,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }));
-
-  if (valuesToInsert.length > 0) {
-    const { error: valuesError } = await client
-      .from('collection_item_values')
-      .insert(valuesToInsert);
-
-    if (valuesError) {
-      // If values insertion fails, we should still return the item
-      // but log the error
-      console.error('Failed to duplicate values:', valuesError);
-    }
-  }
-
-  // Return the new item with its values
-  return {
-    ...newItem,
-    values: newValues,
+  const newItemRow: Record<string, unknown> = {
+    id: newId,
+    collection_id: originalItem.collection_id,
+    manual_order: originalItem.manual_order,
+    is_published: isPublished,
+    is_publishable: originalItem.is_publishable,
+    created_at: now,
+    updated_at: now,
   };
+  const originalTenantId = (originalItem as CollectionItemWithTenant).tenant_id ?? tenantId;
+  if (originalTenantId) newItemRow.tenant_id = originalTenantId;
+
+  try {
+    const [newItem] = await knex('collection_items').insert(newItemRow).returning('*') as CollectionItem[];
+
+    const validFieldIds = new Set(fields.map((field) => field.id));
+    const valuesToInsert = Object.entries(newValues)
+      .filter(([fieldId]) => validFieldIds.has(fieldId))
+      .map(([fieldId, value]) => {
+        const row: Record<string, unknown> = {
+          id: randomUUID(),
+          item_id: newItem.id,
+          field_id: fieldId,
+          value,
+          is_published: isPublished,
+          created_at: now,
+          updated_at: now,
+        };
+        if (originalTenantId) row.tenant_id = originalTenantId;
+        return row;
+      });
+
+    if (valuesToInsert.length > 0) {
+      try {
+        await knex('collection_item_values').insert(valuesToInsert);
+      } catch (error) {
+        console.error('Failed to duplicate values:', error);
+      }
+    }
+
+    return {
+      ...newItem,
+      values: newValues,
+    };
+  } catch (error) {
+    throw new Error(`Failed to create duplicate item: ${getErrorMessage(error)}`);
+  }
 }
 
 /**
@@ -1285,44 +1170,11 @@ export async function searchItems(
   is_published: boolean = false,
   query: string
 ): Promise<{ items: CollectionItemWithValues[], total: number }> {
-  const client = await getSupabaseAdmin();
-
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get all items for this collection
-  const { items, total } = await getItemsByCollectionId(collection_id, is_published);
   if (!query || query.trim() === '') {
-    // Return all items with values if no query
     return getItemsWithValues(collection_id, is_published, undefined);
   }
 
-  // Search in item values
-  const searchTerm = `%${query.toLowerCase()}%`;
-
-  const { data: matchingValues, error } = await client
-    .from('collection_item_values')
-    .select('item_id')
-    .ilike('value', searchTerm)
-    .eq('is_published', is_published)
-    .is('deleted_at', null);
-
-  if (error) {
-    throw new Error(`Failed to search items: ${error.message}`);
-  }
-
-  // Get unique item IDs
-  const itemIds = [...new Set(matchingValues?.map(v => v.item_id) || [])];
-
-  // Filter items and get with values
-  const filteredItems = items.filter(item => itemIds.includes(item.id));
-
-  const itemsWithValues = await Promise.all(
-    filteredItems.map(item => getItemWithValues(item.id, is_published))
-  ).then(results => results.filter((item): item is CollectionItemWithValues => item !== null));
-
-  return { items: itemsWithValues, total: itemsWithValues.length };
+  return getItemsWithValues(collection_id, is_published, { search: query });
 }
 
 /**
@@ -1332,40 +1184,38 @@ export async function searchItems(
  * @param id - Item UUID
  */
 export async function publishItem(id: string): Promise<CollectionItem> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
-
-  // Get the draft version
   const draft = await getItemById(id, false);
   if (!draft) {
     throw new Error('Draft item not found');
   }
 
-  // Upsert published version (composite key handles insert/update automatically)
-  const { data, error } = await client
-    .from('collection_items')
-    .upsert({
-      id: draft.id, // Same UUID
-      collection_id: draft.collection_id,
-      manual_order: draft.manual_order,
-      is_publishable: draft.is_publishable,
-      is_published: true,
-      created_at: draft.created_at,
-      updated_at: new Date().toISOString(),
-    }, {
-      onConflict: 'id,is_published', // Composite primary key
-    }).select()
-    .single();
+  const now = new Date().toISOString();
+  const row = await addTenantIdToRow({
+    id: draft.id,
+    collection_id: draft.collection_id,
+    manual_order: draft.manual_order,
+    is_publishable: draft.is_publishable,
+    is_published: true,
+    created_at: draft.created_at,
+    updated_at: now,
+  });
 
-  if (error) {
-    throw new Error(`Failed to publish item: ${error.message}`);
+  const tenantId = (draft as CollectionItemWithTenant).tenant_id;
+  if (tenantId) row.tenant_id = tenantId;
+
+  try {
+    const [data] = await knex('collection_items')
+      .insert(row)
+      .onConflict(['id', 'is_published'])
+      .merge(['collection_id', 'manual_order', 'is_publishable', 'updated_at'])
+      .returning('*');
+
+    return data as CollectionItem;
+  } catch (error) {
+    throw new Error(`Failed to publish item: ${getErrorMessage(error)}`);
   }
-
-  return data;
-
 }
 
 /**
@@ -1373,97 +1223,73 @@ export async function publishItem(id: string): Promise<CollectionItem> {
  * Checks both metadata (manual_order) and value changes.
  */
 export async function getTotalPublishableItemsCount(): Promise<number> {
-  const client = await getSupabaseAdmin();
+  const knex = await getDb();
 
-  if (!client) {
-    throw new Error('Supabase client not configured');
-  }
+  try {
+    let collectionsQuery = knex('collections')
+      .select('id')
+      .where('is_published', false)
+      .whereNull('deleted_at');
+    collectionsQuery = await addTenantFilter(knex, collectionsQuery, 'collections');
 
-  const { data: collections, error: collectionsError } = await client
-    .from('collections')
-    .select('id')
-    .eq('is_published', false)
-    .is('deleted_at', null);
+    const collections = await collectionsQuery as Array<{ id: string }>;
+    if (collections.length === 0) {
+      return 0;
+    }
 
-  if (collectionsError) {
-    throw new Error(`Failed to fetch collections: ${collectionsError.message}`);
-  }
-
-  if (!collections || collections.length === 0) {
-    return 0;
-  }
-
-  const collectionIds = collections.map(c => c.id);
-
-  // Paginate both queries to avoid PostgREST's default 1000-row limit
-  const fetchAllItems = async (isPublished: boolean): Promise<Array<{ id: string; manual_order: number }>> => {
-    const rows: Array<{ id: string; manual_order: number }> = [];
-    let offset = 0;
-
-    while (true) {
-      let query = client
-        .from('collection_items')
-        .select('id, manual_order')
-        .in('collection_id', collectionIds)
-        .eq('is_published', isPublished)
-        .order('id', { ascending: true })
-        .range(offset, offset + SUPABASE_QUERY_LIMIT - 1);
+    const collectionIds = collections.map((collection) => collection.id);
+    const fetchAllItems = async (isPublished: boolean): Promise<Array<{ id: string; manual_order: number }>> => {
+      let query = knex('collection_items')
+        .select('id', 'manual_order')
+        .whereIn('collection_id', collectionIds)
+        .andWhere('is_published', isPublished)
+        .orderBy('id', 'asc');
 
       if (!isPublished) {
-        query = query.eq('is_publishable', true).is('deleted_at', null);
+        query = query.andWhere('is_publishable', true).whereNull('deleted_at');
       }
 
-      const { data, error } = await query;
-      if (error) {
-        throw new Error(`Failed to fetch ${isPublished ? 'published' : 'draft'} items: ${error.message}`);
+      query = await addTenantFilter(knex, query, 'collection_items');
+      return await query as Array<{ id: string; manual_order: number }>;
+    };
+
+    const [draftItems, publishedItems] = await Promise.all([
+      fetchAllItems(false),
+      fetchAllItems(true),
+    ]);
+
+    const publishedMap = new Map<string, number>();
+    for (const pub of publishedItems) {
+      publishedMap.set(pub.id, pub.manual_order);
+    }
+
+    let count = 0;
+    const matchingOrderItemIds: string[] = [];
+
+    for (const draft of draftItems) {
+      const pubOrder = publishedMap.get(draft.id);
+      if (pubOrder === undefined || draft.manual_order !== pubOrder) {
+        count++;
+      } else {
+        matchingOrderItemIds.push(draft.id);
       }
-
-      const batch = data || [];
-      rows.push(...batch);
-
-      if (batch.length < SUPABASE_QUERY_LIMIT) break;
-      offset += SUPABASE_QUERY_LIMIT;
     }
 
-    return rows;
-  };
-
-  const [draftItems, publishedItems] = await Promise.all([
-    fetchAllItems(false),
-    fetchAllItems(true),
-  ]);
-
-  const publishedMap = new Map<string, number>();
-  for (const pub of publishedItems) {
-    publishedMap.set(pub.id, pub.manual_order);
-  }
-
-  // Count items with metadata changes (new or order changed)
-  let count = 0;
-  const matchingOrderItemIds: string[] = [];
-
-  for (const draft of draftItems) {
-    const pubOrder = publishedMap.get(draft.id);
-    if (pubOrder === undefined || draft.manual_order !== pubOrder) {
-      count++;
-    } else {
-      matchingOrderItemIds.push(draft.id);
+    if (matchingOrderItemIds.length > 0) {
+      const valueChanges = await countItemsWithValueChanges(matchingOrderItemIds);
+      count += valueChanges;
     }
-  }
 
-  // For items with matching metadata, check value changes
-  if (matchingOrderItemIds.length > 0) {
-    const valueChanges = await countItemsWithValueChanges(matchingOrderItemIds);
-    count += valueChanges;
+    return count;
+  } catch (error) {
+    if (isMissingTableError(error)) return 0;
+    throw new Error(`Failed to count publishable items: ${getErrorMessage(error)}`);
   }
-
-  return count;
 }
 
 /**
  * Count items whose draft values differ from published. Reads all values via
- * the direct-DB (Knex) path in two queries rather than paginated PostgREST
- * batches of 50 items.
+ * the direct-DB (Knex) path in two queries.
  */
 async function countItemsWithValueChanges(itemIds: string[]): Promise<number> {
   if (itemIds.length === 0) return 0;
@@ -1477,7 +1303,7 @@ async function countItemsWithValueChanges(itemIds: string[]): Promise<number> {
       getValueRowsForItems(itemIds, true),
     ]);
   } catch {
-    return 0; // Treat read failure as "no detectable changes" for the count
+    return 0;
   }
 
   const groupByItem = (
@@ -1525,22 +1351,19 @@ async function countItemsWithValueChanges(itemIds: string[]): Promise<number> {
  * Also sets is_publishable = false on the draft row.
  */
 export async function unpublishSingleItem(itemId: string): Promise<void> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase client not configured');
+  const knex = await getDb();
 
-  // Delete published row (CASCADE deletes published values)
-  await client
-    .from('collection_items')
-    .delete()
-    .eq('id', itemId)
-    .eq('is_published', true);
+  let deleteQuery = knex('collection_items')
+    .where('id', itemId)
+    .andWhere('is_published', true);
+  deleteQuery = await addTenantFilter(knex, deleteQuery, 'collection_items');
+  await deleteQuery.del();
 
-  // Set draft as not publishable
-  await client
-    .from('collection_items')
-    .update({ is_publishable: false, updated_at: new Date().toISOString() })
-    .eq('id', itemId)
-    .eq('is_published', false);
+  let updateQuery = knex('collection_items')
+    .where('id', itemId)
+    .andWhere('is_published', false);
+  updateQuery = await addTenantFilter(knex, updateQuery, 'collection_items');
+  await updateQuery.update({ is_publishable: false, updated_at: new Date().toISOString() });
 }
 
 /**
@@ -1549,34 +1372,30 @@ export async function unpublishSingleItem(itemId: string): Promise<void> {
  * @returns true if a published version was removed (caller should clear cache)
  */
 export async function stageSingleItem(itemId: string): Promise<boolean> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase client not configured');
+  const knex = await getDb();
 
-  // Check if a published version exists
-  const { data: published } = await client
-    .from('collection_items')
+  let publishedQuery = knex('collection_items')
     .select('id')
-    .eq('id', itemId)
-    .eq('is_published', true)
-    .maybeSingle();
+    .where('id', itemId)
+    .andWhere('is_published', true);
+  publishedQuery = await addTenantFilter(knex, publishedQuery, 'collection_items');
 
+  const published = await publishedQuery.first();
   const hadPublished = !!published;
 
-  // Remove published version if it exists (CASCADE deletes published values)
   if (hadPublished) {
-    await client
-      .from('collection_items')
-      .delete()
-      .eq('id', itemId)
-      .eq('is_published', true);
+    let deleteQuery = knex('collection_items')
+      .where('id', itemId)
+      .andWhere('is_published', true);
+    deleteQuery = await addTenantFilter(knex, deleteQuery, 'collection_items');
+    await deleteQuery.del();
   }
 
-  // Set draft as publishable
-  await client
-    .from('collection_items')
-    .update({ is_publishable: true, updated_at: new Date().toISOString() })
-    .eq('id', itemId)
-    .eq('is_published', false);
+  let updateQuery = knex('collection_items')
+    .where('id', itemId)
+    .andWhere('is_published', false);
+  updateQuery = await addTenantFilter(knex, updateQuery, 'collection_items');
+  await updateQuery.update({ is_publishable: true, updated_at: new Date().toISOString() });
 
   return hadPublished;
 }
@@ -1586,73 +1405,84 @@ export async function stageSingleItem(itemId: string): Promise<boolean> {
  * and copies draft values to published. Sets is_publishable = true.
  */
 export async function publishSingleItem(itemId: string): Promise<void> {
-  const client = await getSupabaseAdmin();
-  if (!client) throw new Error('Supabase client not configured');
+  const knex = await getDb();
 
-  // Get draft item
-  const { data: draftItem, error: draftErr } = await client
-    .from('collection_items')
-    .select('*')
-    .eq('id', itemId)
-    .eq('is_published', false)
-    .is('deleted_at', null)
-    .single();
-
-  if (draftErr || !draftItem) {
+  const draftItem = await getItemById(itemId, false);
+  if (!draftItem || draftItem.deleted_at) {
     throw new Error('Draft item not found');
   }
 
   const now = new Date().toISOString();
+  const tenantId = (draftItem as CollectionItemWithTenant).tenant_id ?? await getTenantIdFromHeaders();
 
-  // Ensure draft is marked publishable
   if (!draftItem.is_publishable) {
-    await client
-      .from('collection_items')
-      .update({ is_publishable: true, updated_at: now })
-      .eq('id', itemId)
-      .eq('is_published', false);
+    let draftUpdate = knex('collection_items')
+      .where('id', itemId)
+      .andWhere('is_published', false);
+    draftUpdate = await addTenantFilter(knex, draftUpdate, 'collection_items');
+    await draftUpdate.update({ is_publishable: true, updated_at: now });
   }
 
-  // Ensure published fields exist (values FK requires them)
   const draftFields = await getFieldsByCollectionId(draftItem.collection_id, false);
   if (draftFields.length > 0) {
-    const fieldsToUpsert = draftFields.map(f => ({
-      id: f.id,
-      name: f.name,
-      key: f.key,
-      type: f.type,
-      default: f.default,
-      fillable: f.fillable,
-      order: f.order,
-      collection_id: f.collection_id,
-      reference_collection_id: f.reference_collection_id,
-      hidden: f.hidden,
-      is_computed: f.is_computed,
-      data: f.data,
-      is_published: true,
-      created_at: f.created_at,
-      updated_at: now,
-    }));
-    await client
-      .from('collection_fields')
-      .upsert(fieldsToUpsert, { onConflict: 'id,is_published' });
+    const fieldsToUpsert = draftFields.map((field) => {
+      const row: Record<string, unknown> = {
+        id: field.id,
+        name: field.name,
+        key: field.key,
+        type: field.type,
+        default: field.default,
+        fillable: field.fillable,
+        order: field.order,
+        collection_id: field.collection_id,
+        reference_collection_id: field.reference_collection_id,
+        hidden: field.hidden,
+        is_computed: field.is_computed,
+        data: field.data,
+        is_published: true,
+        created_at: field.created_at,
+        updated_at: now,
+      };
+      if (tenantId) row.tenant_id = tenantId;
+      return row;
+    });
+
+    await knex('collection_fields')
+      .insert(fieldsToUpsert)
+      .onConflict(['id', 'is_published'])
+      .merge([
+        'name',
+        'key',
+        'type',
+        'default',
+        'fillable',
+        'order',
+        'collection_id',
+        'reference_collection_id',
+        'hidden',
+        'is_computed',
+        'data',
+        'updated_at',
+      ]);
   }
 
-  // Upsert published item row
-  await client
-    .from('collection_items')
-    .upsert({
-      id: draftItem.id,
-      collection_id: draftItem.collection_id,
-      manual_order: draftItem.manual_order,
-      is_publishable: true,
-      is_published: true,
-      content_hash: draftItem.content_hash,
-      created_at: draftItem.created_at,
-      updated_at: now,
-    }, { onConflict: 'id,is_published' });
+  const itemRow: Record<string, unknown> = {
+    id: draftItem.id,
+    collection_id: draftItem.collection_id,
+    manual_order: draftItem.manual_order,
+    is_publishable: true,
+    is_published: true,
+    content_hash: draftItem.content_hash,
+    created_at: draftItem.created_at,
+    updated_at: now,
+  };
+  if (tenantId) itemRow.tenant_id = tenantId;
 
-  // Copy draft values to published via existing publishValues utility
+  await knex('collection_items')
+    .insert(itemRow)
+    .onConflict(['id', 'is_published'])
+    .merge(['collection_id', 'manual_order', 'is_publishable', 'content_hash', 'updated_at']);
+
   const { publishValues } = await import('@/lib/repositories/collectionItemValueRepository');
   await publishValues(itemId);
 }

@@ -1,6 +1,7 @@
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { getFieldsByCollectionId, getFieldById } from '@/lib/repositories/collectionFieldRepository';
 import { parseMultiReferenceValue } from '@/lib/collection-utils';
+import { addTenantFilter } from '@/lib/knex-helpers';
+import { getDb, isMissingTableError } from '@/lib/platform/db';
+import { getFieldById, getFieldsByCollectionId } from '@/lib/repositories/collectionFieldRepository';
 import type { CollectionField, CollectionItemWithValues } from '@/types';
 
 /**
@@ -31,7 +32,7 @@ async function loadCountFieldContexts(
   fieldsById?: Map<string, CollectionField>,
 ): Promise<CountConfigContext[]> {
   const fields = parentFields ?? await getFieldsByCollectionId(parentCollectionId, isPublished);
-  const countFields = fields.filter((f) => f.type === 'count');
+  const countFields = fields.filter((field) => field.type === 'count');
   if (countFields.length === 0) return [];
 
   const contexts: CountConfigContext[] = [];
@@ -65,39 +66,41 @@ async function buildCountMap(
   sourceField: CollectionField,
 ): Promise<Map<string, number>> {
   const counts = new Map<string, number>();
-  const client = await getSupabaseAdmin();
-  if (!client) return counts;
+  const knex = await getDb();
 
-  // Query the draft side: every item has a draft row (the source of truth in
-  // the builder), so this naturally covers brand-new drafts, published items,
-  // and items with pending changes — all exactly once. Joining via inner
-  // select on `collection_items` filters out values whose owning item has
-  // been soft-deleted.
-  const { data, error } = await client
-    .from('collection_item_values')
-    .select('value, collection_items!inner(id, is_published, deleted_at)')
-    .eq('field_id', sourceField.id)
-    .eq('is_published', false)
-    .is('deleted_at', null)
-    .eq('collection_items.is_published', false)
-    .is('collection_items.deleted_at', null);
+  try {
+    let validItemsQuery = knex('collection_items')
+      .select('id')
+      .where('is_published', false)
+      .whereNull('deleted_at');
+    validItemsQuery = await addTenantFilter(knex, validItemsQuery, 'collection_items');
 
-  if (error) {
-    console.error(`[count] Failed to load reference values for field ${sourceField.id}: ${error.message}`);
-    return counts;
-  }
+    let valuesQuery = knex('collection_item_values')
+      .select('value')
+      .where('field_id', sourceField.id)
+      .andWhere('is_published', false)
+      .whereNull('deleted_at')
+      .whereIn('item_id', validItemsQuery);
+    valuesQuery = await addTenantFilter(knex, valuesQuery, 'collection_item_values');
 
-  for (const row of (data || []) as Array<{ value: string | null }>) {
-    if (!row.value) continue;
+    const data = await valuesQuery as Array<{ value: string | null }>;
 
-    if (sourceField.type === 'multi_reference') {
-      const ids = parseMultiReferenceValue(row.value);
-      for (const id of ids) {
-        if (!id) continue;
-        counts.set(id, (counts.get(id) || 0) + 1);
+    for (const row of data) {
+      if (!row.value) continue;
+
+      if (sourceField.type === 'multi_reference') {
+        const ids = parseMultiReferenceValue(row.value);
+        for (const id of ids) {
+          if (!id) continue;
+          counts.set(id, (counts.get(id) || 0) + 1);
+        }
+      } else {
+        counts.set(row.value, (counts.get(row.value) || 0) + 1);
       }
-    } else {
-      counts.set(row.value, (counts.get(row.value) || 0) + 1);
+    }
+  } catch (error) {
+    if (!isMissingTableError(error)) {
+      console.error(`[count] Failed to load reference values for field ${sourceField.id}:`, error);
     }
   }
 
