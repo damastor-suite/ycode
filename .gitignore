@@ -41,7 +41,11 @@ yarn-error.log*
 # IDE / editor config
 .idea/
 .vscode/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
+!.cursor/skills/
+!.cursor/skills/**
 .cursorrules
 *.swp
 *.swo
