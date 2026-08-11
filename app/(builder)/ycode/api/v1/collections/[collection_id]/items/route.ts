@@ -19,7 +19,7 @@ async function upsertPublishedItemVersion(
   collectionId: string
 ): Promise<void> {
   const db = await getDb();
-  const row = await addTenantIdToRow(db, 'collection_items', {
+  const row = await addTenantIdToRow<Record<string, unknown>>(db, 'collection_items', {
     id: item.id,
     collection_id: collectionId,
     manual_order: item.manual_order,
@@ -47,7 +47,7 @@ async function upsertPublishedValues(draftValues: CollectionItemValue[]): Promis
   const db = await getDb();
   const now = new Date().toISOString();
   const rows = await Promise.all(
-    draftValues.map((value) => addTenantIdToRow(db, 'collection_item_values', {
+    draftValues.map((value) => addTenantIdToRow<Record<string, unknown>>(db, 'collection_item_values', {
       id: value.id,
       item_id: value.item_id,
       field_id: value.field_id,

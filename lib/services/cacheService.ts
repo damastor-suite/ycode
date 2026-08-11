@@ -240,7 +240,7 @@ export async function getRoutePathsForPages(pageIds: string[]): Promise<string[]
       if (locale.is_default) continue;
       const localeTranslations = translationsMap[locale.id] || {};
 
-        const slugParts: string[] = [locale.code];
+      const slugParts: string[] = [locale.code];
 
       let currentFolderId = page.page_folder_id;
       const folderSegments: string[] = [];

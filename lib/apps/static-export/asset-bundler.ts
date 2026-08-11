@@ -44,7 +44,8 @@ export async function collectSupabaseAssets(htmlOutputs: OutputFile[]): Promise<
   if (proxyUrls.size === 0) return []
 
   const storage = await getStorage()
-  if (!storage.getObject) {
+  const getObject = storage.getObject?.bind(storage)
+  if (!getObject) {
     console.warn('[Static Export] Could not bundle storage assets: storage provider cannot read objects')
     return []
   }
@@ -56,7 +57,7 @@ export async function collectSupabaseAssets(htmlOutputs: OutputFile[]): Promise<
   const workers = Array.from({ length: Math.min(PROXY_FETCH_CONCURRENCY, queue.length) }, async () => {
     while (cursor < queue.length) {
       const proxyUrl = queue[cursor++]
-      const file = await fetchAssetByProxyUrl(storage.getObject.bind(storage), proxyUrl)
+      const file = await fetchAssetByProxyUrl(getObject, proxyUrl)
       if (file) results.push(file)
     }
   })

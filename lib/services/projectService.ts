@@ -611,7 +611,8 @@ export async function collectAssetFiles(
   assetRows: Record<string, unknown>[]
 ): Promise<ExportFile[]> {
   const storage = await getStorage();
-  if (!storage.getObject) return [];
+  const getObject = storage.getObject?.bind(storage);
+  if (!getObject) return [];
 
   const storagePaths = assetRows
     .map(r => r.storage_path as string | null)
@@ -622,7 +623,7 @@ export async function collectAssetFiles(
 
   return processInParallel(uniquePaths, async (storagePath): Promise<ExportFile | null> => {
     try {
-      const object = await storage.getObject(storagePath);
+      const object = await getObject(storagePath);
       if (!object) {
         console.warn(`[collectAssetFiles] Failed to download ${storagePath}: object not found`);
         return null;

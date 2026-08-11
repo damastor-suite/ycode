@@ -942,7 +942,7 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   // Batch update page layers
   if (pageLayersToUpdate.length > 0) {
     for (const { id, pageId, previousLayers, newLayers } of pageLayersToUpdate) {
-      let updateQuery = db('page_layers')
+      const updateQuery = db('page_layers')
         .update({ layers: newLayers, updated_at: new Date().toISOString() })
         .where('id', id)
         .where('is_published', false);
@@ -979,7 +979,7 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   // Batch update pages
   if (pagesToUpdate.length > 0) {
     for (const { id, settings } of pagesToUpdate) {
-      let updateQuery = db('pages')
+      const updateQuery = db('pages')
         .update({ settings, updated_at: new Date().toISOString() })
         .where('id', id)
         .where('is_published', false);
@@ -1016,7 +1016,7 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
   // Batch update components
   if (componentsToUpdate.length > 0) {
     for (const { id, previousLayers, newLayers } of componentsToUpdate) {
-      let updateQuery = db('components')
+      const updateQuery = db('components')
         .update({ layers: newLayers, updated_at: new Date().toISOString() })
         .where('id', id)
         .where('is_published', false);
@@ -1042,7 +1042,7 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
     const fieldIds = imageFields.map((f) => f.id);
 
     // Update all values that reference this asset to null
-    let updateValuesQuery = db('collection_item_values')
+    const updateValuesQuery = db('collection_item_values')
       .update({ value: null, updated_at: new Date().toISOString() })
       .whereIn('field_id', fieldIds)
       .where('value', assetId)
@@ -1080,7 +1080,7 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
         if (!row.value || !collectionLinkValueHasAsset(row.value, assetId)) continue;
 
         const cleanedValue = nullifyAssetInCollectionLinkValue(row.value);
-        let updateQuery = db('collection_item_values')
+        const updateQuery = db('collection_item_values')
           .update({ value: cleanedValue, updated_at: new Date().toISOString() })
           .where('id', row.id)
           .where('is_published', false);
@@ -1114,7 +1114,7 @@ export async function cleanupAssetReferences(assetId: string): Promise<AssetClea
       newDefault = filtered.length > 0 ? JSON.stringify(filtered) : null;
     }
 
-    let updateQuery = db('collection_fields')
+    const updateQuery = db('collection_fields')
       .update({ default: newDefault, updated_at: new Date().toISOString() })
       .where('id', field.id)
       .where('is_published', false);

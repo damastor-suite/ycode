@@ -402,13 +402,13 @@ async function publishCollectionMetadata(
 
   // Upsert published version (composite key handles insert/update automatically)
   await upsertRows('collections', [{
-      id: draft.id,
-      name: draft.name,
-      sorting: draft.sorting,
-      order: draft.order,
-      is_published: true,
-      created_at: draft.created_at,
-      updated_at: new Date().toISOString(),
+    id: draft.id,
+    name: draft.name,
+    sorting: draft.sorting,
+    order: draft.order,
+    is_published: true,
+    created_at: draft.created_at,
+    updated_at: new Date().toISOString(),
   }]);
 
   return true;

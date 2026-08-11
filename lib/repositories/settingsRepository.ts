@@ -28,14 +28,14 @@ export async function getAllSettings(): Promise<Setting[]> {
 /**
  * Get a setting by key
  */
-export async function getSettingByKey(key: string, _tenantId?: string): Promise<unknown | null> {
+export async function getSettingByKey<T = Setting['value']>(key: string, _tenantId?: string): Promise<T | null> {
   const knex = await getDb();
 
   try {
     let query = knex('settings').select('value').where('key', key);
     query = await addTenantFilter(knex, query, 'settings');
     const row = await query.first();
-    return row?.value ?? null;
+    return (row?.value ?? null) as T | null;
   } catch (error) {
     if (isMissingTableError(error)) return null;
     throw new Error(
@@ -47,7 +47,7 @@ export async function getSettingByKey(key: string, _tenantId?: string): Promise<
 /**
  * Get multiple settings by keys in a single query
  */
-export async function getSettingsByKeys(keys: string[]): Promise<Record<string, unknown>> {
+export async function getSettingsByKeys(keys: string[]): Promise<Record<string, Setting['value']>> {
   if (keys.length === 0) {
     return {};
   }
@@ -59,7 +59,7 @@ export async function getSettingsByKeys(keys: string[]): Promise<Record<string, 
     query = await addTenantFilter(knex, query, 'settings');
     const data = await query;
 
-    const result: Record<string, unknown> = {};
+    const result: Record<string, Setting['value']> = {};
     for (const setting of data) {
       result[setting.key] = setting.value;
     }
@@ -90,15 +90,13 @@ export async function setSetting(key: string, value: unknown): Promise<Setting> 
   }
 
   const mergeCols = ['value', 'updated_at'];
-  const conflict = tenantId ? ['tenant_id', 'key'] : ['key'];
-
   // Prefer simple key conflict for OSS without tenant unique index
   try {
-    const [data] = await knex('settings')
-      .insert(row)
-      .onConflict(tenantId ? conflict : 'key')
-      .merge(mergeCols)
-      .returning('*');
+    const insertQuery = knex('settings').insert(row);
+    const upsertQuery = tenantId
+      ? insertQuery.onConflict(['tenant_id', 'key'])
+      : insertQuery.onConflict('key');
+    const [data] = await upsertQuery.merge(mergeCols).returning('*');
     return data;
   } catch (error) {
     // Fallback: update-then-insert if composite conflict unsupported
@@ -154,10 +152,11 @@ export async function setSettings(settings: Record<string, unknown>): Promise<nu
     });
 
     try {
-      await knex('settings')
-        .insert(records)
-        .onConflict(tenantId ? ['tenant_id', 'key'] : 'key')
-        .merge(['value', 'updated_at']);
+      const insertQuery = knex('settings').insert(records);
+      const upsertQuery = tenantId
+        ? insertQuery.onConflict(['tenant_id', 'key'])
+        : insertQuery.onConflict('key');
+      await upsertQuery.merge(['value', 'updated_at']);
     } catch {
       for (const [key, value] of toUpsert) {
         await setSetting(key, value);

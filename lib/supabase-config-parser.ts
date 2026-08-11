@@ -24,11 +24,11 @@ function replacePasswordPlaceholder(connectionUrl: string, password: string): st
 function tryExtractProjectId(connectionUrl: string): string | null {
   // Pooler format: postgresql://postgres.abc123:...
   const poolerMatch = connectionUrl.match(/\/\/postgres\.([a-z0-9]+):/);
-  if (poolerMatch) return poolerMatch[1];
+  if (poolerMatch?.[1]) return poolerMatch[1];
 
   // Direct format: postgresql://postgres:...@db.abc123.supabase.co:...
   const directMatch = connectionUrl.match(/@db\.([a-z0-9]+)\.supabase\.co[:/]/);
-  if (directMatch) return directMatch[1];
+  if (directMatch?.[1]) return directMatch[1];
 
   return null;
 }
@@ -116,6 +116,10 @@ export function parseConnectionUrl(connectionUrl: string, supabaseUrl?: string):
  * @returns Full SupabaseCredentials with derived properties
  */
 export function parseSupabaseConfig(config: SupabaseConfig): SupabaseCredentials {
+  if (!config.connectionUrl || !config.dbPassword || !config.anonKey || !config.serviceRoleKey) {
+    throw new Error('Supabase config is missing required credentials');
+  }
+
   const connectionUrlResolved = replacePasswordPlaceholder(config.connectionUrl, config.dbPassword);
 
   const { dbPassword: _, ...parsedUrl } = parseConnectionUrl(
