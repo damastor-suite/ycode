@@ -15,8 +15,10 @@ export function resolveRole(raw: string | undefined | null): UserRole {
   return DEFAULT_ROLE;
 }
 
-export function extractRoleFromUser(user: { app_metadata?: Record<string, unknown> } | null): UserRole | null {
-  return (user?.app_metadata?.role as UserRole) || null;
+export function extractRoleFromUser(
+  user: { role?: string | null; app_metadata?: Record<string, unknown> } | null
+): UserRole | null {
+  return resolveRole(user?.role || (user?.app_metadata?.role as string | undefined));
 }
 
 export function canManageMembers(role: UserRole): boolean {

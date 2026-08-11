@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { noCache } from '@/lib/api-response';
-import { getAuthUser } from '@/lib/supabase-auth';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
+import { getAuthUser } from '@/lib/platform/auth';
+import { getDb } from '@/lib/platform/db';
 
 /**
  * DELETE /ycode/api/profile
@@ -15,23 +15,11 @@ export async function DELETE(request: NextRequest) {
       return noCache({ error: 'Not authenticated' }, 401);
     }
 
-    // Use admin client to delete user
-    const adminClient = await getSupabaseAdmin();
-
-    if (!adminClient) {
-      return noCache({ error: 'Server configuration error' }, 500);
-    }
-
-    // Delete user using admin client
-    const { error } = await adminClient.auth.admin.deleteUser(auth.user.id);
-
-    if (error) {
-      console.error('Failed to delete user:', error);
-      return noCache({ error: error.message }, 400);
-    }
-
-    // Sign out the user
-    await auth.client.auth.signOut();
+    const db = await getDb();
+    await db.transaction(async (trx) => {
+      await trx('verification').where('identifier', `invite:${auth.user.id}`).del();
+      await trx('user').where('id', auth.user.id).del();
+    });
 
     return noCache({
       data: {

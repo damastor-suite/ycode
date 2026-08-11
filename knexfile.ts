@@ -1,38 +1,34 @@
 import type { Knex } from 'knex';
 import path from 'path';
 import { credentials } from './lib/credentials.ts';
-import { parseSupabaseConfig } from './lib/supabase-config-parser.ts';
-import type { SupabaseConfig } from './types/index.ts';
+import type { DatabaseConfig } from './types/index.ts';
 
 /**
- * Knex Configuration for Ycode Supabase Migrations
+ * Knex Configuration for Ycode Postgres Migrations
  *
- * This configuration is used to run migrations programmatically
- * against the user's Supabase PostgreSQL database.
+ * Connects via DATABASE_URL (or legacy Supabase connection env during migration).
  */
 
-/**
- * Load Supabase credentials from centralized storage
- * Uses environment variables on Vercel, file-based storage locally
- */
-async function getSupabaseConnectionParams() {
-  const config = await credentials.get<SupabaseConfig>('supabase_config');
+async function getConnectionString(): Promise<string> {
+  const config = await credentials.get<DatabaseConfig>('database_config');
 
-  if (!config?.connectionUrl || !config?.dbPassword) {
-    throw new Error('Supabase not configured. Please run setup first.');
+  if (!config?.databaseUrl) {
+    throw new Error('Database not configured. Please run setup first.');
   }
 
-  const connectionParams = parseSupabaseConfig(config);
-  const isSelfHosted = !!config.supabaseUrl;
+  return config.databaseUrl;
+}
 
-  return {
-    host: connectionParams.dbHost,
-    port: connectionParams.dbPort,
-    database: connectionParams.dbName,
-    user: connectionParams.dbUser,
-    password: connectionParams.dbPassword,
-    ssl: isSelfHosted ? false : { rejectUnauthorized: false },
-  };
+function shouldUseSsl(connectionString: string): boolean | { rejectUnauthorized: boolean } {
+  // Local docker / localhost — no SSL
+  if (
+    connectionString.includes('localhost')
+    || connectionString.includes('127.0.0.1')
+    || process.env.DATABASE_SSL === 'false'
+  ) {
+    return false;
+  }
+  return { rejectUnauthorized: false };
 }
 
 const createConfig = (): Knex.Config => {
@@ -41,9 +37,11 @@ const createConfig = (): Knex.Config => {
   return {
     client: 'pg',
     connection: async () => {
-      const connectionParams = await getSupabaseConnectionParams();
-
-      return connectionParams;
+      const connectionString = await getConnectionString();
+      return {
+        connectionString,
+        ssl: shouldUseSsl(connectionString),
+      };
     },
     migrations: {
       directory: path.join(process.cwd(), 'database/migrations'),

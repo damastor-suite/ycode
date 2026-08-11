@@ -10,14 +10,12 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useSetupStore } from '@/stores/useSetupStore';
 import { useAuthSession } from '@/hooks/use-auth-session';
-import type { SupabaseConfig } from '@/types';
+import type { DatabaseConfig } from '@/types';
 import {
-  connectSupabase,
+  connectDatabase,
   runMigrations,
   completeSetup,
-  checkEmailConfirmDisabled,
 } from '@/lib/api/setup';
-import { resetBrowserClient } from '@/lib/supabase-browser';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import {
@@ -34,27 +32,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import BuilderLoading from '@/components/BuilderLoading';
 import { Spinner } from '@/components/ui/spinner';
 import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { TemplateGallery } from '@/components/templates/TemplateGallery';
-
-type HostingType = 'cloud' | 'self-hosted';
-
-function EnvFileHint({ envVar }: { envVar: string }) {
-  return (
-    <>Find <span className="text-white/85">{envVar}</span> in your <span className="text-white/85">.env</span> file, next to <span className="text-white/85">docker-compose.yml</span>.</>
-  );
-}
-
-function HostingTabs({ value, onChange }: { value: HostingType; onChange: (v: HostingType) => void }) {
-  return (
-    <Tabs value={value} onValueChange={(v) => onChange(v as HostingType)}>
-      <TabsList className="w-full">
-        <TabsTrigger value="cloud" className="flex-1">Supabase Cloud</TabsTrigger>
-        <TabsTrigger value="self-hosted" className="flex-1">Self-hosted Supabase</TabsTrigger>
-      </TabsList>
-    </Tabs>
-  );
-}
 
 function LogoBottomRight() {
   return (
@@ -98,7 +76,7 @@ function LogoBottomRight() {
 
 export default function WelcomePage() {
   const router = useRouter();
-  const { currentStep, setStep, setSupabaseConfig, supabaseConfig, markComplete } = useSetupStore();
+  const { currentStep, setStep, setDatabaseConfig, databaseConfig, markComplete } = useSetupStore();
   const { session, isLoading: isAuthLoading } = useAuthSession();
 
   const [loading, setLoading] = useState(false);
@@ -112,19 +90,13 @@ export default function WelcomePage() {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
 
-  // Supabase connection fields (pre-populated from store if available)
-  const [anonKey, setAnonKey] = useState(supabaseConfig?.anonKey || '');
-  const [serviceRoleKey, setServiceRoleKey] = useState(supabaseConfig?.serviceRoleKey || '');
-  const [connectionUrl, setConnectionUrl] = useState(supabaseConfig?.connectionUrl || '');
-  const [dbPassword, setDbPassword] = useState(supabaseConfig?.dbPassword || '');
-  const [supabaseUrl, setSupabaseUrl] = useState(supabaseConfig?.supabaseUrl || '');
-  const [hostingType, setHostingType] = useState<HostingType>(
-    supabaseConfig?.supabaseUrl ? 'self-hosted' : 'cloud'
-  );
-  const isSelfHosted = hostingType === 'self-hosted';
+  // Database connection fields (pre-populated from store if available)
+  const [databaseUrl, setDatabaseUrl] = useState(databaseConfig?.databaseUrl || '');
+  const [authSecret, setAuthSecret] = useState(databaseConfig?.authSecret || '');
+  const isSelfHosted = false;
 
-  // Email confirmation setting check
-  const [emailConfirmDisabled, setEmailConfirmDisabled] = useState(false);
+  // Better Auth does not require the old Supabase email confirmation setting.
+  const [emailConfirmDisabled, setEmailConfirmDisabled] = useState(true);
   const [checkingEmailConfirm, setCheckingEmailConfirm] = useState(false);
 
   // Ensure dark mode is applied on client-side navigation
@@ -239,7 +211,7 @@ export default function WelcomePage() {
               className="mt-4 animate-in fade-in slide-in-from-bottom-1 duration-700"
               style={{ animationDelay: '3700ms', animationFillMode: 'both' }}
             >
-              <Button onClick={() => setStep('supabase')}>
+              <Button onClick={() => setStep('database')}>
                 Get started
               </Button>
             </div>
@@ -250,8 +222,8 @@ export default function WelcomePage() {
     );
   }
 
-  // Step 2: Connect Supabase
-  if (currentStep === 'supabase') {
+  // Step 2: Connect database
+  if (currentStep === 'database') {
     // Show loading while checking environment
     if (isVercel === null) {
       return (
@@ -301,7 +273,7 @@ export default function WelcomePage() {
 
               <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">
                 <Label variant="muted">Step 1</Label>
-                <Label size="sm">{isSelfHosted ? 'Vercel + Self-hosted' : 'Vercel + Supabase'}</Label>
+                <Label size="sm">Configure database</Label>
               </div>
 
               <div className="border-t-2 border-white/50 py-4 flex flex-col gap-0.5 opacity-50">
@@ -325,8 +297,6 @@ export default function WelcomePage() {
 
               <FieldGroup className="animate-in fade-in slide-in-from-bottom-1 duration-700" style={{ animationFillMode: 'both' }}>
 
-                <HostingTabs value={hostingType} onChange={setHostingType} />
-
                 {error && (
                   <Alert>
                     <AlertDescription>
@@ -345,7 +315,7 @@ export default function WelcomePage() {
                     <Field>
                       <InputGroup size="sm">
                         <InputGroupInput
-                          value="SUPABASE_PUBLISHABLE_KEY" size="sm"
+                          value="DATABASE_URL" size="sm"
                           readOnly
                         />
                         <InputGroupAddon align="inline-end">
@@ -353,25 +323,22 @@ export default function WelcomePage() {
                             size="xs"
                             variant="secondary"
                             className="mr-1"
-                            onClick={() => handleCopy('SUPABASE_PUBLISHABLE_KEY', 'anon')}
+                            onClick={() => handleCopy('DATABASE_URL', 'database')}
                           >
-                            <Icon name={copiedField === 'anon' ? 'check' : 'copy'} />
-                            {copiedField === 'anon' ? 'Copied' : 'Copy'}
+                            <Icon name={copiedField === 'database' ? 'check' : 'copy'} />
+                            {copiedField === 'database' ? 'Copied' : 'Copy'}
                           </Button>
                         </InputGroupAddon>
                       </InputGroup>
                       <FieldDescription>
-                        {isSelfHosted
-                          ? <EnvFileHint envVar="ANON_KEY" />
-                          : <>Find it in <span className="text-white/85">Supabase → Project settings → API keys</span>.</>
-                        }
+                        Your direct Postgres connection string.
                       </FieldDescription>
                     </Field>
 
                     <Field>
                       <InputGroup size="sm">
                         <InputGroupInput
-                          value="SUPABASE_SECRET_KEY" size="sm"
+                          value="BETTER_AUTH_SECRET" size="sm"
                           readOnly
                         />
                         <InputGroupAddon align="inline-end">
@@ -379,97 +346,17 @@ export default function WelcomePage() {
                             size="xs"
                             variant="secondary"
                             className="mr-1"
-                            onClick={() => handleCopy('SUPABASE_SECRET_KEY', 'service')}
+                            onClick={() => handleCopy('BETTER_AUTH_SECRET', 'authSecret')}
                           >
-                            <Icon name={copiedField === 'service' ? 'check' : 'copy'} />
-                            {copiedField === 'service' ? 'Copied' : 'Copy'}
+                            <Icon name={copiedField === 'authSecret' ? 'check' : 'copy'} />
+                            {copiedField === 'authSecret' ? 'Copied' : 'Copy'}
                           </Button>
                         </InputGroupAddon>
                       </InputGroup>
                       <FieldDescription>
-                        {isSelfHosted
-                          ? <EnvFileHint envVar="SERVICE_ROLE_KEY" />
-                          : <>Find it in <span className="text-white/85">Supabase → Project settings → API keys</span>.</>
-                        }
+                        Generate a stable secret with <span className="text-white/85">openssl rand -hex 32</span>.
                       </FieldDescription>
                     </Field>
-
-                    <Field>
-                      <InputGroup size="sm">
-                        <InputGroupInput
-                          value="SUPABASE_CONNECTION_URL" size="sm"
-                          readOnly
-                        />
-                        <InputGroupAddon align="inline-end">
-                          <Button
-                            size="xs"
-                            variant="secondary"
-                            className="mr-1"
-                            onClick={() => handleCopy('SUPABASE_CONNECTION_URL', 'connection')}
-                          >
-                            <Icon name={copiedField === 'connection' ? 'check' : 'copy'} />
-                            {copiedField === 'connection' ? 'Copied' : 'Copy'}
-                          </Button>
-                        </InputGroupAddon>
-                      </InputGroup>
-                      <FieldDescription>
-                        {isSelfHosted
-                          ? <>Requires a direct Postgres connection. In <span className="text-white/85">docker-compose.yml</span>, add <span className="text-white/85">&quot;54322:5432&quot;</span> to the <span className="text-white/85">db</span> service ports, then restart. Connect as <span className="text-white/85">supabase_admin</span> with <span className="text-white/85">POSTGRES_PASSWORD</span> from your <span className="text-white/85">.env</span> file.</>
-                          : <>Find it in <span className="text-white/85">Supabase → Connect → Connection String → Method: Transaction pooler</span>.</>
-                        }
-                      </FieldDescription>
-                    </Field>
-
-                    <Field>
-                      <InputGroup size="sm">
-                        <InputGroupInput
-                          value="SUPABASE_DB_PASSWORD" size="sm"
-                          readOnly
-                        />
-                        <InputGroupAddon align="inline-end">
-                          <Button
-                            size="xs"
-                            variant="secondary"
-                            className="mr-1"
-                            onClick={() => handleCopy('SUPABASE_DB_PASSWORD', 'password')}
-                          >
-                            <Icon name={copiedField === 'password' ? 'check' : 'copy'} />
-                            {copiedField === 'password' ? 'Copied' : 'Copy'}
-                          </Button>
-                        </InputGroupAddon>
-                      </InputGroup>
-                      <FieldDescription>
-                        {isSelfHosted
-                          ? <EnvFileHint envVar="POSTGRES_PASSWORD" />
-                          : <>The database password was created with the project. It can be reset in <span className="text-white/85">Database → Settings</span>.</>
-                        }
-                      </FieldDescription>
-                    </Field>
-
-                    {isSelfHosted && (
-                      <Field>
-                        <InputGroup size="sm">
-                          <InputGroupInput
-                            value="SUPABASE_URL" size="sm"
-                            readOnly
-                          />
-                          <InputGroupAddon align="inline-end">
-                            <Button
-                              size="xs"
-                              variant="secondary"
-                              className="mr-1"
-                              onClick={() => handleCopy('SUPABASE_URL', 'supabaseurl')}
-                            >
-                              <Icon name={copiedField === 'supabaseurl' ? 'check' : 'copy'} />
-                              {copiedField === 'supabaseurl' ? 'Copied' : 'Copy'}
-                            </Button>
-                          </InputGroupAddon>
-                        </InputGroup>
-                        <FieldDescription>
-                          <span className="text-white/85">Required</span> — your Supabase API gateway URL (e.g. <span className="text-white/85">https://supabase.my-company.com</span>).
-                        </FieldDescription>
-                      </Field>
-                    )}
 
                   </FieldGroup>
 
@@ -514,37 +401,33 @@ export default function WelcomePage() {
       );
     }
 
-    // Local development: Show form to enter credentials (only if isVercel === false)
+    // Local development: Show form to enter database credentials.
     if (isVercel === false) {
       const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         setLoading(true);
         setError(null);
 
-        if (isSelfHosted && !supabaseUrl) {
-          setError('Supabase API URL is required for self-hosted instances.');
+        if (!databaseUrl) {
+          setError('Database URL is required.');
           setLoading(false);
           return;
         }
 
-        const config: SupabaseConfig = {
-          anonKey,
-          serviceRoleKey,
-          connectionUrl,
-          dbPassword,
-          ...(supabaseUrl ? { supabaseUrl } : {}),
+        const config: DatabaseConfig = {
+          databaseUrl,
+          ...(authSecret ? { authSecret } : {}),
         };
 
         try {
-          const result = await connectSupabase(config);
+          const result = await connectDatabase(config);
 
           if (result.error) {
             setError(result.error);
             return;
           }
 
-          setSupabaseConfig(config);
-          resetBrowserClient();
+          setDatabaseConfig(config);
 
           // Go to migration step
           setStep('migrate');
@@ -566,7 +449,7 @@ export default function WelcomePage() {
 
               <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">
                 <Label variant="muted">Step 1</Label>
-                <Label size="sm">Connect Supabase</Label>
+                <Label size="sm">Connect database</Label>
               </div>
 
               <div className="border-t-2 border-white/50 py-4 flex flex-col gap-0.5 opacity-50">
@@ -592,8 +475,6 @@ export default function WelcomePage() {
 
                 <FieldGroup className="animate-in fade-in slide-in-from-bottom-1 duration-700" style={{ animationFillMode: 'both' }}>
 
-                  <HostingTabs value={hostingType} onChange={setHostingType} />
-
                   <FieldSet>
                     <FieldGroup className="gap-8">
 
@@ -604,98 +485,35 @@ export default function WelcomePage() {
                       )}
 
                       <Field>
-                        <FieldLabel htmlFor="anon_key" size="sm">Publishable key</FieldLabel>
+                        <FieldLabel htmlFor="database_url" size="sm">Database URL</FieldLabel>
                         <Input
-                          id="anon_key"
-                          name="anon_key"
-                          value={anonKey}
-                          onChange={(e) => setAnonKey(e.target.value)}
+                          id="database_url"
+                          name="database_url"
+                          value={databaseUrl}
+                          onChange={(e) => setDatabaseUrl(e.target.value)}
                           required
                           size="sm"
+                          placeholder="postgresql://user:password@localhost:5432/ycode"
                         />
                         <FieldDescription>
-                          {isSelfHosted
-                            ? <EnvFileHint envVar="ANON_KEY" />
-                            : <>Find it in <span className="text-white/85">Supabase → Project settings → API keys</span>.</>
-                          }
+                          Use a direct Postgres connection string. It will be stored as <span className="text-white/85">DATABASE_URL</span>.
                         </FieldDescription>
                       </Field>
 
                       <Field>
-                        <FieldLabel htmlFor="service_role_key" size="sm">Secret key</FieldLabel>
+                        <FieldLabel htmlFor="auth_secret" size="sm">Auth secret</FieldLabel>
                         <Input
-                          id="service_role_key"
-                          name="service_role_key"
-                          value={serviceRoleKey}
-                          onChange={(e) => setServiceRoleKey(e.target.value)}
-                          required
+                          id="auth_secret"
+                          name="auth_secret"
+                          value={authSecret}
+                          onChange={(e) => setAuthSecret(e.target.value)}
                           size="sm"
+                          placeholder="Optional; generate with openssl rand -hex 32"
                         />
                         <FieldDescription>
-                          {isSelfHosted
-                            ? <EnvFileHint envVar="SERVICE_ROLE_KEY" />
-                            : <>Find it in <span className="text-white/85">Supabase → Project settings → API keys</span>.</>
-                          }
+                          Used by Better Auth. Leave blank only for local testing.
                         </FieldDescription>
                       </Field>
-
-                      <Field>
-                        <FieldLabel htmlFor="connection_url" size="sm">{isSelfHosted ? 'Database connection URL' : 'Pooler connection URL'}</FieldLabel>
-                        <Input
-                          type="text"
-                          id="connection_url"
-                          name="connection_url"
-                          value={connectionUrl}
-                          onChange={(e) => setConnectionUrl(e.target.value)}
-                          required
-                          size="sm"
-                          placeholder={isSelfHosted ? 'postgresql://supabase_admin:password@localhost:54322/postgres' : undefined}
-                        />
-                        <FieldDescription>
-                          {isSelfHosted
-                            ? <>Requires a direct Postgres connection. In <span className="text-white/85">docker-compose.yml</span>, add <span className="text-white/85">&quot;54322:5432&quot;</span> to the <span className="text-white/85">db</span> service ports, then restart. Connect as <span className="text-white/85">supabase_admin</span> with <span className="text-white/85">POSTGRES_PASSWORD</span> from your <span className="text-white/85">.env</span> file.</>
-                            : <>Find it in <span className="text-white/85">Supabase → Connect → Connection String → Method: Transaction pooler</span>.</>
-                          }
-                        </FieldDescription>
-                      </Field>
-
-                      <Field>
-                        <FieldLabel htmlFor="db_password" size="sm">Database password</FieldLabel>
-                        <Input
-                          type="password"
-                          id="db_password"
-                          name="db_password"
-                          value={dbPassword}
-                          onChange={(e) => setDbPassword(e.target.value)}
-                          required
-                          size="sm"
-                        />
-                        <FieldDescription>
-                          {isSelfHosted
-                            ? <EnvFileHint envVar="POSTGRES_PASSWORD" />
-                            : <>The database password was created with the project. It can be reset in <span className="text-white/85">Database → Settings</span>.</>
-                          }
-                        </FieldDescription>
-                      </Field>
-
-                      {isSelfHosted && (
-                        <Field>
-                          <FieldLabel htmlFor="supabase_url" size="sm">Supabase API URL</FieldLabel>
-                          <Input
-                            type="url"
-                            id="supabase_url"
-                            name="supabase_url"
-                            placeholder="http://localhost:8000"
-                            value={supabaseUrl}
-                            onChange={(e) => setSupabaseUrl(e.target.value)}
-                            required
-                            size="sm"
-                          />
-                          <FieldDescription>
-                            Your Supabase API gateway URL. Typically <span className="text-white/85">http://localhost:8000</span> for local Docker setups.
-                          </FieldDescription>
-                        </Field>
-                      )}
 
                       <div className="flex flex-col gap-2 mt-4">
                         <Button
@@ -764,7 +582,7 @@ export default function WelcomePage() {
 
             <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">
               <Label variant="muted">Step 1</Label>
-              <Label size="sm">Connect Supabase</Label>
+              <Label size="sm">Connect database</Label>
             </div>
 
             <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">
@@ -800,7 +618,7 @@ export default function WelcomePage() {
                 <Label
                   variant="muted" size="sm"
                   className="leading-relaxed max-w-96"
-                >We&apos;ll automatically create the necessary database tables and storage buckets in your Supabase project.</Label>
+                >We&apos;ll automatically create the necessary database tables and storage setup.</Label>
               </div>
 
               <div className="flex flex-col gap-2">
@@ -813,7 +631,7 @@ export default function WelcomePage() {
                 <Button
                   type="button"
                   variant="ghost"
-                  onClick={() => setStep('supabase')}
+                  onClick={() => setStep('database')}
                   disabled={loading}
                 >
                   Go back
@@ -836,21 +654,9 @@ export default function WelcomePage() {
       setError(null);
 
       try {
-        const result = await checkEmailConfirmDisabled();
-
-        if (result.error) {
-          setError(result.error);
-          return;
-        }
-
-        if (!result.autoconfirm) {
-          setError('Confirm email setting in Supabase is not disabled.');
-          return;
-        }
-
         setEmailConfirmDisabled(true);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to check setting');
+        setError(err instanceof Error ? err.message : 'Failed to continue');
       } finally {
         setCheckingEmailConfirm(false);
       }
@@ -873,8 +679,8 @@ export default function WelcomePage() {
         return;
       }
 
-      if (password.length < 6) {
-        setError('Password must be at least 6 characters');
+      if (password.length < 8) {
+        setError('Password must be at least 8 characters');
         setLoading(false);
         return;
       }
@@ -929,7 +735,7 @@ export default function WelcomePage() {
 
           <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">
             <Label variant="muted">Step 1</Label>
-            <Label size="sm">Connect Supabase</Label>
+            <Label size="sm">Connect database</Label>
           </div>
 
           <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">
@@ -954,11 +760,11 @@ export default function WelcomePage() {
 
             <div className="flex-1 flex items-center text-center flex-col gap-4 bg-white/5 py-10 px-6 rounded-2xl">
               <div className="flex flex-col items-center gap-1">
-                <Label size="sm">Adjust Supabase authentication settings</Label>
+                <Label size="sm">Authentication settings are ready</Label>
                 <p className="text-sm text-muted-foreground leading-relaxed">
                   {isSelfHosted
-                    ? 'In your Supabase .env file, find and update the setting below, then restart your Docker containers.'
-                    : 'In your Supabase project, find and disable the setting below.'
+                    ? 'Better Auth email/password is configured in the application.'
+                    : 'Better Auth email/password is configured in the application.'
                   }
                 </p>
               </div>
@@ -1046,7 +852,7 @@ export default function WelcomePage() {
                       disabled={loading}
                       size="sm"
                     />
-                    <FieldDescription>At least 6 characters</FieldDescription>
+                    <FieldDescription>At least 8 characters</FieldDescription>
                   </Field>
 
                   <Field>
@@ -1069,7 +875,7 @@ export default function WelcomePage() {
                     >
                       {loading ? <Spinner /> : 'Create account'}
                     </Button>
-                    <FieldDescription className="text-center text-[10px] opacity-60">Your user will be stored securely in Supabase Auth.</FieldDescription>
+                    <FieldDescription className="text-center text-[10px] opacity-60">Your user will be stored securely with Better Auth.</FieldDescription>
                   </div>
 
                 </FieldGroup>
@@ -1098,7 +904,7 @@ export default function WelcomePage() {
 
             <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">
               <Label variant="muted">Step 1</Label>
-              <Label size="sm">Connect Supabase</Label>
+              <Label size="sm">Connect database</Label>
             </div>
 
             <div className="border-t-2 border-white py-4 flex flex-col gap-0.5">

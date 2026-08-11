@@ -1,13 +1,13 @@
-import { createServerClient } from '@supabase/ssr';
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
+import { auth } from '@/lib/auth';
 
 /**
  * Public API routes that skip authentication.
  */
 const PUBLIC_API_PREFIXES = [
   '/ycode/api/setup/',    // Setup wizard — needed before any user exists
-  '/ycode/api/supabase/', // Supabase config — needed for browser client init
+  '/ycode/api/supabase/', // Legacy config endpoints during migration
   '/ycode/api/auth/',     // Auth callbacks and session checks
   '/ycode/api/v1/',       // Public API — has own API key auth
 ];
@@ -25,34 +25,14 @@ const PUBLIC_API_EXACT = [
 ];
 
 /**
- * Derive the Supabase project URL and anon key from environment variables.
- * Returns null if env vars are not set (pre-setup or local dev without .env.local).
- *
- * Uses SUPABASE_URL when set (self-hosted instances), otherwise derives from
- * the project ref in the connection string (hosted Supabase).
+ * Returns false when env vars are not set (pre-setup or local dev without .env.local).
+ * Legacy Supabase envs still count during migration so existing installs remain protected.
  */
-function getSupabaseEnvConfig(): { url: string; anonKey: string } | null {
-  const anonKey = process.env.SUPABASE_PUBLISHABLE_KEY
-    || process.env.SUPABASE_ANON_KEY;
-  const connectionUrl = process.env.SUPABASE_CONNECTION_URL;
-
-  if (!anonKey || !connectionUrl) return null;
-
-  if (process.env.SUPABASE_URL) {
-    return {
-      url: process.env.SUPABASE_URL.replace(/\/+$/, ''),
-      anonKey,
-    };
-  }
-
-  // Hosted Supabase: extract project ID from connection URL
-  const match = connectionUrl.match(/\/\/postgres\.([a-z0-9]+):/);
-  if (!match) return null;
-
-  return {
-    url: `https://${match[1]}.supabase.co`,
-    anonKey,
-  };
+function hasAuthDatabaseConfig(): boolean {
+  return Boolean(
+    process.env.DATABASE_URL
+    || (process.env.SUPABASE_CONNECTION_URL && process.env.SUPABASE_DB_PASSWORD)
+  );
 }
 
 function isPublicApiRoute(pathname: string, method: string): boolean {
@@ -75,7 +55,7 @@ function isPublicApiRoute(pathname: string, method: string): boolean {
 }
 
 /**
- * Verify Supabase session for protected API routes.
+ * Verify Better Auth session for protected API routes.
  * Returns a 401 response if not authenticated, or null to continue.
  */
 async function verifyApiAuth(request: NextRequest): Promise<NextResponse | null> {
@@ -83,46 +63,18 @@ async function verifyApiAuth(request: NextRequest): Promise<NextResponse | null>
     return null;
   }
 
-  const config = getSupabaseEnvConfig();
+  // If env vars aren't set (pre-setup or local dev without .env.local), let through.
+  if (!hasAuthDatabaseConfig()) return null;
 
-  // If env vars aren't set (pre-setup or local dev without .env.local), let through
-  if (!config) return null;
-
-  let response = NextResponse.next({ request });
-
-  const supabase = createServerClient(config.url, config.anonKey, {
-    cookies: {
-      getAll() {
-        return request.cookies.getAll();
-      },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value }) => {
-          request.cookies.set(name, value);
-        });
-        response = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }) => {
-          response.cookies.set(name, value, options);
-        });
-      },
-    },
-  });
-
-  const { data: { user } } = await supabase.auth.getUser();
-
-  if (!user) {
+  const session = await auth.api.getSession({ headers: request.headers });
+  if (!session?.user) {
     return NextResponse.json(
       { error: 'Not authenticated' },
       { status: 401 }
     );
   }
 
-  // Authenticated — pass through with any refreshed cookies
-  const authResponse = NextResponse.next({ request });
-  response.cookies.getAll().forEach((cookie) => {
-    authResponse.cookies.set(cookie.name, cookie.value);
-  });
-
-  return authResponse;
+  return NextResponse.next({ request });
 }
 
 export async function proxy(request: NextRequest) {

@@ -1,19 +1,26 @@
+import { randomBytes, randomUUID } from 'crypto';
 import { NextRequest } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { noCache } from '@/lib/api-response';
+import { getDb } from '@/lib/platform/db';
 import { requireManageMembers } from '@/lib/roles-server';
 import { ASSIGNABLE_ROLES } from '@/lib/roles';
+
+interface AuthUserRow {
+  id: string;
+  email: string;
+}
 
 /**
  * POST /ycode/api/auth/invite
  *
- * Invite a user by email using Supabase's built-in invite system.
+ * Create a pending Better Auth user and invite token.
  * Requires owner or admin role.
  */
 export async function POST(request: NextRequest) {
   try {
     const result = await requireManageMembers();
     if ('status' in result) return result;
+    const caller = result;
 
     const body = await request.json();
     const { email, role = 'designer', redirectTo } = body;
@@ -28,35 +35,78 @@ export async function POST(request: NextRequest) {
     }
 
     const assignRole = ASSIGNABLE_ROLES.includes(role) ? role : 'designer';
-
-    const client = await getSupabaseAdmin();
-    if (!client) {
-      return noCache({ error: 'Supabase not configured' }, 500);
+    if (assignRole === 'admin' && caller.role !== 'owner') {
+      return noCache({ error: 'Only the owner can assign the admin role' }, 403);
     }
 
-    const { data, error } = await client.auth.admin.inviteUserByEmail(email, {
-      redirectTo: redirectTo || undefined,
-      data: {
-        invited_at: new Date().toISOString(),
-      },
+    const db = await getDb();
+    const normalizedEmail = email.trim().toLowerCase();
+    const existingUser = await db<AuthUserRow>('user')
+      .select('id', 'email')
+      .where('email', normalizedEmail)
+      .first();
+
+    const existingCredential = existingUser
+      ? await db('account')
+        .select('id')
+        .where({ userId: existingUser.id, providerId: 'credential' })
+        .whereNotNull('password')
+        .first()
+      : null;
+
+    if (existingCredential) {
+      return noCache({ error: 'A user with this email already exists' }, 400);
+    }
+
+    const userId = existingUser?.id || randomUUID();
+    const token = randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7);
+    const now = new Date();
+
+    await db.transaction(async (trx) => {
+      if (existingUser) {
+        await trx('user')
+          .where('id', existingUser.id)
+          .update({
+            role: assignRole,
+            updatedAt: now,
+          });
+      } else {
+        await trx('user').insert({
+          id: userId,
+          email: normalizedEmail,
+          name: normalizedEmail.split('@')[0],
+          emailVerified: false,
+          role: assignRole,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+
+      await trx('verification').where('identifier', `invite:${userId}`).del();
+      await trx('verification').insert({
+        id: randomUUID(),
+        identifier: `invite:${userId}`,
+        value: token,
+        expiresAt,
+        createdAt: now,
+        updatedAt: now,
+      });
     });
 
-    if (error) {
-      console.error('[invite] Error inviting user:', error);
-      return noCache({ error: error.message }, 400);
-    }
-
-    if (data.user) {
-      await client.auth.admin.updateUserById(data.user.id, {
-        app_metadata: { role: assignRole },
-      });
-    }
+    const inviteBase = redirectTo || `${new URL(request.url).origin}/ycode/accept-invite`;
+    const invitationUrl = new URL(inviteBase);
+    invitationUrl.searchParams.set('token', token);
 
     return noCache({
       data: {
-        user: data.user,
+        user: {
+          id: userId,
+          email: normalizedEmail,
+        },
         role: assignRole,
-        message: `Invitation sent to ${email}`,
+        invitationUrl: invitationUrl.toString(),
+        message: `Invitation created for ${normalizedEmail}`,
       },
     });
   } catch (error) {

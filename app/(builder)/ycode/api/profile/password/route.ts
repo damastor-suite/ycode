@@ -1,6 +1,13 @@
 import { NextRequest } from 'next/server';
+import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { noCache } from '@/lib/api-response';
-import { getAuthUser } from '@/lib/supabase-auth';
+import { getAuthUser } from '@/lib/platform/auth';
+import { getDb } from '@/lib/platform/db';
+
+interface AccountRow {
+  id: string;
+  password: string | null;
+}
 
 /**
  * PUT /ycode/api/profile/password
@@ -20,8 +27,8 @@ export async function PUT(request: NextRequest) {
       return noCache({ error: 'New password is required' }, 400);
     }
 
-    if (newPassword.length < 6) {
-      return noCache({ error: 'New password must be at least 6 characters' }, 400);
+    if (newPassword.length < 8) {
+      return noCache({ error: 'New password must be at least 8 characters' }, 400);
     }
 
     const auth = await getAuthUser();
@@ -29,29 +36,22 @@ export async function PUT(request: NextRequest) {
       return noCache({ error: 'Not authenticated' }, 401);
     }
 
-    // Verify current password by re-authenticating
-    const { error: signInError } = await auth.client.auth.signInWithPassword({
-      email: auth.user.email!,
-      password: currentPassword,
-    });
+    const db = await getDb();
+    const account = await db<AccountRow>('account')
+      .select('id', 'password')
+      .where({ userId: auth.user.id, providerId: 'credential' })
+      .first();
 
-    if (signInError) {
+    if (!account?.password || !await verifyPassword({ hash: account.password, password: currentPassword })) {
       return noCache({ error: 'Current password is incorrect' }, 400);
     }
 
-    // Update password
-    const { data, error } = await auth.client.auth.updateUser({
-      password: newPassword,
-    });
-
-    if (error) {
-      console.error('Failed to update password:', error);
-      return noCache({ error: `Failed to update password: ${error.message}` }, 400);
-    }
-
-    if (!data.user) {
-      return noCache({ error: 'Password update failed - no user returned' }, 500);
-    }
+    await db('account')
+      .where('id', account.id)
+      .update({
+        password: await hashPassword(newPassword),
+        updatedAt: new Date(),
+      });
 
     return noCache({
       data: {

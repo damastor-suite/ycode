@@ -5,10 +5,11 @@
  */
 
 import { create } from 'zustand';
-import type { SetupStep, SetupState, SupabaseConfig } from '@/types';
+import type { DatabaseConfig, SetupStep, SetupState, SupabaseConfig } from '@/types';
 
 interface SetupStore extends SetupState {
   setStep: (step: SetupStep) => void;
+  setDatabaseConfig: (config: DatabaseConfig) => void;
   setSupabaseConfig: (config: SupabaseConfig) => void;
   setVercelToken: (token: string) => void;
   setAdminEmail: (email: string) => void;
@@ -23,6 +24,8 @@ export const useSetupStore = create<SetupStore>((set) => ({
 
   // Actions
   setStep: (step) => set({ currentStep: step }),
+
+  setDatabaseConfig: (config) => set({ databaseConfig: config }),
   
   setSupabaseConfig: (config) => set({ supabaseConfig: config }),
   
@@ -42,6 +45,7 @@ export const useSetupStore = create<SetupStore>((set) => ({
   reset: () =>
     set({
       currentStep: 'welcome',
+      databaseConfig: undefined,
       supabaseConfig: undefined,
       vercelConfig: undefined,
       adminEmail: undefined,

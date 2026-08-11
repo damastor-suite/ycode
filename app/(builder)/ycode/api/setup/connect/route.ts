@@ -1,76 +1,36 @@
 import { NextRequest } from 'next/server';
 import { credentials } from '@/lib/credentials';
-import { testSupabaseConnection } from '@/lib/supabase-server';
-import { testSupabaseDirectConnection } from '@/lib/knex-client';
-import { parseSupabaseConfig } from '@/lib/supabase-config-parser';
+import { testDatabaseUrlConnection } from '@/lib/knex-client';
 import { noCache } from '@/lib/api-response';
-import type { SupabaseConfig } from '@/types';
+import type { DatabaseConfig } from '@/types';
 
 /**
  * POST /ycode/api/setup/connect
  *
- * Test and store Supabase credentials (4 fields)
+ * Test and store database credentials.
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { anon_key, service_role_key, connection_url, db_password, supabase_url } = body;
+    const { databaseUrl, database_url, authSecret, auth_secret } = body;
+    const resolvedDatabaseUrl = databaseUrl || database_url;
+    const resolvedAuthSecret = authSecret || auth_secret;
 
     // Validate required fields
-    if (!anon_key || !service_role_key || !connection_url || !db_password) {
+    if (!resolvedDatabaseUrl || typeof resolvedDatabaseUrl !== 'string') {
       return noCache(
-        { error: 'Missing required fields: anon_key, service_role_key, connection_url, db_password' },
+        { error: 'Missing required field: databaseUrl' },
         400
       );
     }
 
-    // Create config object
-    const config: SupabaseConfig = {
-      anonKey: anon_key,
-      serviceRoleKey: service_role_key,
-      connectionUrl: connection_url,
-      dbPassword: db_password,
-      ...(supabase_url ? { supabaseUrl: supabase_url } : {}),
+    const config: DatabaseConfig = {
+      databaseUrl: resolvedDatabaseUrl,
+      ...(resolvedAuthSecret ? { authSecret: resolvedAuthSecret } : {}),
     };
 
-    let parsed;
-    try {
-      parsed = parseSupabaseConfig(config);
-    } catch (error) {
-      return noCache(
-        { error: error instanceof Error ? error.message : 'Invalid connection URL format' },
-        400
-      );
-    }
-
-    // Test Supabase API connection
-    const supabaseTestResult = await testSupabaseConnection(config);
-    if (!supabaseTestResult.success) {
-      const isSelfHosted = !!supabase_url;
-      const rawError = supabaseTestResult.error || 'Supabase API connection test failed';
-      const isAuthError = /unauthorized|invalid.*key|forbidden/i.test(rawError);
-
-      let error = rawError;
-      if (isSelfHosted && isAuthError) {
-        error =
-          `Supabase API returned "${rawError}". ` +
-          'For self-hosted setups, verify that SERVICE_ROLE_KEY and ANON_KEY in your .env ' +
-          'were generated with the same JWT_SECRET. If you changed any of these values, restart ' +
-          'your Docker containers with "docker compose down && docker compose up -d".';
-      }
-
-      return noCache({ error }, 400);
-    }
-
     // Test database connection
-    const dbTestResult = await testSupabaseDirectConnection({
-      dbHost: parsed.dbHost,
-      dbPort: parsed.dbPort,
-      dbName: parsed.dbName,
-      dbUser: parsed.dbUser,
-      dbPassword: parsed.dbPassword,
-      ssl: !supabase_url,
-    });
+    const dbTestResult = await testDatabaseUrlConnection(resolvedDatabaseUrl);
     if (!dbTestResult.success) {
       return noCache(
         { error: `Database connection failed: ${dbTestResult.error || 'Unknown error'}` },
@@ -79,11 +39,11 @@ export async function POST(request: NextRequest) {
     }
 
     // Store credentials
-    await credentials.set('supabase_config', config);
+    await credentials.set('database_config', config);
 
     return noCache({
       success: true,
-      message: 'Supabase connected successfully',
+      message: 'Database connected successfully',
     });
   } catch (error) {
     console.error('[Setup API] Connection failed:', error);

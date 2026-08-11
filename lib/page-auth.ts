@@ -24,33 +24,22 @@ let hasWarnedMissingSecret = false;
  *
  * Order of preference:
  *  1. PAGE_AUTH_SECRET — explicit, recommended.
- *  2. A value derived from an always-present Supabase secret. This keeps the
- *     signature stable across serverless instances and deploys WITHOUT extra
- *     configuration. It's run through HMAC (never used raw) so the cookie
- *     signature can't leak the underlying key.
+ *  2. BETTER_AUTH_SECRET — stable application secret.
  *  3. A per-process random secret — last resort. Cookies won't verify across
  *     serverless instances or restarts, so password unlock appears to fail.
- *
- * Before (2) existed, an unset PAGE_AUTH_SECRET meant the /verify endpoint and
- * the redirected page render could run on different instances with different
- * random secrets — the correct password was accepted but the session cookie
- * was rejected, leaving the visitor stuck on the 401 page.
  */
 function getSigningSecret(): string {
   const explicit = process.env.PAGE_AUTH_SECRET;
   if (explicit) return explicit;
 
-  const supabaseSecret =
-    process.env.SUPABASE_SECRET_KEY
-    || process.env.SUPABASE_SERVICE_ROLE_KEY
-    || process.env.SUPABASE_DB_PASSWORD;
-
-  if (supabaseSecret) {
-    return createHmac('sha256', supabaseSecret).update('ycode-page-auth-v1').digest('hex');
+  if (process.env.BETTER_AUTH_SECRET) {
+    return createHmac('sha256', process.env.BETTER_AUTH_SECRET)
+      .update('ycode-page-auth-v1')
+      .digest('hex');
   }
 
   if (!hasWarnedMissingSecret && process.env.NODE_ENV === 'production') {
-    console.warn('[page-auth] PAGE_AUTH_SECRET is not set and no Supabase secret is available. Page password protection is using a temporary secret that resets on each deploy and will not verify across serverless instances. Set PAGE_AUTH_SECRET (generate with: openssl rand -hex 32).');
+    console.warn('[page-auth] PAGE_AUTH_SECRET is not set. Page password protection is using a temporary secret that resets on each deploy and will not verify across serverless instances. Set PAGE_AUTH_SECRET (generate with: openssl rand -hex 32).');
     hasWarnedMissingSecret = true;
   }
   return fallbackSecret;

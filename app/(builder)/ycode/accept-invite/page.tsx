@@ -9,12 +9,12 @@
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { createBrowserClient } from '@/lib/supabase-browser';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Spinner } from '@/components/ui/spinner';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { authClient } from '@/lib/auth-client';
 import {
   Field,
   FieldDescription,
@@ -27,10 +27,10 @@ export default function AcceptInvitePage() {
   const router = useRouter();
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [inviteToken, setInviteToken] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [verifying, setVerifying] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [userEmail, setUserEmail] = useState<string | null>(null);
 
   // Ensure dark mode is applied
   useEffect(() => {
@@ -45,47 +45,17 @@ export default function AcceptInvitePage() {
   useEffect(() => {
     const verifyInvite = async () => {
       try {
-        const supabase = await createBrowserClient();
-
-        if (!supabase) {
-          setError('Application not configured. Please contact the administrator.');
-          setVerifying(false);
-          return;
-        }
-
-        // Get hash parameters from URL (Supabase sends token in hash)
-        const hashParams = new URLSearchParams(window.location.hash.substring(1));
-        const accessToken = hashParams.get('access_token');
-        const refreshToken = hashParams.get('refresh_token');
-        const type = hashParams.get('type');
-
-        // Check if this is an invite flow
-        if (type === 'invite' && accessToken && refreshToken) {
-          // Set the session with the tokens from the URL
-          const { data, error: sessionError } = await supabase.auth.setSession({
-            access_token: accessToken,
-            refresh_token: refreshToken,
-          });
-
-          if (sessionError) {
-            console.error('Session error:', sessionError);
-            setError('Invalid or expired invitation link. Please request a new invite.');
-            setVerifying(false);
-            return;
-          }
-
-          if (data.user) {
-            setUserEmail(data.user.email || null);
-          }
-
+        const token = new URLSearchParams(window.location.search).get('token');
+        if (token) {
+          setInviteToken(token);
           setVerifying(false);
           return;
         }
 
         // Check if user is already logged in (maybe clicked link while logged in)
-        const { data: { session } } = await supabase.auth.getSession();
+        const { data } = await authClient.getSession();
 
-        if (session?.user) {
+        if (data?.session?.userId) {
           // User is already authenticated, redirect to app
           router.push('/ycode');
           return;
@@ -119,29 +89,42 @@ export default function AcceptInvitePage() {
       return;
     }
 
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters');
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters');
+      return;
+    }
+
+    if (!inviteToken) {
+      setError('Invalid invitation link. Please request a new invite.');
       return;
     }
 
     setLoading(true);
 
     try {
-      const supabase = await createBrowserClient();
+      const response = await fetch('/ycode/api/auth/accept-invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: inviteToken,
+          password,
+        }),
+      });
+      const result = await response.json();
 
-      if (!supabase) {
-        setError('Application not configured');
+      if (!response.ok || result.error) {
+        setError(result.error || 'Failed to set password.');
         setLoading(false);
         return;
       }
 
-      // Update the user's password
-      const { error: updateError } = await supabase.auth.updateUser({
-        password: password,
+      const signIn = await authClient.signIn.email({
+        email: result.data.email,
+        password,
       });
 
-      if (updateError) {
-        setError(updateError.message);
+      if (signIn.error) {
+        setError(signIn.error.message || 'Password set. Please sign in.');
         setLoading(false);
         return;
       }
@@ -168,7 +151,7 @@ export default function AcceptInvitePage() {
   }
 
   // Show error state if verification failed
-  if (error && !userEmail) {
+  if (error && !inviteToken) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-neutral-950">
         <div className="w-full max-w-md p-8">
@@ -205,7 +188,7 @@ export default function AcceptInvitePage() {
 
             <Button
               variant="secondary"
-              onClick={() => router.push('/login')}
+              onClick={() => router.push('/ycode')}
             >
               Go to Login
             </Button>
@@ -253,13 +236,11 @@ export default function AcceptInvitePage() {
               className="animate-in fade-in slide-in-from-bottom-1 duration-700"
               style={{ animationFillMode: 'both' }}
             >
-              {userEmail && (
-                <div className="text-center mb-6">
-                  <Label variant="muted" size="sm">
-                    Setting up account for {userEmail}
-                  </Label>
-                </div>
-              )}
+              <div className="text-center mb-6">
+                <Label variant="muted" size="sm">
+                  Set a password to accept your invitation
+                </Label>
+              </div>
 
               <FieldSet>
                 <FieldGroup className="gap-6">
@@ -282,7 +263,7 @@ export default function AcceptInvitePage() {
                       size="sm"
                       autoFocus
                     />
-                    <FieldDescription>At least 6 characters</FieldDescription>
+                    <FieldDescription>At least 8 characters</FieldDescription>
                   </Field>
 
                   <Field>

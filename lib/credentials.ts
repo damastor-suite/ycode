@@ -1,44 +1,50 @@
 /**
- * Supabase Credentials
+ * Application credentials
  *
- * Always reads from process.env (environment variables).
- * On local dev, writes to .env + sets process.env in-memory.
+ * Reads DATABASE_URL (and related platform env) from process.env.
+ * On local dev, setup wizard can write to .env + set process.env in-memory.
  * On Vercel, env vars are set via the dashboard — writes are not supported.
  *
- * SERVER-ONLY: This module uses Node.js fs module and should never be imported in client code.
+ * SERVER-ONLY: uses Node.js fs — never import in client code.
  */
 
 import 'server-only';
 
 import fs from 'fs/promises';
 import path from 'path';
-import type { SupabaseConfig } from '@/types';
+import type { DatabaseConfig } from '@/types';
 
 const ENV_FILE = path.join(process.cwd(), '.env');
 const IS_VERCEL = process.env.VERCEL === '1';
 
 /**
- * Read Supabase config from environment variables.
- * Supports both new (SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY) and legacy
- * (SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY) variable names.
- *
- * SUPABASE_URL is optional — required for self-hosted Supabase instances.
- * When omitted, the API URL is derived from the project ref in the connection string.
+ * Build DatabaseConfig from env.
+ * Prefers DATABASE_URL; falls back to legacy SUPABASE_CONNECTION_URL + password
+ * so existing installs keep working during migration.
  */
-function getSupabaseConfigFromEnv(): SupabaseConfig | null {
-  const anonKey = process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY;
-  const secretKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+function getDatabaseConfigFromEnv(): DatabaseConfig | null {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (databaseUrl) {
+    return {
+      databaseUrl,
+      authSecret: process.env.BETTER_AUTH_SECRET || process.env.PAGE_AUTH_SECRET,
+      storageDriver: (process.env.STORAGE_DRIVER as 'local' | 's3') || 'local',
+      redisUrl: process.env.REDIS_URL,
+      defaultTenantId: process.env.DEFAULT_TENANT_ID,
+    };
+  }
+
+  // Legacy Supabase connection string → synthesize DATABASE_URL
   const connectionUrl = process.env.SUPABASE_CONNECTION_URL;
   const dbPassword = process.env.SUPABASE_DB_PASSWORD;
-  const supabaseUrl = process.env.SUPABASE_URL;
-
-  if (anonKey && secretKey && connectionUrl && dbPassword) {
+  if (connectionUrl && dbPassword) {
+    const resolved = connectionUrl.replace('[YOUR-PASSWORD]', encodeURIComponent(dbPassword));
     return {
-      anonKey,
-      serviceRoleKey: secretKey,
-      connectionUrl,
-      dbPassword,
-      ...(supabaseUrl ? { supabaseUrl } : {}),
+      databaseUrl: resolved,
+      authSecret: process.env.BETTER_AUTH_SECRET || process.env.SUPABASE_SECRET_KEY || process.env.PAGE_AUTH_SECRET,
+      storageDriver: (process.env.STORAGE_DRIVER as 'local' | 's3') || 'local',
+      redisUrl: process.env.REDIS_URL,
+      defaultTenantId: process.env.DEFAULT_TENANT_ID,
     };
   }
 
@@ -49,8 +55,8 @@ function getSupabaseConfigFromEnv(): SupabaseConfig | null {
  * Get a value from storage (reads from environment variables).
  */
 export async function get<T = unknown>(key: string): Promise<T | null> {
-  if (key === 'supabase_config') {
-    return getSupabaseConfigFromEnv() as T;
+  if (key === 'database_config' || key === 'supabase_config') {
+    return getDatabaseConfigFromEnv() as T;
   }
   return null;
 }
@@ -65,46 +71,51 @@ export async function set(key: string, value: unknown): Promise<void> {
     throw new Error(
       'Cannot write to file system on Vercel. Please set environment variables instead:\n' +
       '1. Go to Vercel Dashboard → Project Settings → Environment Variables\n' +
-      '2. Add: SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY, SUPABASE_CONNECTION_URL, SUPABASE_DB_PASSWORD (and SUPABASE_URL for self-hosted)\n' +
+      '2. Add: DATABASE_URL, BETTER_AUTH_SECRET, REDIS_URL, STORAGE_DRIVER\n' +
       '3. Redeploy your application'
     );
   }
 
-  if (key === 'supabase_config') {
-    const config = value as SupabaseConfig;
+  if (key === 'database_config' || key === 'supabase_config') {
+    const config = value as DatabaseConfig;
 
-    // Set process.env in-memory so credentials are available immediately
-    // (without waiting for a dev server restart)
-    process.env.SUPABASE_PUBLISHABLE_KEY = config.anonKey;
-    process.env.SUPABASE_SECRET_KEY = config.serviceRoleKey;
-    process.env.SUPABASE_CONNECTION_URL = config.connectionUrl;
-    process.env.SUPABASE_DB_PASSWORD = config.dbPassword;
-
-    if (config.supabaseUrl) {
-      process.env.SUPABASE_URL = config.supabaseUrl;
-    } else {
-      delete process.env.SUPABASE_URL;
+    process.env.DATABASE_URL = config.databaseUrl;
+    if (config.authSecret) {
+      process.env.BETTER_AUTH_SECRET = config.authSecret;
+    }
+    if (config.storageDriver) {
+      process.env.STORAGE_DRIVER = config.storageDriver;
+    }
+    if (config.redisUrl) {
+      process.env.REDIS_URL = config.redisUrl;
+    }
+    if (config.defaultTenantId) {
+      process.env.DEFAULT_TENANT_ID = config.defaultTenantId;
     }
 
-    // Persist to .env so credentials survive a dev server restart
     await writeEnvFile(config);
   }
 }
 
 /**
- * Delete a value from storage.
+ * Delete database config from env / .env.
  */
 export async function del(key: string): Promise<void> {
-  if (key === 'supabase_config') {
+  if (key === 'database_config' || key === 'supabase_config') {
+    delete process.env.DATABASE_URL;
+    delete process.env.BETTER_AUTH_SECRET;
+    delete process.env.STORAGE_DRIVER;
+    delete process.env.REDIS_URL;
+    delete process.env.DEFAULT_TENANT_ID;
+    // Keep legacy keys cleared too
     delete process.env.SUPABASE_PUBLISHABLE_KEY;
     delete process.env.SUPABASE_SECRET_KEY;
     delete process.env.SUPABASE_CONNECTION_URL;
     delete process.env.SUPABASE_DB_PASSWORD;
     delete process.env.SUPABASE_URL;
 
-    // Remove Supabase vars from .env
     try {
-      await removeSupabaseVarsFromEnv();
+      await removeDbVarsFromEnv();
     } catch {
       // File may not exist
     }
@@ -112,13 +123,27 @@ export async function del(key: string): Promise<void> {
 }
 
 /**
- * Check if Supabase credentials are configured.
+ * Check if database credentials are configured.
  */
 export async function exists(): Promise<boolean> {
-  return getSupabaseConfigFromEnv() !== null;
+  return getDatabaseConfigFromEnv() !== null;
 }
 
-const SUPABASE_ENV_KEYS = [
+const DB_ENV_KEYS = [
+  'DATABASE_URL',
+  'BETTER_AUTH_SECRET',
+  'STORAGE_DRIVER',
+  'STORAGE_LOCAL_PATH',
+  'STORAGE_PUBLIC_BASE_URL',
+  'REDIS_URL',
+  'DEFAULT_TENANT_ID',
+  'S3_BUCKET',
+  'S3_REGION',
+  'S3_ENDPOINT',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+  'S3_FORCE_PATH_STYLE',
+  // legacy
   'SUPABASE_PUBLISHABLE_KEY',
   'SUPABASE_SECRET_KEY',
   'SUPABASE_CONNECTION_URL',
@@ -126,11 +151,7 @@ const SUPABASE_ENV_KEYS = [
   'SUPABASE_URL',
 ];
 
-/**
- * Write Supabase credentials to .env file.
- * Preserves existing non-Supabase vars, replaces Supabase vars.
- */
-async function writeEnvFile(config: SupabaseConfig): Promise<void> {
+async function writeEnvFile(config: DatabaseConfig): Promise<void> {
   let existing = '';
   try {
     existing = await fs.readFile(ENV_FILE, 'utf-8');
@@ -138,44 +159,45 @@ async function writeEnvFile(config: SupabaseConfig): Promise<void> {
     // File doesn't exist yet
   }
 
-  // Filter out old Supabase vars and the auto-generated comment
   const filtered = existing
     .split('\n')
     .filter((line) => {
       if (line === '# Auto-generated by Ycode setup wizard') return false;
-      return !SUPABASE_ENV_KEYS.some((key) => line.startsWith(`${key}=`));
+      return !DB_ENV_KEYS.some((key) => line.startsWith(`${key}=`));
     })
     .join('\n')
     .trimEnd();
 
   const lines = [
     '# Auto-generated by Ycode setup wizard',
-    `SUPABASE_PUBLISHABLE_KEY="${config.anonKey}"`,
-    `SUPABASE_SECRET_KEY="${config.serviceRoleKey}"`,
-    `SUPABASE_CONNECTION_URL="${config.connectionUrl}"`,
-    `SUPABASE_DB_PASSWORD="${config.dbPassword}"`,
+    `DATABASE_URL="${config.databaseUrl}"`,
   ];
 
-  if (config.supabaseUrl) {
-    lines.push(`SUPABASE_URL="${config.supabaseUrl}"`);
+  if (config.authSecret) {
+    lines.push(`BETTER_AUTH_SECRET="${config.authSecret}"`);
+  }
+  if (config.storageDriver) {
+    lines.push(`STORAGE_DRIVER="${config.storageDriver}"`);
+  }
+  if (config.redisUrl) {
+    lines.push(`REDIS_URL="${config.redisUrl}"`);
+  }
+  if (config.defaultTenantId) {
+    lines.push(`DEFAULT_TENANT_ID="${config.defaultTenantId}"`);
   }
 
-  const supabaseBlock = lines.join('\n');
-
-  const content = filtered ? `${filtered}\n${supabaseBlock}\n` : `${supabaseBlock}\n`;
+  const block = lines.join('\n');
+  const content = filtered ? `${filtered}\n${block}\n` : `${block}\n`;
   await fs.writeFile(ENV_FILE, content, 'utf-8');
 }
 
-/**
- * Remove Supabase vars from .env file, preserving other vars.
- */
-async function removeSupabaseVarsFromEnv(): Promise<void> {
+async function removeDbVarsFromEnv(): Promise<void> {
   const existing = await fs.readFile(ENV_FILE, 'utf-8');
   const filtered = existing
     .split('\n')
     .filter((line) => {
       if (line === '# Auto-generated by Ycode setup wizard') return false;
-      return !SUPABASE_ENV_KEYS.some((key) => line.startsWith(`${key}=`));
+      return !DB_ENV_KEYS.some((key) => line.startsWith(`${key}=`));
     })
     .join('\n')
     .trimEnd();

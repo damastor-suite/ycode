@@ -74,7 +74,7 @@ export const InviteUserButton: React.FC<InviteUserButtonProps> = ({
         return;
       }
 
-      setSuccess(`Invitation sent to ${email}`);
+      setSuccess(result.data?.invitationUrl || `Invitation created for ${email}`);
       setEmail('');
 
       // Auto-close after success

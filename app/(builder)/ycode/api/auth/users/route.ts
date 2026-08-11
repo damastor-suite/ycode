@@ -1,8 +1,32 @@
 import { NextRequest } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { noCache } from '@/lib/api-response';
 import { getCallerInfo, requireManageMembers } from '@/lib/roles-server';
 import { resolveRole, ASSIGNABLE_ROLES } from '@/lib/roles';
+import { getDb } from '@/lib/platform/db';
+
+interface AuthUserRow {
+  id: string;
+  email: string;
+  name: string | null;
+  image: string | null;
+  role: string | null;
+  createdAt: Date | string | null;
+}
+
+interface AuthAccountRow {
+  userId: string;
+  password: string | null;
+}
+
+interface VerificationRow {
+  identifier: string | null;
+  createdAt: Date | string | null;
+}
+
+function toIsoString(value: Date | string | null): string {
+  if (!value) return new Date().toISOString();
+  return new Date(value).toISOString();
+}
 
 /**
  * GET /ycode/api/auth/users
@@ -11,20 +35,7 @@ import { resolveRole, ASSIGNABLE_ROLES } from '@/lib/roles';
  */
 export async function GET(request: NextRequest) {
   try {
-    const client = await getSupabaseAdmin();
-    if (!client) {
-      return noCache({ error: 'Supabase not configured' }, 500);
-    }
-
-    const { data, error } = await client.auth.admin.listUsers({
-      page: 1,
-      perPage: 1000,
-    });
-
-    if (error) {
-      console.error('[users] Error listing users:', error);
-      return noCache({ error: error.message }, 500);
-    }
+    const db = await getDb();
 
     const caller = await getCallerInfo();
 
@@ -45,34 +56,45 @@ export async function GET(request: NextRequest) {
       invited_at: string;
     }> = [];
 
-    for (const user of data.users) {
-      const userAny = user as any;
-      const metadata = user.user_metadata || userAny.raw_user_meta_data || {};
-      const appMeta = user.app_metadata || userAny.raw_app_meta_data || {};
-      const wasInvited = !!metadata.invited_at;
-      const hasIdentities = user.identities && user.identities.length > 0;
-      const hasSignedIn = user.last_sign_in_at !== null;
-      const emailConfirmed = !!user.email_confirmed_at;
-      const isPending = wasInvited && !emailConfirmed && !hasIdentities && !hasSignedIn;
+    const users = await db<AuthUserRow>('user')
+      .select('id', 'email', 'name', 'image', 'role', 'createdAt')
+      .orderBy('createdAt', 'asc');
+    const accounts = await db<AuthAccountRow>('account')
+      .select('userId', 'password')
+      .where('providerId', 'credential');
+    const inviteRows = await db<VerificationRow>('verification')
+      .select('identifier', 'createdAt')
+      .whereLike('identifier', 'invite:%');
 
-      const userRole = resolveRole(appMeta.role as string);
+    const credentialUserIds = new Set(
+      accounts.filter(account => account.password).map(account => account.userId)
+    );
+    const invitedAtByUserId = new Map(
+      inviteRows
+        .filter(row => row.identifier)
+        .map(row => [row.identifier!.replace('invite:', ''), toIsoString(row.createdAt)])
+    );
+
+    for (const user of users) {
+      const isPending = !credentialUserIds.has(user.id);
+      const userRole = resolveRole(user.role);
 
       if (!isPending) {
         activeUsers.push({
           id: user.id,
-          email: user.email || '',
-          display_name: metadata.display_name || metadata.full_name || null,
-          avatar_url: metadata.avatar_url || null,
+          email: user.email,
+          display_name: user.name,
+          avatar_url: user.image,
           role: userRole,
-          created_at: user.created_at,
-          last_sign_in_at: user.last_sign_in_at || null,
+          created_at: toIsoString(user.createdAt),
+          last_sign_in_at: null,
         });
       } else {
         pendingInvites.push({
           id: user.id,
-          email: user.email || '',
+          email: user.email,
           role: userRole,
-          invited_at: metadata.invited_at || user.created_at,
+          invited_at: invitedAtByUserId.get(user.id) || toIsoString(user.createdAt),
         });
       }
     }
@@ -113,24 +135,23 @@ export async function PATCH(request: NextRequest) {
       return noCache({ error: 'Only the owner can assign the admin role' }, 403);
     }
 
-    const client = await getSupabaseAdmin();
-    if (!client) {
-      return noCache({ error: 'Supabase not configured' }, 500);
+    const db = await getDb();
+    const target = await db<AuthUserRow>('user')
+      .select('role')
+      .where('id', targetId)
+      .first();
+
+    if (!target) {
+      return noCache({ error: 'User not found' }, 404);
     }
 
-    const { data: targetData } = await client.auth.admin.getUserById(targetId);
-    if (targetData?.user?.app_metadata?.role === 'owner') {
+    if (target.role === 'owner') {
       return noCache({ error: 'Cannot change the owner\'s role' }, 400);
     }
 
-    const { error } = await client.auth.admin.updateUserById(targetId, {
-      app_metadata: { role },
-    });
-
-    if (error) {
-      console.error('[users] Error updating role:', error);
-      return noCache({ error: error.message }, 400);
-    }
+    await db('user')
+      .where('id', targetId)
+      .update({ role, updatedAt: new Date() });
 
     return noCache({ data: { success: true } });
   } catch (error) {
@@ -161,21 +182,24 @@ export async function DELETE(request: NextRequest) {
       return noCache({ error: 'Cannot remove yourself' }, 400);
     }
 
-    const client = await getSupabaseAdmin();
-    if (!client) {
-      return noCache({ error: 'Supabase not configured' }, 500);
+    const db = await getDb();
+    const target = await db<AuthUserRow>('user')
+      .select('role')
+      .where('id', userId)
+      .first();
+
+    if (!target) {
+      return noCache({ error: 'User not found' }, 404);
     }
 
-    const { data: targetData } = await client.auth.admin.getUserById(userId);
-    if (targetData?.user?.app_metadata?.role === 'owner') {
+    if (target.role === 'owner') {
       return noCache({ error: 'Cannot remove the owner' }, 400);
     }
 
-    const { error } = await client.auth.admin.deleteUser(userId);
-    if (error) {
-      console.error('[users] Error deleting user:', error);
-      return noCache({ error: error.message }, 400);
-    }
+    await db.transaction(async (trx) => {
+      await trx('verification').where('identifier', `invite:${userId}`).del();
+      await trx('user').where('id', userId).del();
+    });
 
     return noCache({ data: { success: true } });
   } catch (error) {

@@ -1,8 +1,7 @@
 import { credentials } from '@/lib/credentials';
 import { noCache } from '@/lib/api-response';
-import { validateConnectionUrl } from '@/lib/supabase-config-parser';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import type { SupabaseConfig } from '@/types';
+import { getDbOrNull } from '@/lib/platform/db';
+import type { DatabaseConfig } from '@/types';
 
 // Disable caching for this route
 export const dynamic = 'force-dynamic';
@@ -13,16 +12,11 @@ export const revalidate = 0;
  */
 async function hasAuthUsers(): Promise<boolean> {
   try {
-    const client = await getSupabaseAdmin();
-    if (!client) return false;
+    const db = await getDbOrNull();
+    if (!db) return false;
 
-    const { data, error } = await client.auth.admin.listUsers({
-      page: 1,
-      perPage: 1,
-    });
-
-    if (error) return false;
-    return (data.users?.length ?? 0) > 0;
+    const row = await db('user').count<{ count: string }[]>({ count: '*' }).first();
+    return Number(row?.count || 0) > 0;
   } catch {
     return false;
   }
@@ -31,12 +25,12 @@ async function hasAuthUsers(): Promise<boolean> {
 /**
  * GET /ycode/api/setup/status
  *
- * Check if Supabase is configured and detect environment.
+ * Check if the database is configured and detect environment.
  * Also returns is_setup_complete when config + migrations + admin user exist.
  */
 export async function GET() {
   try {
-    const config = await credentials.get<SupabaseConfig>('supabase_config');
+    const config = await credentials.get<DatabaseConfig>('database_config');
     const isVercel = process.env.VERCEL === '1';
 
     // If no config, return not configured
@@ -45,22 +39,6 @@ export async function GET() {
         is_configured: false,
         is_setup_complete: false,
         is_vercel: isVercel,
-      });
-    }
-
-    // Validate the connection URL format
-    try {
-      validateConnectionUrl(config.connectionUrl, config.dbPassword, config.supabaseUrl);
-    } catch (validationError) {
-      console.error('Invalid connection URL format:', validationError);
-
-      return noCache({
-        is_configured: false,
-        is_setup_complete: false,
-        is_vercel: isVercel,
-        error: validationError instanceof Error
-          ? validationError.message
-          : 'Invalid SUPABASE_CONNECTION_URL format. For self-hosted Supabase, also set the SUPABASE_URL environment variable.',
       });
     }
 

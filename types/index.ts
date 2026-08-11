@@ -961,24 +961,38 @@ export interface PaginatedResponse<T> {
   per_page: number;
 }
 
-// Supabase Config Types (for setup wizard)
-export interface SupabaseConfig {
-  anonKey: string;
-  serviceRoleKey: string;
-  connectionUrl: string; // With [YOUR-PASSWORD] placeholder
-  dbPassword: string; // Actual password to replace [YOUR-PASSWORD]
-  supabaseUrl?: string; // Explicit API URL for self-hosted instances (e.g. https://supabase.my-company.com)
+/** Postgres + platform config (setup wizard / env) */
+export interface DatabaseConfig {
+  databaseUrl: string;
+  authSecret?: string;
+  storageDriver?: 'local' | 's3';
+  redisUrl?: string;
+  defaultTenantId?: string;
 }
 
-// Internal credentials structure (derived from SupabaseConfig)
+/**
+ * @deprecated Use DatabaseConfig — kept for legacy setup payloads during migration
+ */
+export interface SupabaseConfig {
+  anonKey?: string;
+  serviceRoleKey?: string;
+  connectionUrl?: string;
+  dbPassword?: string;
+  supabaseUrl?: string;
+  /** Prefer this when migrating off Supabase */
+  databaseUrl?: string;
+}
+
+/**
+ * @deprecated Parsed Supabase connection details — prefer DATABASE_URL
+ */
 export interface SupabaseCredentials {
   anonKey: string;
   serviceRoleKey: string;
-  connectionUrl: string; // Original with placeholder
+  connectionUrl: string;
   dbPassword: string;
-  // Derived properties
   projectId: string;
-  projectUrl: string; // API URL — explicit or derived from project ID
+  projectUrl: string;
   dbHost: string;
   dbPort: number;
   dbName: string;
@@ -992,10 +1006,12 @@ export interface VercelConfig {
 }
 
 // Setup Wizard Types
-export type SetupStep = 'welcome' | 'supabase' | 'migrate' | 'admin' | 'template' | 'complete';
+export type SetupStep = 'welcome' | 'database' | 'migrate' | 'admin' | 'template' | 'complete';
 
 export interface SetupState {
   currentStep: SetupStep;
+  databaseConfig?: DatabaseConfig;
+  /** @deprecated */
   supabaseConfig?: SupabaseConfig;
   vercelConfig?: VercelConfig;
   adminEmail?: string;

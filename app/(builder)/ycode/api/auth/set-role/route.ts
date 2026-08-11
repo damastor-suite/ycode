@@ -1,23 +1,19 @@
 import { NextRequest } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
 import { noCache } from '@/lib/api-response';
-import { requireManageMembers } from '@/lib/roles-server';
-import { ALL_ROLES } from '@/lib/roles';
+import { getAuthUser } from '@/lib/platform/auth';
+import { getDb } from '@/lib/platform/db';
+import { ALL_ROLES, canManageMembers, resolveRole } from '@/lib/roles';
 
 export const dynamic = 'force-dynamic';
 
 /**
  * POST /ycode/api/auth/set-role
  *
- * Set a user's role in app_metadata via the Supabase Admin API.
+ * Set a user's role in the Better Auth user table.
  * Requires the caller to be owner or admin.
  */
 export async function POST(request: NextRequest) {
   try {
-    const result = await requireManageMembers();
-    if ('status' in result) return result;
-    const caller = result;
-
     const body = await request.json();
     const { userId, role } = body;
 
@@ -29,23 +25,33 @@ export async function POST(request: NextRequest) {
       return noCache({ error: `Invalid role. Must be one of: ${ALL_ROLES.join(', ')}` }, 400);
     }
 
-    if (role === 'owner' && caller.role !== 'owner') {
-      return noCache({ error: 'Only the owner can assign the owner role' }, 403);
+    const auth = await getAuthUser();
+    if (!auth) {
+      return noCache({ error: 'Not authenticated' }, 401);
     }
 
-    const client = await getSupabaseAdmin();
-    if (!client) {
-      return noCache({ error: 'Supabase not configured' }, 500);
+    const db = await getDb();
+    const callerRole = resolveRole(auth.user.role);
+    const userCountRow = await db('user').count<{ count: string }[]>({ count: '*' }).first();
+    const userCount = Number(userCountRow?.count || 0);
+    const isFirstUserBootstrap = userCount === 1 && auth.user.id === userId && role === 'owner';
+
+    if (!isFirstUserBootstrap) {
+      if (!canManageMembers(callerRole)) {
+        return noCache({ error: 'Insufficient permissions' }, 403);
+      }
+
+      if (role === 'owner' && callerRole !== 'owner') {
+        return noCache({ error: 'Only the owner can assign the owner role' }, 403);
+      }
     }
 
-    const { error } = await client.auth.admin.updateUserById(userId, {
-      app_metadata: { role },
-    });
-
-    if (error) {
-      console.error('[set-role] Error:', error);
-      return noCache({ error: error.message }, 400);
-    }
+    await db('user')
+      .where('id', userId)
+      .update({
+        role,
+        updatedAt: new Date(),
+      });
 
     return noCache({ data: { success: true } });
   } catch (error) {

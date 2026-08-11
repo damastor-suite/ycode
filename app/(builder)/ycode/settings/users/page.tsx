@@ -111,7 +111,11 @@ export default function UsersSettingsPage() {
       }
 
       const invitedEmail = inviteEmail.trim();
-      setInviteSuccess(`Invitation sent to ${invitedEmail}`);
+      setInviteSuccess(
+        result.data?.invitationUrl
+          ? `Invitation link for ${invitedEmail}: ${result.data.invitationUrl}`
+          : `Invitation created for ${invitedEmail}`
+      );
       setInviteEmail('');
 
       if (result.data?.user) {
@@ -180,7 +184,11 @@ export default function UsersSettingsPage() {
       const result = await response.json();
 
       if (response.ok && !result.error) {
-        setInviteSuccess(`Invitation resent to ${email}`);
+        setInviteSuccess(
+          result.data?.invitationUrl
+            ? `Invitation link for ${email}: ${result.data.invitationUrl}`
+            : `Invitation recreated for ${email}`
+        );
         setTimeout(() => setInviteSuccess(null), 3000);
       }
     } catch (error) {

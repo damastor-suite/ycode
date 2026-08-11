@@ -1,5 +1,5 @@
-import { createRouteClient } from '@/lib/supabase-route-client';
 import { noCache } from '@/lib/api-response';
+import { getServerSession } from '@/lib/platform/auth';
 
 /**
  * GET /ycode/api/auth/session
@@ -8,27 +8,11 @@ import { noCache } from '@/lib/api-response';
  */
 export async function GET() {
   try {
-    const supabase = await createRouteClient();
-
-    if (!supabase) {
-      return noCache(
-        { error: 'Supabase not configured' },
-        500
-      );
-    }
-
-    const { data: { session }, error } = await supabase.auth.getSession();
-
-    if (error) {
-      return noCache(
-        { error: error.message },
-        401
-      );
-    }
+    const session = await getServerSession();
 
     return noCache({
       data: {
-        session,
+        session: session?.session || null,
         user: session?.user || null,
       },
     });

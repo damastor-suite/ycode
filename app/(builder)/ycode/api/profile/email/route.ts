@@ -1,6 +1,12 @@
 import { NextRequest } from 'next/server';
+import { verifyPassword } from 'better-auth/crypto';
 import { noCache } from '@/lib/api-response';
-import { getAuthUser } from '@/lib/supabase-auth';
+import { getAuthUser } from '@/lib/platform/auth';
+import { getDb } from '@/lib/platform/db';
+
+interface AccountRow {
+  password: string | null;
+}
 
 /**
  * PUT /ycode/api/profile/email
@@ -25,29 +31,29 @@ export async function PUT(request: NextRequest) {
       return noCache({ error: 'Not authenticated' }, 401);
     }
 
-    // Verify current password by re-authenticating
-    const { error: signInError } = await auth.client.auth.signInWithPassword({
-      email: auth.user.email!,
-      password,
-    });
+    const db = await getDb();
+    const account = await db<AccountRow>('account')
+      .select('password')
+      .where({ userId: auth.user.id, providerId: 'credential' })
+      .first();
 
-    if (signInError) {
+    if (!account?.password || !await verifyPassword({ hash: account.password, password })) {
       return noCache({ error: 'Incorrect password' }, 400);
     }
 
-    // Update email
-    const { data, error } = await auth.client.auth.updateUser({
-      email: email.trim(),
-    });
-
-    if (error) {
-      return noCache({ error: error.message }, 400);
-    }
+    const [user] = await db('user')
+      .where('id', auth.user.id)
+      .update({
+        email: email.trim().toLowerCase(),
+        emailVerified: true,
+        updatedAt: new Date(),
+      })
+      .returning(['id', 'email', 'name', 'image', 'role', 'createdAt', 'updatedAt']);
 
     return noCache({
       data: {
-        user: data.user,
-        message: 'Email update initiated. Check your new email for confirmation.',
+        user,
+        message: 'Email updated successfully.',
       },
     });
   } catch (error) {

@@ -1,8 +1,9 @@
 import { NextRequest } from 'next/server';
 import { noCache } from '@/lib/api-response';
-import { getAuthUser } from '@/lib/supabase-auth';
-import { getSupabaseAdmin } from '@/lib/supabase-server';
-import { STORAGE_BUCKET, STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { STORAGE_FOLDERS } from '@/lib/asset-constants';
+import { getAuthUser } from '@/lib/platform/auth';
+import { getDb } from '@/lib/platform/db';
+import { getStorage } from '@/lib/platform/storage';
 import { generateId } from '@/lib/utils';
 import sharp from 'sharp';
 
@@ -36,13 +37,6 @@ export async function POST(request: NextRequest) {
       return noCache({ error: 'Not authenticated' }, 401);
     }
 
-    // Use admin client for storage operations
-    const adminClient = await getSupabaseAdmin();
-
-    if (!adminClient) {
-      return noCache({ error: 'Server configuration error' }, 500);
-    }
-
     // Convert image to WebP and resize for avatar
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
@@ -54,17 +48,15 @@ export async function POST(request: NextRequest) {
 
     // Create storage path: avatars/{userId}-{randomId}.webp
     const storagePath = `${STORAGE_FOLDERS.AVATARS}/${generateId(auth.user.id)}.webp`;
+    const storage = await getStorage();
 
     // Delete old avatar if exists
-    const oldAvatarUrl = auth.user.user_metadata?.avatar_url;
+    const oldAvatarUrl = auth.user.image || auth.user.user_metadata?.avatar_url;
     if (oldAvatarUrl) {
       try {
-        // Extract storage path from public URL (after bucket name segment)
-        const bucketSegment = `/object/public/${STORAGE_BUCKET}/`;
-        const idx = oldAvatarUrl.indexOf(bucketSegment);
+        const idx = oldAvatarUrl.indexOf(`${STORAGE_FOLDERS.AVATARS}/`);
         if (idx !== -1) {
-          const oldPath = oldAvatarUrl.substring(idx + bucketSegment.length);
-          await adminClient.storage.from(STORAGE_BUCKET).remove([oldPath]);
+          await storage.remove([oldAvatarUrl.substring(idx)]);
         }
       } catch (error) {
         console.error('Failed to delete old avatar:', error);
@@ -73,40 +65,26 @@ export async function POST(request: NextRequest) {
     }
 
     // Upload new avatar
-    const { data: uploadData, error: uploadError } = await adminClient.storage
-      .from(STORAGE_BUCKET)
-      .upload(storagePath, webpBuffer, {
-        cacheControl: '3600',
-        upsert: true,
-        contentType: 'image/webp',
-      });
-
-    if (uploadError) {
-      console.error('Failed to upload avatar:', uploadError);
-      return noCache({ error: `Failed to upload avatar: ${uploadError.message}` }, 500);
-    }
-
-    // Get public URL
-    const { data: urlData } = adminClient.storage
-      .from(STORAGE_BUCKET)
-      .getPublicUrl(uploadData.path);
-
-    // Update user metadata with new avatar URL
-    const { data: updateData, error: updateError } = await auth.client.auth.updateUser({
-      data: {
-        avatar_url: urlData.publicUrl,
-      },
+    const uploadData = await storage.upload(storagePath, webpBuffer, {
+      cacheControl: '3600',
+      upsert: true,
+      contentType: 'image/webp',
     });
+    const publicUrl = storage.getPublicUrl(uploadData.path);
 
-    if (updateError) {
-      console.error('Failed to update user metadata:', updateError);
-      return noCache({ error: 'Failed to update profile' }, 500);
-    }
+    const db = await getDb();
+    const [user] = await db('user')
+      .where('id', auth.user.id)
+      .update({
+        image: publicUrl,
+        updatedAt: new Date(),
+      })
+      .returning(['id', 'email', 'name', 'image', 'role', 'createdAt', 'updatedAt']);
 
     return noCache({
       data: {
-        avatar_url: urlData.publicUrl,
-        user: updateData.user,
+        avatar_url: publicUrl,
+        user,
       },
     });
   } catch (error) {

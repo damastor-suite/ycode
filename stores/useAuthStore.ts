@@ -1,19 +1,57 @@
 /**
  * Auth Store
  *
- * Manages authentication state using Supabase Auth
+ * Manages authentication state using Better Auth
  */
 
 import { create } from 'zustand';
-import { createBrowserClient } from '../lib/supabase-browser';
-import { extractRoleFromUser } from '@/lib/roles';
-import type { User, Session } from '@supabase/supabase-js';
+import { authClient } from '@/lib/auth-client';
+import { resolveRole, type UserRole } from '@/lib/roles';
+
+interface BetterAuthUser {
+  id: string;
+  email: string;
+  name?: string | null;
+  image?: string | null;
+  role?: string | null;
+  emailVerified?: boolean;
+  createdAt?: Date | string;
+  updatedAt?: Date | string;
+  created_at?: string;
+  updated_at?: string;
+  app_metadata?: { role?: string | null };
+  user_metadata?: {
+    avatar_url?: string | null;
+    display_name?: string | null;
+    full_name?: string | null;
+  };
+}
+
+interface BetterAuthSession {
+  id: string;
+  token: string;
+  userId: string;
+  expiresAt: Date | string;
+  createdAt?: Date | string;
+  updatedAt?: Date | string;
+}
+
+interface BetterAuthSessionData {
+  user: BetterAuthUser;
+  session: BetterAuthSession;
+}
+
+type AuthResponse<T> = {
+  data?: T | null;
+  error?: { message?: string } | null;
+};
 
 interface AuthState {
-  user: User | null;
-  session: Session | null;
+  user: BetterAuthUser | null;
+  session: BetterAuthSession | null;
   role: string | null;
   loading: boolean;
+  isLoading: boolean;
   initialized: boolean;
   error: string | null;
 }
@@ -29,62 +67,89 @@ interface AuthActions {
 
 type AuthStore = AuthState & AuthActions;
 
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string') return message;
+  }
+  return fallback;
+}
+
+function normalizeUser(user: BetterAuthUser | null | undefined): BetterAuthUser | null {
+  if (!user) return null;
+
+  const role = resolveRole(user.role || user.app_metadata?.role);
+  return {
+    ...user,
+    role,
+    created_at: user.created_at || new Date(user.createdAt || Date.now()).toISOString(),
+    updated_at: user.updated_at || new Date(user.updatedAt || Date.now()).toISOString(),
+    app_metadata: {
+      ...user.app_metadata,
+      role,
+    },
+    user_metadata: {
+      avatar_url: user.user_metadata?.avatar_url || user.image || null,
+      display_name: user.user_metadata?.display_name || user.name || null,
+      full_name: user.user_metadata?.full_name || user.name || null,
+    },
+  };
+}
+
+function getRole(user: BetterAuthUser | null): UserRole | null {
+  if (!user) return null;
+  return resolveRole(user.role || user.app_metadata?.role);
+}
+
+async function getCurrentSession(): Promise<BetterAuthSessionData | null> {
+  const response = await authClient.getSession() as AuthResponse<BetterAuthSessionData>;
+  if (response.error) {
+    throw new Error(response.error.message || 'Failed to get session');
+  }
+  if (!response.data?.user) return null;
+
+  return {
+    ...response.data,
+    user: normalizeUser(response.data.user) as BetterAuthUser,
+  };
+}
+
 export const useAuthStore = create<AuthStore>((set, get) => ({
   user: null,
   session: null,
   role: null,
   loading: false,
+  isLoading: false,
   initialized: false,
   error: null,
 
   /**
-   * Initialize auth state and listen for auth changes
-   * Gracefully handles missing Supabase config (expected during setup)
+   * Initialize auth state.
+   * Gracefully handles missing database config (expected during setup).
    */
   initialize: async () => {
     if (get().initialized) return;
 
+    set({ loading: true, isLoading: true, error: null });
+
     try {
-      const supabase = await createBrowserClient();
-
-      // If Supabase is not configured, skip initialization (expected during setup)
-      if (!supabase) {
-        set({
-          initialized: true,
-          error: null,
-        });
-        return;
-      }
-
-      // Validate session server-side (getUser verifies the JWT, unlike getSession)
-      const { data: { user } } = await supabase.auth.getUser();
-
-      if (user) {
-        // Refresh the session so the JWT contains the latest app_metadata
-        // (role changes via Admin API don't update existing JWTs)
-        await supabase.auth.refreshSession();
-      }
-
-      const { data: { session } } = await supabase.auth.getSession();
+      const data = await getCurrentSession();
+      const user = data?.user ?? null;
 
       set({
-        user: user ?? null,
-        session: user ? session : null,
-        role: extractRoleFromUser(user),
+        user,
+        session: data?.session ?? null,
+        role: getRole(user),
+        loading: false,
+        isLoading: false,
         initialized: true,
-      });
-
-      supabase.auth.onAuthStateChange((_event, session) => {
-        set({
-          user: session?.user ?? null,
-          session,
-          role: extractRoleFromUser(session?.user ?? null),
-        });
       });
     } catch (error) {
       console.error('Failed to initialize auth:', error);
       set({
-        error: error instanceof Error ? error.message : 'Failed to initialize auth',
+        loading: false,
+        isLoading: false,
+        error: getErrorMessage(error, 'Failed to initialize auth'),
         initialized: true,
       });
     }
@@ -94,50 +159,36 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
    * Sign up a new user
    */
   signUp: async (email, password) => {
-    set({ loading: true, error: null });
+    set({ loading: true, isLoading: true, error: null });
 
     try {
-      const supabase = await createBrowserClient();
-
-      if (!supabase) {
-        set({ loading: false, error: 'Supabase not configured. Please complete setup first.' });
-        return { error: 'Supabase not configured. Please complete setup first.' };
-      }
-
-      const { data, error } = await supabase.auth.signUp({
+      const response = await authClient.signUp.email({
+        name: email.split('@')[0] || email,
         email,
         password,
-        options: {
-          emailRedirectTo: `${window.location.origin}/ycode`,
-          // Note: Email confirmation should be disabled in Supabase Dashboard
-          // (Authentication → Providers → Email → Disable "Confirm email")
-          // This is recommended for self-hosted single-admin setups
-        },
-      });
+        callbackURL: `${window.location.origin}/ycode`,
+      }) as AuthResponse<{ user: BetterAuthUser; token?: string | null }>;
 
-      if (error) {
-        set({ loading: false, error: error.message });
-        return { error: error.message };
-      }
-
-      // Check if email confirmation is required
-      if (data.user && !data.session) {
-        const message = 'Email confirmation required. Please disable email confirmation in your Supabase project settings (Authentication → Providers → Email).';
-        set({ loading: false, error: message });
+      if (response.error) {
+        const message = response.error.message || 'Sign up failed';
+        set({ loading: false, isLoading: false, error: message });
         return { error: message };
       }
 
+      const session = await getCurrentSession();
+      const user = session?.user ?? normalizeUser(response.data?.user);
       set({
-        user: data.user,
-        session: data.session,
-        role: extractRoleFromUser(data.user),
+        user,
+        session: session?.session ?? null,
+        role: getRole(user),
         loading: false,
+        isLoading: false,
       });
 
       return { error: null };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Sign up failed';
-      set({ loading: false, error: message });
+      const message = getErrorMessage(error, 'Sign up failed');
+      set({ loading: false, isLoading: false, error: message });
       return { error: message };
     }
   },
@@ -146,37 +197,34 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
    * Sign in existing user
    */
   signIn: async (email, password) => {
-    set({ loading: true, error: null });
+    set({ loading: true, isLoading: true, error: null });
 
     try {
-      const supabase = await createBrowserClient();
-
-      if (!supabase) {
-        set({ loading: false, error: 'Supabase not configured. Please complete setup first.' });
-        return { error: 'Supabase not configured. Please complete setup first.' };
-      }
-
-      const { data, error } = await supabase.auth.signInWithPassword({
+      const response = await authClient.signIn.email({
         email,
         password,
-      });
+      }) as AuthResponse<{ user: BetterAuthUser; token?: string | null }>;
 
-      if (error) {
-        set({ loading: false, error: error.message });
-        return { error: error.message };
+      if (response.error) {
+        const message = response.error.message || 'Sign in failed';
+        set({ loading: false, isLoading: false, error: message });
+        return { error: message };
       }
 
+      const session = await getCurrentSession();
+      const user = session?.user ?? normalizeUser(response.data?.user);
       set({
-        user: data.user,
-        session: data.session,
-        role: extractRoleFromUser(data.user),
+        user,
+        session: session?.session ?? null,
+        role: getRole(user),
         loading: false,
+        isLoading: false,
       });
 
       return { error: null };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Sign in failed';
-      set({ loading: false, error: message });
+      const message = getErrorMessage(error, 'Sign in failed');
+      set({ loading: false, isLoading: false, error: message });
       return { error: message };
     }
   },
@@ -185,25 +233,13 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
    * Sign out current user
    */
   signOut: async () => {
-    set({ loading: true, error: null });
+    set({ loading: true, isLoading: true, error: null });
 
     try {
-      const supabase = await createBrowserClient();
+      const response = await authClient.signOut() as AuthResponse<{ success: boolean }>;
 
-      if (!supabase) {
-        set({
-          user: null,
-          session: null,
-          role: null,
-          loading: false,
-        });
-        return;
-      }
-
-      const { error } = await supabase.auth.signOut();
-
-      if (error) {
-        set({ loading: false, error: error.message });
+      if (response.error) {
+        set({ loading: false, isLoading: false, error: response.error.message || 'Sign out failed' });
         return;
       }
 
@@ -212,10 +248,11 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         session: null,
         role: null,
         loading: false,
+        isLoading: false,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Sign out failed';
-      set({ loading: false, error: message });
+      const message = getErrorMessage(error, 'Sign out failed');
+      set({ loading: false, isLoading: false, error: message });
     }
   },
 
@@ -224,17 +261,12 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
    */
   checkSession: async () => {
     try {
-      const supabase = await createBrowserClient();
-
-      if (!supabase) {
-        return;
-      }
-
-      const { data: { session } } = await supabase.auth.getSession();
-
+      const data = await getCurrentSession();
+      const user = data?.user ?? null;
       set({
-        user: session?.user ?? null,
-        session,
+        user,
+        session: data?.session ?? null,
+        role: getRole(user),
       });
     } catch (error) {
       console.error('Failed to check session:', error);

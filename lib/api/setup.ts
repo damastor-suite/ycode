@@ -4,7 +4,7 @@
  * Handles communication with Next.js setup API routes
  */
 
-import type { ApiResponse, SupabaseConfig } from '@/types';
+import type { ApiResponse, DatabaseConfig } from '@/types';
 
 /**
  * Check if setup is complete
@@ -25,28 +25,28 @@ export async function checkSetupStatus(): Promise<{
 }
 
 /**
- * Connect Supabase credentials (4 fields)
+ * Connect database credentials.
  */
-export async function connectSupabase(
-  config: SupabaseConfig
+export async function connectDatabase(
+  config: DatabaseConfig
 ): Promise<ApiResponse<void>> {
   const response = await fetch('/ycode/api/setup/connect', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      anon_key: config.anonKey,
-      service_role_key: config.serviceRoleKey,
-      connection_url: config.connectionUrl,
-      db_password: config.dbPassword,
-      ...(config.supabaseUrl ? { supabase_url: config.supabaseUrl } : {}),
+      databaseUrl: config.databaseUrl,
+      ...(config.authSecret ? { authSecret: config.authSecret } : {}),
     }),
   });
 
   return response.json();
 }
 
+/** @deprecated Use connectDatabase. */
+export const connectSupabase = connectDatabase;
+
 /**
- * Run Supabase migrations (checks and runs if needed)
+ * Run database migrations (checks and runs if needed)
  */
 export async function runMigrations(): Promise<ApiResponse<void>> {
   const response = await fetch('/ycode/api/setup/migrate', {
@@ -58,7 +58,7 @@ export async function runMigrations(): Promise<ApiResponse<void>> {
 }
 
 /**
- * Check if Supabase "Confirm email" setting is disabled (autoconfirm enabled)
+ * Better Auth does not require a Supabase email confirmation setting.
  */
 export async function checkEmailConfirmDisabled(): Promise<{
   autoconfirm: boolean;
